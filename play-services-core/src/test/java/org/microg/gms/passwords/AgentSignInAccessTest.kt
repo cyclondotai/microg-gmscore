@@ -116,6 +116,25 @@ class AgentSignInAccessTest {
         } finally { file.delete() }
     }
 
+    /** A file that is there but cannot be opened is not "no file yet": Android reports both as FileNotFoundException. */
+    @Test fun aFileThatCannotBeOpenedFallsBackToAskAndKeepsNothingAllowed() {
+        try {
+            val before = AgentSignInAccess(context)
+            val never = before.get(vault, "never")
+            before.setCurrent(vault, "never", never.incarnation, AgentSignInAccess.Level.NEVER)
+            val strict = before.get(vault, "strict")
+            before.setOwnerPolicy(vault, "strict", strict.incarnation, AgentSignInAccess.Level.ALWAYS, true)
+            assertTrue(file.setReadable(false))
+            org.junit.Assume.assumeFalse("runs as a user who can read any file", file.canRead())
+            val access = AgentSignInAccess(context)
+            for (tag in listOf("never", "strict", "new")) {
+                val state = access.get(vault, tag)
+                assertEquals(AgentSignInAccess.Level.ASK, state.level)
+                assertThrows(SecurityException::class.java) { access.redeem(vault, tag, state.incarnation, false) { fail() } }
+            }
+        } finally { file.setReadable(true); file.delete() }
+    }
+
     @Test fun askRequiresOwnerOnceAndNeverOverridesOwnerOnce() {
         val access = AgentSignInAccess(context) { 1234 }
         val initial = access.get(vault, "login")

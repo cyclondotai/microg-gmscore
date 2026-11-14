@@ -6,7 +6,6 @@ import android.content.Context
 import android.util.AtomicFile
 import org.json.JSONObject
 import java.io.File
-import java.io.FileNotFoundException
 import java.io.RandomAccessFile
 import java.util.UUID
 import java.security.MessageDigest
@@ -33,7 +32,7 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
     class State(val level: Level, val lastUsed: Long?, val incarnation: String, val requireDeviceAuthentication: Boolean = false)
 
     private val directory = context.applicationContext.noBackupFilesDir
-    private val file = AtomicFile(File(directory, "agent-signin-access-v1.json"))
+    private val file = AtomicFile(File(directory, FILE))
     private fun <T> locked(action: () -> T): T = synchronized(LOCK) {
         directory.mkdirs()
         RandomAccessFile(File(directory, "agent-signin-access-v1.lock"), "rw").use { lock ->
@@ -159,9 +158,12 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
 
     private fun read(): JSONObject {
         val unreadable = { JSONObject().put(DEFAULT_ALWAYS, true).put(UNREADABLE, true) }
+        // "No file yet" only when nothing is stored: Android also throws FileNotFoundException for a file that is there
+        // but cannot be opened (permission denied), and that one may hold a Never. The .bak is AtomicFile's older
+        // way to keep the committed copy during a write.
+        val stored = File(directory, FILE).exists() || File(directory, "$FILE.bak").exists()
         val bytes = try { file.readFully() }
-            catch (_: FileNotFoundException) { return JSONObject().put(DEFAULT_ALWAYS, true) }
-            catch (_: Exception) { return unreadable() }
+            catch (_: Exception) { return if (stored) unreadable() else JSONObject().put(DEFAULT_ALWAYS, true) }
         val all = runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }.getOrElse { return unreadable() }
         if (!all.optBoolean(DEFAULT_ALWAYS)) {
             // A file from when Ask was the default. Whoever writes next stores this with its change.
@@ -183,6 +185,7 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
 
     companion object {
         private val LOCK = Any()
+        private const val FILE = "agent-signin-access-v1.json"
         // Two marks of the file itself. Neither can be a login's key: those are hashes with a colon.
         /** Written by this version: Always is the default, so an Ask in the file is the owner's own choice. */
         private const val DEFAULT_ALWAYS = "defaultAlways"
