@@ -63,7 +63,9 @@ class AgentSignInAndroidTest {
                 val tag = PasswordData.decode(Proto.decode(chrome).one(1)).tag()
                 val access = AgentSignInAccess(context) { 1234L }
                 val initial = access.get(identity, tag)
-                check(initial.level == AgentSignInAccess.Level.ASK && initial.lastUsed == null)
+                // CYC-2136: a login nobody chose for is Always. The owner's Ask is set here to check it as before.
+                check(initial.level == AgentSignInAccess.Level.ALWAYS && initial.lastUsed == null)
+                access.setCurrent(identity, tag, initial.incarnation, AgentSignInAccess.Level.ASK)
                 var deliveries = 0
                 denied { access.redeem(identity, tag, initial.incarnation, false) { deliveries++ } }
                 access.redeem(identity, tag, initial.incarnation, true) { deliveries++ }
@@ -111,7 +113,7 @@ class AgentSignInAndroidTest {
                 vault.insertIfAbsent(first)
                 val replacement = AgentSignInAccess(context).get(identity, tag)
                 check(replacement.incarnation != original.incarnation)
-                check(replacement.level == AgentSignInAccess.Level.ASK && replacement.lastUsed == null)
+                check(replacement.level == AgentSignInAccess.Level.ALWAYS && replacement.lastUsed == null)
                 denied { access.redeem(identity, tag, original.incarnation, true) { error("Stale delivery") } }
                 denied { access.setCurrent(identity, tag, original.incarnation, AgentSignInAccess.Level.ALWAYS) }
                 check(access.get(identity, otherTag).incarnation == untouched.incarnation)
@@ -119,7 +121,7 @@ class AgentSignInAndroidTest {
                 vault.store.clear()
                 val afterClear = AgentSignInAccess(context).get(identity, otherTag)
                 check(afterClear.incarnation != untouched.incarnation)
-                check(afterClear.level == AgentSignInAccess.Level.ASK && afterClear.lastUsed == null)
+                check(afterClear.level == AgentSignInAccess.Level.ALWAYS && afterClear.lastUsed == null)
                 denied { access.redeem(identity, otherTag, untouched.incarnation, true) { error("Cleared delivery") } }
             } finally { first.fill(0); other.fill(0); edited?.fill(0) }
         }

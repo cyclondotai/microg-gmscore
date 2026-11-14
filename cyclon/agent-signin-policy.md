@@ -1,7 +1,11 @@
 # Per-login device authentication
 
 The owner controls two local properties of a saved login: Ask / Allow sign-in /
-Never, and **Require device authentication**. Requiring authentication disables
+Never, and **Require device authentication**. Allow sign-in is the default since
+CYC-2136 (2026-11-14), so Cyclon signs in without Core's sheet unless the owner
+chose Ask or Never for that login. Ask was the default until then and was stored
+for every login ever listed; such a file has its Ask entries read as Allow, once.
+A file that cannot be read falls back to Ask. Requiring authentication disables
 Allow sign-in (an existing Allow becomes Ask), preserves Never, and needs a
 configured Android screen lock. Removing the requirement does not restore an old
 Allow grant; the owner can explicitly choose a new access level. Both transitions

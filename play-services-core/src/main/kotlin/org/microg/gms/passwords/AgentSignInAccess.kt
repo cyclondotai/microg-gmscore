@@ -12,10 +12,17 @@ import java.security.MessageDigest
 
 /**
  * Whether the phone's assistant may sign in with a saved login (CYC-779). Local to this phone and never synced: a
- * login's access is the owner's choice for this device's assistant, not account data. Ask is the default.
+ * login's access is the owner's choice for this device's assistant, not account data.
+ *
+ * Always is the default since CYC-2136 (2026-11-14): Cyclon signs in with a saved login without Core's sheet unless the
+ * owner chose Ask or Never for it. Until then Ask was the default and was stored for every login that was ever listed,
+ * so the file cannot tell it from an owner's own choice: a file from before ([DEFAULT_ALWAYS] not set) has its Ask
+ * entries read as Always, once. A login with "Require device authentication" stays Ask, as that setting demands.
  *
  * Keys are hashes of (vault, entry tag), so the file names no site or username. Values are not secrets; only this app
- * writes them. A missing or unreadable file means every login is Ask (fail safe).
+ * writes them. No file yet means every login is at the default. A file that is there but cannot be read may have held
+ * a Never or an authentication requirement, so it falls back to Ask, not to Always: the file started in its place is
+ * marked ([UNREADABLE]) and a login without an entry in it is Ask until the owner chooses for it.
  */
 class AgentSignInAccess(context: Context, private val now: () -> Long = System::currentTimeMillis) {
     enum class Level(val wire: String) {
@@ -25,7 +32,7 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
     class State(val level: Level, val lastUsed: Long?, val incarnation: String, val requireDeviceAuthentication: Boolean = false)
 
     private val directory = context.applicationContext.noBackupFilesDir
-    private val file = AtomicFile(File(directory, "agent-signin-access-v1.json"))
+    private val file = AtomicFile(File(directory, FILE))
     private fun <T> locked(action: () -> T): T = synchronized(LOCK) {
         directory.mkdirs()
         RandomAccessFile(File(directory, "agent-signin-access-v1.lock"), "rw").use { lock ->
@@ -36,7 +43,8 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
     fun get(vault: String, tag: String): State = locked {
         val all = read()
         val key = key(vault, tag)
-        val entry = all.optJSONObject(key) ?: JSONObject().put("level", Level.ASK.wire)
+        val entry = all.optJSONObject(key)
+            ?: JSONObject().put("level", (if (all.optBoolean(UNREADABLE)) Level.ASK else Level.ALWAYS).wire)
         if (!entry.has("incarnation")) {
             entry.put("incarnation", UUID.randomUUID().toString())
             entry.put("store", hash(if (vault == "local") "local-passwords-v1" else vault))
@@ -148,7 +156,26 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
         if (stale.isNotEmpty()) { stale.forEach(all::remove); write(all) }
     }
 
-    private fun read(): JSONObject = runCatching { JSONObject(String(file.readFully(), Charsets.UTF_8)) }.getOrElse { JSONObject() }
+    private fun read(): JSONObject {
+        val unreadable = { JSONObject().put(DEFAULT_ALWAYS, true).put(UNREADABLE, true) }
+        // "No file yet" only when nothing is stored: Android also throws FileNotFoundException for a file that is there
+        // but cannot be opened (permission denied), and that one may hold a Never. The .bak is AtomicFile's older
+        // way to keep the committed copy during a write.
+        val stored = File(directory, FILE).exists() || File(directory, "$FILE.bak").exists()
+        val bytes = try { file.readFully() }
+            catch (_: Exception) { return if (stored) unreadable() else JSONObject().put(DEFAULT_ALWAYS, true) }
+        val all = runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }.getOrElse { return unreadable() }
+        if (!all.optBoolean(DEFAULT_ALWAYS)) {
+            // A file from when Ask was the default. Whoever writes next stores this with its change.
+            all.keys().asSequence().toList().forEach { key ->
+                val entry = all.optJSONObject(key) ?: return@forEach
+                if (entry.optString("level") == Level.ASK.wire && !entry.optBoolean("requireDeviceAuthentication", false))
+                    entry.put("level", Level.ALWAYS.wire)
+            }
+            all.put(DEFAULT_ALWAYS, true)
+        }
+        return all
+    }
 
     private fun write(value: JSONObject) {
         val out = file.startWrite()
@@ -158,6 +185,12 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
 
     companion object {
         private val LOCK = Any()
+        private const val FILE = "agent-signin-access-v1.json"
+        // Two marks of the file itself. Neither can be a login's key: those are hashes with a colon.
+        /** Written by this version: Always is the default, so an Ask in the file is the owner's own choice. */
+        private const val DEFAULT_ALWAYS = "defaultAlways"
+        /** The file was started after one that could not be read: a login without an entry in it is Ask. */
+        private const val UNREADABLE = "previousUnreadable"
         /** The vault key used in [get]/[set]: "local" for the on-device vault, "google:<user id>" for an account's. */
         fun vaultKey(googleUserId: String?) = if (googleUserId == null) "local" else "google:$googleUserId"
         private fun vaultPrefix(vault: String) = hash("vault:$vault").take(16) + ":"
