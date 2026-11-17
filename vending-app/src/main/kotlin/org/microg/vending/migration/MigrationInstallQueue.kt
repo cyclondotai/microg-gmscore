@@ -52,10 +52,63 @@ internal class MigrationInstallQueue(private val context: Context,
     private fun legacy() = !prefs.contains("sessions") && prefs.contains("packages")
     fun currentSessionId(): String? = prefs.getString("current_session", null)
     fun sessions(): List<String> = prefs.getString("sessions", "").orEmpty().split(',').filter { it.isNotEmpty() }
-    fun beginTransfer(): String = synchronized(LOCK) {
+    fun beginTransfer(): String = synchronized(LOCK) { newSession() }
+
+    private fun newSession(run: String? = null): String {
         val id = UUID.randomUUID().toString()
-        check(prefs.edit().putString("current_session", id).putString("sessions", (listOf(id) + sessions()).joinToString(",")).commit())
-        id
+        val edit = prefs.edit().putString("current_session", id).putString("sessions", (listOf(id) + sessions()).joinToString(","))
+        val handoffSession = prefs.getString("handoff_session", null)
+        if (run != null) {
+            edit.putString("handoff_run", run).putString("handoff_session", id).remove("handoff_outcome")
+        } else if (prefs.contains("handoff_run") && !prefs.contains("handoff_outcome") &&
+            (handoffSession == null || !prefs.getBoolean("$handoffSession:selected", false))) {
+            edit.putString("handoff_session", id)
+        }
+        check(edit.commit())
+        return id
+    }
+
+    fun beginHandoff(run: String): Bundle = synchronized(LOCK) {
+        if (prefs.getString("handoff_run", null) != run) newSession(run)
+        Bundle().apply { putBoolean("accepted", !prefs.contains("handoff_outcome")) }
+    }
+
+    /** A projection of saved selections only. Reading it never waits for or calls Aurora. */
+    fun handoff(run: String): Bundle {
+        val snapshot = prefs.all
+        return Bundle().apply {
+            putBoolean("supported", true)
+            if (snapshot["handoff_run"] != run) return@apply
+            putString("run_id", run)
+            val id = snapshot["handoff_session"] as? String
+            val outcome = snapshot["handoff_outcome"] as? String
+            putString("session_id", id)
+            putString("outcome", outcome)
+            putBoolean("selection_closed", if (id == null) outcome != null else snapshot["$id:selection_closed"] == true)
+            putLong("selection_changed_at", snapshot["$id:selection_changed_at"] as? Long ?: 0)
+            val names = (snapshot["$id:handoff_packages"] as? Set<*>)?.filterIsInstance<String>().orEmpty().sorted()
+            putStringArrayList("packages", ArrayList(names))
+            putStringArrayList("titles", ArrayList(names.map { name -> snapshot["$id:$name:title"] as? String ?: name }))
+            val pending = snapshot["$id:pending"] as? Set<*> ?: emptySet<String>()
+            putStringArrayList("statuses", ArrayList(names.map { name ->
+                if (name in pending) "pending" else (snapshot["$id:$name:status"] as? String).orEmpty()
+            }))
+        }
+    }
+
+    fun endHandoff(run: String, outcome: String): Bundle = synchronized(LOCK) {
+        if (prefs.getString("handoff_run", null) != run) return Bundle().apply { putBoolean("accepted", false) }
+        if (!prefs.contains("handoff_outcome")) {
+            val id = prefs.getString("handoff_session", null)
+            if (id != null) {
+                if (!transferEnded(outcome, id, recordHandoff = true).getBoolean("accepted")) {
+                    return Bundle().apply { putBoolean("accepted", false) }
+                }
+            } else {
+                check(prefs.edit().putString("handoff_outcome", outcome).commit())
+            }
+        }
+        handoff(run).apply { putBoolean("accepted", true) }
     }
     fun startPausedTransfer(): String = synchronized(LOCK) {
         currentSessionId()?.let { if (prefs.getBoolean("$it:pause_requested", false)) resume(it) }
@@ -124,6 +177,10 @@ internal class MigrationInstallQueue(private val context: Context,
         val fresh = names - selected(id)
         val edit = prefs.edit().putBoolean("$id:selected", true).putStringSet("$id:packages", selected(id) + names)
             .putStringSet("$id:pending", pending(id) + fresh)
+        if (prefs.getString("handoff_session", null) == id) {
+            edit.putStringSet("$id:handoff_packages", selected(id) + names)
+            if (fresh.isNotEmpty()) edit.putLong("$id:selection_changed_at", System.currentTimeMillis())
+        }
         for (doc in documents) metadata(edit, id, doc)
         check(edit.commit()); changed(id); schedule()
     }
@@ -135,7 +192,10 @@ internal class MigrationInstallQueue(private val context: Context,
         }
     }
     /** A trusted companion's wizard return closes input; it does not certify any app installation. */
-    fun transferEnded(outcome: String, expectedSessionId: String? = null): Bundle = synchronized(LOCK) {
+    fun transferEnded(outcome: String, expectedSessionId: String? = null): Bundle =
+        transferEnded(outcome, expectedSessionId, recordHandoff = false)
+
+    private fun transferEnded(outcome: String, expectedSessionId: String?, recordHandoff: Boolean): Bundle = synchronized(LOCK) {
         require(outcome in setOf("success", "cancelled")) { "Invalid transfer outcome" }
         val id = currentSessionId()
         if (id == null) return Bundle().apply { putBoolean("accepted", false); putString("error", "no_active_session") }
@@ -145,6 +205,7 @@ internal class MigrationInstallQueue(private val context: Context,
         val alreadyClosed = prefs.getBoolean("$id:selection_closed", false)
         val edit = prefs.edit().putBoolean("$id:selected", true).putBoolean("$id:selection_closed", true)
         if (!prefs.contains("$id:transfer_outcome")) edit.putString("$id:transfer_outcome", outcome)
+        if (recordHandoff) edit.putString("handoff_outcome", outcome)
         check(edit.commit())
         changed(id); schedule()
         Bundle().apply {

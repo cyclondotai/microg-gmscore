@@ -117,6 +117,39 @@ class TransferSessionProviderTest {
         assertEquals(1, TransferSessionBinderIdentityShadow.restores)
     }
 
+    @Test fun handoffReturns256SelectedPackagesBeforeAnyAuroraDispatchAndSurvivesReopen() {
+        val (queue, oldId) = selected()
+        val run = "00000000-0000-0000-0000-000000000001"
+        val coreUid = companionUid + 1
+        install("ai.cyclon.core", coreUid, ApplicationInfo.FLAG_SYSTEM, platform)
+        assertTrue(provider.call("beginHandoff", run, null).getBoolean("accepted"))
+        assertTrue(runCatching { provider.call("getHandoff", run, null) }.exceptionOrNull() is SecurityException)
+        ShadowBinder.setCallingUid(coreUid)
+        val armed = provider.call("getHandoff", run, null)
+        assertNotEquals(oldId, armed.getString("session_id"))
+        assertTrue(armed.getStringArrayList("packages")!!.isEmpty())
+        assertTrue(runCatching { provider.call("endHandoff", run, null) }.exceptionOrNull() is SecurityException)
+
+        val names = (0 until 256).map { "org.example.app$it" }
+        val id = queue.catalogSession()
+        assertEquals(armed.getString("session_id"), id)
+        names.chunked(50).forEach { batch ->
+            queue.select(batch.map { name -> Bundle().apply { putString("package_name", name) } })
+        }
+        val open = provider.call("getHandoff", run, null)
+        assertEquals(id, open.getString("session_id"))
+        assertFalse(open.getBoolean("selection_closed"))
+        assertEquals(names.toSet(), open.getStringArrayList("packages")!!.toSet())
+        assertEquals(List(256) { "pending" }, open.getStringArrayList("statuses"))
+
+        ShadowBinder.setCallingUid(companionUid)
+        val cancelled = provider.call("endHandoff", run, Bundle().apply { putString("outcome", "cancelled") })
+        assertTrue(cancelled.getBoolean("accepted"))
+        assertTrue(cancelled.getBoolean("selection_closed"))
+        assertEquals("cancelled", queue().handoff(run).getString("outcome"))
+        assertFalse(queue.summary(oldId).getBoolean("selection_closed"))
+    }
+
     @Test fun wizardSuccessAndCancelCloseSelectionWithoutClaimingAnInstallSucceeded() {
         for (outcome in listOf("success", "cancelled")) {
             val (queue, id) = selected()
