@@ -74,7 +74,7 @@ internal class MigrationInstallQueue(private val context: Context,
     }
 
     /** A projection of saved selections only. Reading it never waits for or calls Aurora. */
-    fun handoff(run: String): Bundle {
+    fun handoff(run: String, offset: Int = 0): Bundle {
         val snapshot = prefs.all
         return Bundle().apply {
             putBoolean("supported", true)
@@ -86,9 +86,12 @@ internal class MigrationInstallQueue(private val context: Context,
             putString("outcome", outcome)
             putBoolean("selection_closed", if (id == null) outcome != null else snapshot["$id:selection_closed"] == true)
             putLong("selection_changed_at", snapshot["$id:selection_changed_at"] as? Long ?: 0)
-            val names = (snapshot["$id:handoff_packages"] as? Set<*>)?.filterIsInstance<String>().orEmpty().sorted()
+            val selected = (snapshot["$id:handoff_packages"] as? Set<*>)?.filterIsInstance<String>().orEmpty().sorted()
+            val names = selected.drop(offset).take(64)
+            putInt("total", selected.size)
+            if (offset + names.size < selected.size) putInt("next_offset", offset + names.size)
             putStringArrayList("packages", ArrayList(names))
-            putStringArrayList("titles", ArrayList(names.map { name -> snapshot["$id:$name:title"] as? String ?: name }))
+            putStringArrayList("titles", ArrayList(names.map { name -> (snapshot["$id:$name:title"] as? String)?.take(80) ?: name }))
             val pending = snapshot["$id:pending"] as? Set<*> ?: emptySet<String>()
             putStringArrayList("statuses", ArrayList(names.map { name ->
                 if (name in pending) "pending" else (snapshot["$id:$name:status"] as? String).orEmpty()

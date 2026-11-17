@@ -31,7 +31,7 @@ class TransferSessionProvider : ContentProvider() {
                 val queue = MigrationInstallQueue(context)
                 return when (method) {
                     "beginHandoff" -> queue.beginHandoff(run)
-                    "getHandoff" -> queue.handoff(run)
+                    "getHandoff" -> queue.handoff(run, (extras?.getInt("offset") ?: 0).also { require(it >= 0) })
                     else -> {
                         val outcome = extras?.getString("outcome")
                         require(outcome == "success" || outcome == "cancelled") { "Expected success or cancelled outcome" }

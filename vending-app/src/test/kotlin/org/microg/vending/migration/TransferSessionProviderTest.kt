@@ -136,11 +136,18 @@ class TransferSessionProviderTest {
         names.chunked(50).forEach { batch ->
             queue.select(batch.map { name -> Bundle().apply { putString("package_name", name) } })
         }
-        val open = provider.call("getHandoff", run, null)
-        assertEquals(id, open.getString("session_id"))
-        assertFalse(open.getBoolean("selection_closed"))
-        assertEquals(names.toSet(), open.getStringArrayList("packages")!!.toSet())
-        assertEquals(List(256) { "pending" }, open.getStringArrayList("statuses"))
+        val read = mutableListOf<String>()
+        var offset = 0
+        do {
+            val open = provider.call("getHandoff", run, Bundle().apply { putInt("offset", offset) })
+            assertEquals(id, open.getString("session_id"))
+            assertFalse(open.getBoolean("selection_closed"))
+            assertEquals(256, open.getInt("total"))
+            read += open.getStringArrayList("packages")!!
+            assertEquals(List(64) { "pending" }, open.getStringArrayList("statuses"))
+            offset = open.getInt("next_offset")
+        } while (offset > 0)
+        assertEquals(names.sorted(), read)
 
         ShadowBinder.setCallingUid(companionUid)
         val cancelled = provider.call("endHandoff", run, Bundle().apply { putString("outcome", "cancelled") })
