@@ -20,18 +20,19 @@ class TransferSessionProvider : ContentProvider() {
         val context = requireNotNull(context)
         val uid = Binder.getCallingUid()
         val manager = context.packageManager
-        val caller = if (method == "getHandoff") CORE else COMPANION
+        val caller = if (method == "getHandoff" || method == "cancelHandoff") CORE else COMPANION
         val app = try { manager.getApplicationInfo(caller, 0) }
         catch (_: PackageManager.NameNotFoundException) { throw SecurityException("Transfer caller is not installed") }
         checkCaller(app, uid, manager, caller)
-        if (method in setOf("beginHandoff", "getHandoff", "endHandoff")) {
+        if (method in setOf("beginHandoff", "getHandoff", "endHandoff", "cancelHandoff")) {
             val run = requireNotNull(arg).also { require(RUN.matches(it)) { "Invalid transfer run" } }
             val identity = Binder.clearCallingIdentity()
             try {
                 val queue = MigrationInstallQueue(context)
                 return when (method) {
-                    "beginHandoff" -> queue.beginHandoff(run)
+                    "beginHandoff" -> queue.beginHandoff(run, extras?.getBoolean("resume_only") == true)
                     "getHandoff" -> queue.handoff(run, (extras?.getInt("offset") ?: 0).also { require(it >= 0) })
+                    "cancelHandoff" -> queue.endHandoff(run, "cancelled")
                     else -> {
                         val outcome = extras?.getString("outcome")
                         require(outcome == "success" || outcome == "cancelled") { "Expected success or cancelled outcome" }

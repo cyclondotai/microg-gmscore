@@ -149,8 +149,9 @@ class TransferSessionProviderTest {
         } while (offset > 0)
         assertEquals(names.sorted(), read)
 
-        ShadowBinder.setCallingUid(companionUid)
-        val cancelled = provider.call("endHandoff", run, Bundle().apply { putString("outcome", "cancelled") })
+        val stale = provider.call("cancelHandoff", "00000000-0000-0000-0000-000000000002", null)
+        assertFalse(stale.getBoolean("accepted"))
+        val cancelled = provider.call("cancelHandoff", run, null)
         assertTrue(cancelled.getBoolean("accepted"))
         assertTrue(cancelled.getBoolean("selection_closed"))
         assertEquals("cancelled", queue().handoff(run).getString("outcome"))

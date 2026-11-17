@@ -68,8 +68,11 @@ internal class MigrationInstallQueue(private val context: Context,
         return id
     }
 
-    fun beginHandoff(run: String): Bundle = synchronized(LOCK) {
-        if (prefs.getString("handoff_run", null) != run) newSession(run)
+    fun beginHandoff(run: String, resumeOnly: Boolean): Bundle = synchronized(LOCK) {
+        if (prefs.getString("handoff_run", null) != run) {
+            if (resumeOnly) return Bundle().apply { putBoolean("accepted", false) }
+            newSession(run)
+        }
         Bundle().apply { putBoolean("accepted", !prefs.contains("handoff_outcome")) }
     }
 
