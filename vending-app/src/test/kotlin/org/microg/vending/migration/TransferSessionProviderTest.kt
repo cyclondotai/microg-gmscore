@@ -117,6 +117,68 @@ class TransferSessionProviderTest {
         assertEquals(1, TransferSessionBinderIdentityShadow.restores)
     }
 
+    @Test fun handoffReturns256SelectedPackagesBeforeAnyAuroraDispatchAndSurvivesReopen() {
+        val (queue, oldId) = selected()
+        val run = "00000000-0000-0000-0000-000000000001"
+        val coreUid = companionUid + 1
+        install("ai.cyclon.core", coreUid, ApplicationInfo.FLAG_SYSTEM, platform)
+        assertTrue(provider.call("beginHandoff", run, null).getBoolean("accepted"))
+        assertTrue(runCatching { provider.call("getHandoff", run, null) }.exceptionOrNull() is SecurityException)
+        ShadowBinder.setCallingUid(coreUid)
+        val armed = provider.call("getHandoff", run, null)
+        assertNotEquals(oldId, armed.getString("session_id"))
+        assertTrue(armed.getStringArrayList("packages")!!.isEmpty())
+        assertTrue(runCatching { provider.call("endHandoff", run, null) }.exceptionOrNull() is SecurityException)
+
+        val names = (0 until 256).map { "org.example.app$it" }
+        val id = queue.catalogSession()
+        assertEquals(armed.getString("session_id"), id)
+        names.chunked(50).forEach { batch ->
+            queue.select(batch.map { name -> Bundle().apply { putString("package_name", name) } })
+        }
+        val read = mutableListOf<String>()
+        var offset = 0
+        do {
+            val open = provider.call("getHandoff", run, Bundle().apply { putInt("offset", offset) })
+            assertEquals(id, open.getString("session_id"))
+            assertFalse(open.getBoolean("selection_closed"))
+            assertEquals(256, open.getInt("total"))
+            read += open.getStringArrayList("packages")!!
+            assertEquals(List(64) { "pending" }, open.getStringArrayList("statuses"))
+            offset = open.getInt("next_offset")
+        } while (offset > 0)
+        assertEquals(names.sorted(), read)
+
+        val stale = provider.call("cancelHandoff", "00000000-0000-0000-0000-000000000002", null)
+        assertFalse(stale.getBoolean("accepted"))
+        val cancelled = provider.call("cancelHandoff", run, null)
+        assertTrue(cancelled.getBoolean("accepted"))
+        assertTrue(cancelled.getBoolean("selection_closed"))
+        assertEquals("cancelled", queue().handoff(run).getString("outcome"))
+        assertFalse(queue.summary(oldId).getBoolean("selection_closed"))
+    }
+
+    @Test fun handoffKeepsAStoreOutageSeparateFromAnUnavailableApp() {
+        val run = "00000000-0000-0000-0000-000000000001"
+        val transient = "org.example.outage"
+        val unavailable = "org.example.unavailable"
+        val queue = MigrationInstallQueue(context) { _, _ -> error("Aurora could not be reached") }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false).getBoolean("accepted"))
+        val id = queue.catalogSession()
+        queue.select(listOf(transient, unavailable).map { name ->
+            Bundle().apply { putString("package_name", name) }
+        })
+        queue.save(transient, Bundle().apply { putString("status", "queued") }, dispatched = true, id = id)
+        queue.save(unavailable, MigrationInstallQueue.unavailable(unavailable, "not_found").apply {
+            putBoolean("terminal", true)
+        }, dispatched = true, id = id)
+        queue.finishSelection(id)
+        queue.summary(id)
+        val handoff = queue.handoff(run)
+        assertEquals(listOf(transient, unavailable), handoff.getStringArrayList("packages"))
+        assertEquals(listOf("queued", "unavailable"), handoff.getStringArrayList("statuses"))
+    }
+
     @Test fun wizardSuccessAndCancelCloseSelectionWithoutClaimingAnInstallSucceeded() {
         for (outcome in listOf("success", "cancelled")) {
             val (queue, id) = selected()

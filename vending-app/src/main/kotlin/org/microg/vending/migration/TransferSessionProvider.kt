@@ -20,9 +20,27 @@ class TransferSessionProvider : ContentProvider() {
         val context = requireNotNull(context)
         val uid = Binder.getCallingUid()
         val manager = context.packageManager
-        val companion = try { manager.getApplicationInfo(COMPANION, 0) }
-        catch (_: PackageManager.NameNotFoundException) { throw SecurityException("Transfer Phone is not installed") }
-        checkCaller(companion, uid, manager)
+        val caller = if (method == "getHandoff" || method == "cancelHandoff") CORE else COMPANION
+        val app = try { manager.getApplicationInfo(caller, 0) }
+        catch (_: PackageManager.NameNotFoundException) { throw SecurityException("Transfer caller is not installed") }
+        checkCaller(app, uid, manager, caller)
+        if (method in setOf("beginHandoff", "getHandoff", "endHandoff", "cancelHandoff")) {
+            val run = requireNotNull(arg).also { require(RUN.matches(it)) { "Invalid transfer run" } }
+            val identity = Binder.clearCallingIdentity()
+            try {
+                val queue = MigrationInstallQueue(context)
+                return when (method) {
+                    "beginHandoff" -> queue.beginHandoff(run, extras?.getBoolean("resume_only") == true)
+                    "getHandoff" -> queue.handoff(run, (extras?.getInt("offset") ?: 0).also { require(it >= 0) })
+                    "cancelHandoff" -> queue.endHandoff(run, "cancelled")
+                    else -> {
+                        val outcome = extras?.getString("outcome")
+                        require(outcome == "success" || outcome == "cancelled") { "Expected success or cancelled outcome" }
+                        queue.endHandoff(run, outcome)
+                    }
+                }
+            } finally { Binder.restoreCallingIdentity(identity) }
+        }
         require(arg == null) { "Unexpected transfer argument" }
         val outcome: String?
         val expectedSession: String?
@@ -49,10 +67,10 @@ class TransferSessionProvider : ContentProvider() {
         } finally { Binder.restoreCallingIdentity(identity) }
     }
 
-    private fun checkCaller(companion: ApplicationInfo, uid: Int, manager: PackageManager) {
-        val system = companion.flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
-        val platform = uid == Process.SYSTEM_UID || manager.checkSignatures("android", COMPANION) == PackageManager.SIGNATURE_MATCH
-        if (companion.uid != uid || !system || !platform) throw SecurityException("Only the platform Transfer Phone companion may close a transfer")
+    private fun checkCaller(app: ApplicationInfo, uid: Int, manager: PackageManager, caller: String) {
+        val system = app.flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+        val platform = uid == Process.SYSTEM_UID || manager.checkSignatures("android", caller) == PackageManager.SIGNATURE_MATCH
+        if (app.uid != uid || !system || !platform) throw SecurityException("Untrusted transfer caller")
     }
 
     override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? = unsupported()
@@ -65,5 +83,7 @@ class TransferSessionProvider : ContentProvider() {
     companion object {
         const val AUTHORITY = "com.android.vending.migration"
         private const val COMPANION = "ai.cyclon.migration"
+        private const val CORE = "ai.cyclon.core"
+        private val RUN = Regex("[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}")
     }
 }
