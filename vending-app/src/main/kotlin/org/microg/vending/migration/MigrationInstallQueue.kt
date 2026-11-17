@@ -97,7 +97,13 @@ internal class MigrationInstallQueue(private val context: Context,
             putStringArrayList("titles", ArrayList(names.map { name -> (snapshot["$id:$name:title"] as? String)?.take(80) ?: name }))
             val pending = snapshot["$id:pending"] as? Set<*> ?: emptySet<String>()
             putStringArrayList("statuses", ArrayList(names.map { name ->
-                if (name in pending) "pending" else (snapshot["$id:$name:status"] as? String).orEmpty()
+                val status = (snapshot["$id:$name:status"] as? String).orEmpty()
+                when {
+                    name in pending -> "pending"
+                    // summary() may have lost its Aurora connection while checking a dispatched app.
+                    status == "unavailable" && snapshot["$id:$name:error"] == "store_unavailable" -> "queued"
+                    else -> status
+                }
             }))
         }
     }

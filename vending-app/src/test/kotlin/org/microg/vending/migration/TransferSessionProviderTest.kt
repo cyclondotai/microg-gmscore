@@ -158,6 +158,27 @@ class TransferSessionProviderTest {
         assertFalse(queue.summary(oldId).getBoolean("selection_closed"))
     }
 
+    @Test fun handoffKeepsAStoreOutageSeparateFromAnUnavailableApp() {
+        val run = "00000000-0000-0000-0000-000000000001"
+        val transient = "org.example.outage"
+        val unavailable = "org.example.unavailable"
+        val queue = MigrationInstallQueue(context) { _, _ -> error("Aurora could not be reached") }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false).getBoolean("accepted"))
+        val id = queue.catalogSession()
+        queue.select(listOf(transient, unavailable).map { name ->
+            Bundle().apply { putString("package_name", name) }
+        })
+        queue.save(transient, Bundle().apply { putString("status", "queued") }, dispatched = true, id = id)
+        queue.save(unavailable, MigrationInstallQueue.unavailable(unavailable, "not_found").apply {
+            putBoolean("terminal", true)
+        }, dispatched = true, id = id)
+        queue.finishSelection(id)
+        queue.summary(id)
+        val handoff = queue.handoff(run)
+        assertEquals(listOf(transient, unavailable), handoff.getStringArrayList("packages"))
+        assertEquals(listOf("queued", "unavailable"), handoff.getStringArrayList("statuses"))
+    }
+
     @Test fun wizardSuccessAndCancelCloseSelectionWithoutClaimingAnInstallSucceeded() {
         for (outcome in listOf("success", "cancelled")) {
             val (queue, id) = selected()
