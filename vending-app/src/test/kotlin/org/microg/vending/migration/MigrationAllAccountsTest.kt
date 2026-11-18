@@ -126,4 +126,50 @@ class MigrationAllAccountsTest {
         download = state("installed", installed = true, version = 9, offer = 9)
         assertFalse(results(queue).getBoolean("installed"))
     }
+
+    /** An all-accounts attempt Aurora finished with the Google account (google_account) at an older version than listed. */
+    private fun refusedByGoogleAccount() = refused().apply { putBoolean("google_account", true); putLong("version_code", 7) }
+
+    /**
+     * Greptile on #102: after an all-accounts attempt failed with google_account and an older version_code, an owner Retry
+     * must not adopt that attempt's account choice from Aurora's status, which still shows it: the new request asks for
+     * the listed version, without the Google account's approval.
+     */
+    @Test fun aRetryDoesNotAdoptThePreviousAttemptsGoogleAccount() {
+        val sent = mutableListOf<Bundle>()
+        val queue = MigrationInstallQueue(context, { _, _ -> capabilities(true) }) { _, _ -> refusedByGoogleAccount() }
+            .apply { sentOptions = { operation, options -> if (operation == 2) sent += options!! } }
+        queue.select(selected())
+        val id = queue.currentSessionId()!!
+        assertTrue(queue.dispatch(name))
+        assertTrue("the attempt failed for good", queue.pending().isEmpty())
+        queue.retry(id, name)
+        assertEquals(setOf(name), queue.pending())
+        queue.dispatch(name)
+        val again = sent.last()
+        assertEquals(2, sent.size)
+        assertEquals(12L, again.getLong("minimum_version_code"))
+        assertFalse(again.getBoolean("owner_account_approved"))
+    }
+
+    /** Greptile on #102: a status asked before the app's records changed changes nothing, not even the account choice. */
+    @Test fun aStaleStatusChangesNothingBeforeTheRevisionCheck() {
+        lateinit var queue: MigrationInstallQueue
+        var changeDuringAsk = false
+        queue = MigrationInstallQueue(context, { _, _ -> capabilities(true) }) { operation, _ ->
+            // While Aurora is asked about the app, its selection is recorded again (its records change).
+            if (operation == 3 && changeDuringAsk) { changeDuringAsk = false; queue.select(selected()) }
+            refusedByGoogleAccount()
+        }
+        queue.select(selected())
+        assertTrue(queue.dispatch(name))
+        // A new attempt for the same app is pending (Switch handed it again), and Aurora still shows the earlier one.
+        val prefs = context.getSharedPreferences("migration-installs", 0)
+        val id = queue.currentSessionId()!!
+        check(prefs.edit().putStringSet("$id:pending", setOf(name)).putBoolean("$id:$name:owner_account", false).remove("$id:$name:ownerVersion").commit())
+        changeDuringAsk = true
+        assertFalse("decided in the next round", queue.dispatch(name))
+        assertFalse(prefs.getBoolean("$id:$name:owner_account", false))
+        assertFalse(prefs.contains("$id:$name:ownerVersion"))
+    }
 }
