@@ -56,6 +56,48 @@ class MigrationLockTest {
         } finally { release.countDown(); job.shutdown(); controller.destroy() }
     }
 
+    /** 11-17 founders-02: Switch's chunks took up to 32 s while installs held the lock across their Aurora calls. */
+    @Test fun switchsNextChunkIsAcceptedWhileAnInstallWaitsForAurora() {
+        val inAurora = CountDownLatch(1); val release = CountDownLatch(1)
+        val queue = MigrationInstallQueue(context) { operation, name ->
+            if (operation == 2) { inAurora.countDown(); release.await(10, TimeUnit.SECONDS) }
+            Bundle().apply { putString("package_name", name); putString("status", if (operation == 2) "queued" else "none") }
+        }
+        queue.select(listOf(Bundle().apply { putString("package_name", "a.example.app") }))
+        val job = Executors.newSingleThreadExecutor()
+        try {
+            val dispatched = job.submit<Boolean> { queue.dispatch("a.example.app") }
+            assertTrue(inAurora.await(5, TimeUnit.SECONDS))
+            val started = System.nanoTime()
+            queue.select(listOf(Bundle().apply { putString("package_name", "b.example.app") }))
+            assertTrue("a chunk waited for the install", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 1000)
+            assertEquals(setOf("a.example.app", "b.example.app"), queue.selected())
+            release.countDown()
+            assertTrue(dispatched.get(5, TimeUnit.SECONDS))
+            assertEquals(setOf("b.example.app"), queue.pending())
+        } finally { release.countDown(); job.shutdown() }
+    }
+
+    @Test fun switchsNextChunkIsAcceptedWhileTheSummaryAsksAurora() {
+        val asking = CountDownLatch(1); val release = CountDownLatch(1)
+        val queue = MigrationInstallQueue(context) { _, name ->
+            asking.countDown(); release.await(10, TimeUnit.SECONDS)
+            Bundle().apply { putString("package_name", name); putString("status", "queued") }
+        }
+        queue.select(listOf(Bundle().apply { putString("package_name", "a.example.app") }))
+        val job = Executors.newSingleThreadExecutor()
+        try {
+            val summary = job.submit<Bundle> { queue.summary() }
+            assertTrue(asking.await(5, TimeUnit.SECONDS))
+            val started = System.nanoTime()
+            queue.select(listOf(Bundle().apply { putString("package_name", "b.example.app") }))
+            assertTrue("a chunk waited for the summary", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 1000)
+            release.countDown()
+            val results = summary.get(5, TimeUnit.SECONDS).getParcelableArray("cyclon_app_results")!!.map { (it as Bundle).getString("package_name") }
+            assertEquals(listOf("a.example.app", "b.example.app"), results)
+        } finally { release.countDown(); job.shutdown() }
+    }
+
     @Test fun anAppPlayKeepsRefusingGoesBehindTheOthersAcrossSessions() {
         val queue = MigrationInstallQueue(context) { operation, name ->
             if (operation == 3) Bundle().apply { putString("package_name", name); putString("status", "none") }

@@ -309,14 +309,28 @@ internal class MigrationInstallQueue(private val context: Context,
         putString("status", "removed"); putString("error", "removed_by_owner")
         putBoolean("installed", false); putBoolean("terminal", true)
     }
-    fun summary(id: String = currentSessionId().orEmpty()): Bundle = synchronized(LOCK) {
+    /**
+     * Every app's state, asked of Aurora before taking [LOCK] (one call per open app): Switch's next chunk and its status
+     * calls never wait for these round trips, only for the bookkeeping after them.
+     */
+    fun summary(id: String = currentSessionId().orEmpty()): Bundle {
+        val asked = synchronized(LOCK) {
+            val pending = pending(id)
+            selected(id).filter { !(prefs.getBoolean("$id:$it:terminal", false) && it !in pending) }
+        }.associateWith { bridge(3, it) }
+        val refused = asked.values.any { it.getString("status") == "failed" && it.getString("errorCode") in DOWNLOAD_REFUSALS }
         // Null when Aurora could not be asked: the refused download then waits for a later summary, not a failure.
-        val ownerFallback by lazy { control(7, Bundle()).takeUnless { it.getString("error") == "store_unavailable" }?.getBoolean("owner_account_fallback") }
+        val fallback = if (refused) control(7, Bundle()).takeUnless { it.getString("error") == "store_unavailable" }?.getBoolean("owner_account_fallback") else null
+        return synchronized(LOCK) { summarize(id, asked, refused, fallback) }
+    }
+    private fun summarize(id: String, asked: Map<String, Bundle>, fallbackAsked: Boolean, fallback: Boolean?): Bundle {
+        val ownerFallback by lazy { if (fallbackAsked) fallback else control(7, Bundle()).takeUnless { it.getString("error") == "store_unavailable" }?.getBoolean("owner_account_fallback") }
         val results = selected(id).sorted().map { name ->
             val saved = document(id, name)
             if (saved.getBoolean("terminal") && name !in pending(id)) return@map saved
             var result = saved.apply {
-                val current = bridge(3, name)
+                // An app that became open while Aurora was asked about the others is asked now (rare).
+                val current = asked[name] ?: bridge(3, name)
                 if (current.getString("status") != "none") { remove("error"); remove("errorCode") }
                 if (current.getString("title") == name) current.remove("title")
                 if (current.getString("icon_url").isNullOrEmpty()) current.remove("icon_url")
@@ -374,7 +388,7 @@ internal class MigrationInstallQueue(private val context: Context,
         } + prefs.getStringSet("$id:excluded", emptySet()).orEmpty().filter { it !in selected(id) }.sorted().map { name ->
             document(id, name).apply { putBoolean("terminal", true); putBoolean("excluded", true) }
         }
-        Bundle().apply {
+        return Bundle().apply {
             putString("session_id", id); putParcelableArray("cyclon_app_results", results.toTypedArray())
             putString("transfer_outcome", prefs.getString("$id:transfer_outcome", null))
             putBoolean("all_installed", results.all { it.getBoolean("installed") })
@@ -407,20 +421,39 @@ internal class MigrationInstallQueue(private val context: Context,
             unfrozen?.let { summary(it) }
         }
     }
-    fun dispatch(name: String, id: String = session()): Boolean = synchronized(LOCK) {
-        if (name !in pending(id)) return true
+    /**
+     * Hands one pending app to Aurora. Aurora is asked and called outside [LOCK]: only the bookkeeping around those calls
+     * holds it, so Switch's next chunk ([select]) never waits behind an install (11-17 founders-02: chunks took up to 32 s).
+     * The job runs dispatches one at a time; [retry] and [select] may change the app's records meanwhile, so each step
+     * reads them again under the lock.
+     */
+    fun dispatch(name: String, id: String = session()): Boolean {
+        if (synchronized(LOCK) { name !in pending(id) }) return true
         val current = bridge(3, name)
         if (current.getString("error") == "store_unavailable") return false
+        val request = synchronized(LOCK) { decide(name, id, current) } ?: return true
+        if (request.done != null) return request.done
+        val result = bridge(2, name, request.options)
+        // Aurora's answers that need another Aurora call, asked before taking the lock again.
+        val supported = if (result.getString("error") in ANONYMOUS_FAILURES && !request.ownerAccount) ownerAccountSupported() else false
+        // Without a store session, ask Aurora to prepare one before the next round (unless the Google account takes over).
+        if (result.getString("error") in SESSION_FAILURES && !supported) control(6)
+        return synchronized(LOCK) { settle(name, id, result, request, supported) }
+    }
+    private class Request(val options: Bundle, val ownerRetry: Boolean, val ownerAccount: Boolean, val done: Boolean? = null)
+    /** What to do with [current]: null when nothing is left to do, a [Request] to send, or one whose [Request.done] is the answer. */
+    private fun decide(name: String, id: String, current: Bundle): Request? {
+        if (name !in pending(id)) return null
+        fun finished(value: Boolean) = Request(Bundle(), false, false, value)
         if (prefs.getBoolean("$id:$name:ever_installed", false)) {
             save(name, if (satisfies(name, current, id)) current else removedResult(current), true, id)
-            return true
+            return finished(true)
         }
         val ownerRetry = prefs.getBoolean("$id:$name:owner_retry", false)
         val needsReview = !satisfies(name, current, id) && (
             current.getString("status") == "awaiting_install" || (current.getString("status") == "none" &&
                 (prefs.getBoolean("$id:$name:uncertain", false) || prefs.getBoolean("$id:$name:acknowledged", false))))
-        var requestedInstall = false
-        var result = if (removed(current)) {
+        val result = if (removed(current)) {
             check(prefs.edit().putBoolean("$id:$name:ever_installed", true).commit())
             removedResult(current)
         } else if (needsReview && !ownerRetry) {
@@ -429,7 +462,7 @@ internal class MigrationInstallQueue(private val context: Context,
             // Let the old attempt settle, then reconcile this session's still-pending target.
             save(name, current, id = id)
             check(prefs.edit().putBoolean("$id:$name:acknowledged", true).commit())
-            return false
+            return finished(false)
         } else if (ownerRetry && current.getString("status") == "awaiting_install" && !control(7, Bundle()).getBoolean("owner_approved_retry")) {
             ownerReview(current, "installation_confirmation_required") // Legacy Aurora: use its owner-facing install UI.
         } else if (needsEnqueue(name, current, id) || (ownerRetry && current.getString("status") == "awaiting_install")) {
@@ -437,34 +470,40 @@ internal class MigrationInstallQueue(private val context: Context,
             // return to review; the captured ownerRetry value applies only to this request.
             check(prefs.edit().putBoolean("$id:$name:uncertain", true)
                 .putBoolean("$id:$name:owner_retry", false).commit())
-            requestedInstall = true
-            bridge(2, name, options(id).apply {
+            val ownerAccount = prefs.getBoolean("$id:$name:owner_account", false)
+            return Request(options(id).apply {
                 // The Google account gets whatever version Play offers it; the reply's version_code becomes the floor.
-                putLong("minimum_version_code", if (prefs.getBoolean("$id:$name:owner_account", false)) 0 else expectedVersion(id, name))
+                putLong("minimum_version_code", if (ownerAccount) 0 else expectedVersion(id, name))
                 putBoolean("owner_approved_retry", ownerRetry)
-                putBoolean("owner_account_approved", prefs.getBoolean("$id:$name:owner_account", false))
+                putBoolean("owner_account_approved", ownerAccount)
                 // summary() queues a download Play refuses the anonymous session once more for the Google account.
-                putBoolean("owner_retry_on_refusal", !prefs.getBoolean("$id:$name:owner_account", false))
-            })
+                putBoolean("owner_retry_on_refusal", !ownerAccount)
+            }, ownerRetry, ownerAccount)
         } else current
+        return finished(record(name, id, result, requestedInstall = false, ownerRetry = ownerRetry))
+    }
+    /** The bookkeeping after Aurora's answer to an install request ([dispatch]). */
+    private fun settle(name: String, id: String, answer: Bundle, request: Request, supported: Boolean): Boolean {
+        var result = answer
+        val ownerRetry = request.ownerRetry
         if (result.getString("error") == "store_unavailable") return false
-        if (requestedInstall && prefs.getBoolean("$id:$name:owner_account", false) && result.getLong("version_code") > 0) {
+        if (prefs.getBoolean("$id:$name:owner_account", false) && result.getLong("version_code") > 0) {
             check(prefs.edit().putLong("$id:$name:ownerVersion", result.getLong("version_code")).commit())
         }
-        if (requestedInstall && result.getString("error") in ANONYMOUS_FAILURES &&
-            !prefs.getBoolean("$id:$name:owner_account", false) && ownerAccountSupported()) {
+        if (result.getString("error") in ANONYMOUS_FAILURES &&
+            !prefs.getBoolean("$id:$name:owner_account", false) && supported) {
             // As on a Pixel, Play may install with the phone's Google account. Aurora refused before enqueuing,
             // so this is no uncertain install: keep the app pending for the account and keep the owner's retry.
             check(prefs.edit().putBoolean("$id:$name:owner_account", true).remove("$id:$name:ownerVersion").putBoolean("$id:$name:uncertain", false)
                 .putBoolean("$id:$name:owner_retry", ownerRetry).putInt("$id:$name:throttle_count", 0).commit())
             return false
         }
-        val sessionFailure = requestedInstall && result.getString("error") in SESSION_FAILURES
-        if (requestedInstall && (result.getString("error") == RATE_LIMITED || sessionFailure)) {
+        val sessionFailure = result.getString("error") in SESSION_FAILURES
+        if (result.getString("error") == RATE_LIMITED || sessionFailure) {
             // Aurora refused before enqueuing, so this is no uncertain install. Keep it pending, and keep the owner's retry.
-            // Without a store session (and after the Google account fallback), ask Aurora to prepare one before the next
-            // round instead of failing the app: on 10-30 a copy's last apps failed this way while the store recovered.
-            if (sessionFailure) control(6)
+            // Without a store session (and after the Google account fallback), [dispatch] already asked Aurora to prepare
+            // one before the next round instead of failing the app: on 10-30 a copy's last apps failed this way while the
+            // store recovered.
             throttled = true
             val refusals = prefs.getInt("$id:$name:throttle_count", 0) + 1
             check(prefs.edit().putBoolean("$id:$name:uncertain", false).putBoolean("$id:$name:owner_retry", ownerRetry)
@@ -473,6 +512,12 @@ internal class MigrationInstallQueue(private val context: Context,
             // Play keeps refusing: show the owner a failure they can retry.
             result = Bundle(result).apply { putString("status", "unavailable"); putBoolean("terminal", true) }
         }
+        return record(name, id, result, requestedInstall = true, ownerRetry = ownerRetry)
+    }
+    /** Saves [result] for [name]; false while an older attempt of it still has to settle. */
+    private fun record(name: String, id: String, answer: Bundle, requestedInstall: Boolean, ownerRetry: Boolean): Boolean {
+        var result = answer
+        if (result.getString("error") == "store_unavailable") return false
         // Aurora refused before enqueuing. Freeze that reason; a status refresh would show an older download row's error.
         if (requestedInstall && result.getString("status") == "unavailable") result = Bundle(result).apply { putBoolean("terminal", true) }
         if (requestedInstall && result.getString("status") == "installed" && !satisfies(name, result, id) &&
@@ -485,7 +530,7 @@ internal class MigrationInstallQueue(private val context: Context,
         save(name, result, dispatched = !retainTarget, id = id)
         if (retainTarget) check(prefs.edit().putBoolean("$id:$name:acknowledged", true).putBoolean("$id:$name:uncertain", false).commit())
         changed(id)
-        !retainTarget
+        return !retainTarget
     }
     fun bridge(operation: Int, name: String, options: Bundle? = null): Bundle = try {
         storeCall?.let { sentOptions?.invoke(operation, options); it(operation, name) }
