@@ -638,6 +638,11 @@ internal class MigrationInstallQueue(private val context: Context,
         if (prefs.getInt("$id:$name:retry_gen", 0) != request.retryGen) return false
         var result = answer
         val ownerRetry = request.ownerRetry
+        // Review of #103: Aurora refused this request before enqueuing it (no store, a rate limit, no session), so its
+        // download row is still the previous attempt's: this attempt asked no account yet, and that row's account choice
+        // must not be adopted by a later summary. The next request marks all_accounts again.
+        val preEnqueue = result.getString("error").let { it == "store_unavailable" || it == RATE_LIMITED || it in SESSION_FAILURES }
+        if (preEnqueue) check(prefs.edit().putBoolean("$id:$name:all_accounts", false).commit())
         if (result.getString("error") == "store_unavailable") return false
         adoptGoogleAccount(id, name, result)
         if (prefs.getBoolean("$id:$name:owner_account", false) && result.getLong("version_code") > 0) {

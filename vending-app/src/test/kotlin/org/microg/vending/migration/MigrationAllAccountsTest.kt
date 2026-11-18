@@ -172,4 +172,26 @@ class MigrationAllAccountsTest {
         assertFalse(prefs.getBoolean("$id:$name:owner_account", false))
         assertFalse(prefs.contains("$id:$name:ownerVersion"))
     }
+
+    /** Review of #103: a Retry Aurora rate-limits before enqueuing leaves the old row, and a later summary never adopts it. */
+    @Test fun aRateLimitedRetryNeverAdoptsTheOldAttemptsGoogleAccount() {
+        val sent = mutableListOf<Bundle>()
+        var limited = false
+        val queue = MigrationInstallQueue(context, { _, _ -> capabilities(true) }) { operation, _ ->
+            if (operation == 2 && limited) MigrationInstallQueue.unavailable(name, "rate_limited").apply { putString("status", "failed") }
+            else refusedByGoogleAccount()
+        }.apply { sentOptions = { operation, options -> if (operation == 2) sent += options!! } }
+        queue.select(selected())
+        val id = queue.currentSessionId()!!
+        assertTrue(queue.dispatch(name))
+        queue.retry(id, name)
+        limited = true
+        assertFalse("rate limited: tried again later", queue.dispatch(name))
+        queue.summary(id, reschedule = false)
+        limited = false
+        queue.dispatch(name)
+        val again = sent.last()
+        assertEquals(12L, again.getLong("minimum_version_code"))
+        assertFalse(again.getBoolean("owner_account_approved"))
+    }
 }
