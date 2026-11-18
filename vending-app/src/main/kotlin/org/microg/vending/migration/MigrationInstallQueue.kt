@@ -10,6 +10,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.DeadObjectException
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -691,20 +692,26 @@ internal class MigrationInstallQueue(private val context: Context,
     /**
      * Aurora's status of each of [names], over one binding (CYC-2573: one bind and unbind per app made Aurora create and
      * destroy its service for each). A failed call fails only its app, as [bridge] does, and the next app binds again;
-     * so does one after Aurora died. The storeCall test hook keeps one [bridge] call per app.
+     * so does one after Aurora died. A call that finds the binding of an earlier app dead (Aurora died before Android
+     * told us) is made once more over a new binding, as [bridge]'s own binding would have been. The storeCall test hook
+     * keeps one [bridge] call per app.
      */
     private fun statuses(names: Collection<String>): Map<String, Bundle> {
         if (storeCall != null) return names.associateWith { bridge(3, it) }
         var link: AuroraMigrationClient? = null
         fun drop() { link?.let { runCatching { it.close() } }; link = null }
+        fun ask(name: String): Bundle = (link ?: AuroraMigrationClient(context).also { link = it }).call(3, name)
         try {
             return names.associateWith { name ->
+                if (link?.alive == false) drop()
+                val reused = link != null
                 try {
-                    if (link?.alive == false) drop()
-                    (link ?: AuroraMigrationClient(context).also { link = it }).call(3, name)
-                } catch (_: Exception) {
+                    ask(name)
+                } catch (e: Exception) {
                     drop()
-                    unavailable(name, "store_unavailable")
+                    if (reused && e is DeadObjectException) {
+                        try { ask(name) } catch (_: Exception) { drop(); unavailable(name, "store_unavailable") }
+                    } else unavailable(name, "store_unavailable")
                 }
             }
         } finally { drop() }

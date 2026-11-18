@@ -167,6 +167,60 @@ class MigrationSummaryBindingTest {
         assertEquals(expectedThree(::threeAnswers), rendered)
     }
 
+    @Test fun anAppAskedJustAfterAuroraDiedIsAskedAgainOverANewBinding() {
+        // Aurora died after app 1 and Android has not said so yet: the binder still looks alive, and the next call on
+        // it fails as a dead object. bind-per-app would have bound again for app 2 and got Aurora's answer.
+        val store = object : Binder() {
+            init { attachInterface(null, AuroraMigrationClient.DESCRIPTOR) }
+            val asked = mutableListOf<String>()
+            var calls = 0
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                if (code != 3) return false
+                data.enforceInterface(AuroraMigrationClient.DESCRIPTOR)
+                val name = requireNotNull(data.readString())
+                if (++calls == 2) throw android.os.DeadObjectException()
+                asked += name
+                requireNotNull(reply).writeNoException(); reply.writeInt(1); threeAnswers(name).writeToParcel(reply, 0)
+                return true
+            }
+        }.also(::installAurora)
+        val context = CountingContext(app)
+        val queue = MigrationInstallQueue(context, { _, _ -> Bundle() })
+        selectThree(queue)
+        val rendered = render(queue.summary())
+        assertEquals(three.sorted(), store.asked.sorted())
+        assertEquals(2, context.binds)
+        assertEquals(2, context.unbinds)
+        assertTrue(shadowOf(app).boundServiceConnections.isEmpty())
+        assertEquals(expectedThree(::threeAnswers), rendered)
+    }
+
+    @Test fun aDeadObjectOnAFreshBindingIsNotAskedAgain() {
+        // Each app binds anew here (the binder reports itself dead after each answer), so a dead object on its fresh
+        // binding fails only that app, as bridge() did.
+        val failing = object : Binder() {
+            init { attachInterface(null, AuroraMigrationClient.DESCRIPTOR) }
+            var calls = 0
+            override fun isBinderAlive() = false
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                if (code != 3) return false
+                data.enforceInterface(AuroraMigrationClient.DESCRIPTOR)
+                val name = requireNotNull(data.readString())
+                if (++calls == 2) throw android.os.DeadObjectException()
+                requireNotNull(reply).writeNoException(); reply.writeInt(1); threeAnswers(name).writeToParcel(reply, 0)
+                return true
+            }
+        }.also(::installAurora)
+        val context = CountingContext(app)
+        val queue = MigrationInstallQueue(context, { _, _ -> Bundle() })
+        selectThree(queue)
+        val summary = queue.summary()
+        assertEquals(3, failing.calls)
+        assertEquals(3, context.binds)
+        val results = summary.getParcelableArray("cyclon_app_results")!!.map { it as Bundle }.associateBy { it.getString("package_name") }
+        assertEquals(1, results.values.count { it.getString("error") == "store_unavailable" })
+    }
+
     /**
      * cyclon_app_results for a large Setup copy: 300 selected apps, 150 of them open (asked of Aurora), and 10 the copy
      * left out. Recorded before CYC-2573; the receipts must stay the same byte for byte.
