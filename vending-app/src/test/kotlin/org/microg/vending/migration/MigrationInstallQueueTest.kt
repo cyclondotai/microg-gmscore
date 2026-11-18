@@ -114,6 +114,9 @@ class MigrationInstallQueueTest {
         val downloads = names.associateWith { state("none") }.toMutableMap()
         val ownerInstalls = mutableListOf<String>()
         var now = 0L
+        var handoffs = 0
+        var refusedPendingAtEnd = false
+        fun lastHandoff() = ++handoffs == names.size
         val queue = MigrationInstallQueue(context, { _, _ -> Bundle().apply { putBoolean("owner_account_fallback", true) } }) { operation, name ->
             if (operation == 3) Bundle(downloads.getValue(name))
             else {
@@ -122,13 +125,41 @@ class MigrationInstallQueueTest {
                 (if (name == names[0]) state("failed").apply { putString("error", "failed"); putString("errorCode", "app_not_purchased") }
                     else state("queued")).also { downloads[name] = it }
             }
-        }.apply { sentOptions = { operation, options -> if (operation == 2 && options!!.getBoolean("owner_account_approved")) ownerInstalls += "x" } }
+        }.apply { sentOptions = { operation, options ->
+            if (operation == 2 && options!!.getBoolean("owner_account_approved")) ownerInstalls += "x"
+            // By the last handoff of the pass (80 s in), the refusal is already queued again for the Google account.
+            if (operation == 2 && options!!.getString("session_id") != null && lastHandoff()) refusedPendingAtEnd = names[0] in pending()
+        } }
         queue.select(names.map { name -> Bundle().apply { putString("package_name", name); putLong("version_code", 12) } })
         queue.dispatchRound(clock = { now })
-        // Within the pass (by its 4th handoff, 60 s in) the refusal was queued once more, for the Google account.
+        assertTrue("queued again within the pass, not at its end", refusedPendingAtEnd)
         assertTrue(names[0] in queue.pending())
         assertTrue(queue.dispatchRound(clock = { now }))
         assertEquals(1, ownerInstalls.size)
+    }
+
+    /** #100 review: a status Aurora gave before an install was recorded must not freeze the app for owner review. */
+    @Test fun aStatusAskedBeforeAnInstallWasRecordedIsNotApplied() {
+        val asked = java.util.concurrent.CountDownLatch(1); val go = java.util.concurrent.CountDownLatch(1)
+        var installed = false
+        val queue = MigrationInstallQueue(context) { operation, _ ->
+            when {
+                operation == 2 -> { installed = true; state("queued") }
+                Thread.currentThread().name == "summary" -> { val before = installed; asked.countDown(); go.await(5, java.util.concurrent.TimeUnit.SECONDS); if (before) state("queued") else state("none") }
+                else -> if (installed) state("queued") else state("none")
+            }
+        }
+        queue.select(selected())
+        var summary: Bundle? = null
+        val thread = Thread({ summary = queue.summary() }, "summary").apply { start() }
+        assertTrue(asked.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        assertTrue(queue.dispatch("org.example.app"))   // queued meanwhile
+        go.countDown(); thread.join(5000)
+        val app = summary!!.getParcelableArray("cyclon_app_results")!!.map { it as Bundle }.single()
+        assertNotEquals("owner_action_required", app.getString("status"))
+        assertFalse(app.getBoolean("terminal"))
+        // The next summary sees the queued install.
+        assertEquals("queued", queue.summary().getParcelableArray("cyclon_app_results")!!.map { it as Bundle }.single().getString("status"))
     }
 
     /** 10-30 customer-98: the Google account's Play offered an older version than Switch listed (Blindmate, Tinder). */
