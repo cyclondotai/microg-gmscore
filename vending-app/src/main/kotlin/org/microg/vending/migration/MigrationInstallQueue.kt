@@ -350,8 +350,11 @@ internal class MigrationInstallQueue(private val context: Context,
             .putStringSet("$id:excluded", prefs.getStringSet("$id:excluded", emptySet()).orEmpty() - added.toSet())
         for (name in names) bump(id, name)
         for (name in names) edit.putInt("$id:$name:retry_gen", prefs.getInt("$id:$name:retry_gen", 0) + 1)
+        // A Retry starts clean (Greptile on #102): the previous attempt's all_accounts mark goes with its account choice, so
+        // a status still showing that failed attempt (google_account, its version_code) is never adopted for this one.
         for (name in names) edit.putBoolean("$id:$name:terminal", false).putBoolean("$id:$name:uncertain", false)
             .putBoolean("$id:$name:owner_retry", true).putBoolean("$id:$name:owner_account", false)
+            .putBoolean("$id:$name:all_accounts", false).remove("$id:$name:ownerVersion")
             .putInt("$id:$name:throttle_count", 0)
         check(edit.commit())
     }
@@ -566,9 +569,9 @@ internal class MigrationInstallQueue(private val context: Context,
             val approvedRetry = current.getString("status") == "awaiting_install" &&
                 control(7, Bundle()).getBoolean("owner_approved_retry")
             val request = synchronized(LOCK) {
-                adoptGoogleAccount(id, name, current)
-                // The owner retried while Aurora was asked: decide in the next round.
+                // The owner retried while Aurora was asked: decide in the next round, with nothing changed by this stale answer.
                 if (revision(id, name) != asked) return false
+                adoptGoogleAccount(id, name, current)
                 decide(name, id, current, approvedRetry)?.also { bump(id, name) }
             } ?: return true
             if (request.done != null) return request.done
@@ -635,6 +638,11 @@ internal class MigrationInstallQueue(private val context: Context,
         if (prefs.getInt("$id:$name:retry_gen", 0) != request.retryGen) return false
         var result = answer
         val ownerRetry = request.ownerRetry
+        // Review of #103: Aurora refused this request before enqueuing it (no store, a rate limit, no session), so its
+        // download row is still the previous attempt's: this attempt asked no account yet, and that row's account choice
+        // must not be adopted by a later summary. The next request marks all_accounts again.
+        val preEnqueue = result.getString("error").let { it == "store_unavailable" || it == RATE_LIMITED || it in SESSION_FAILURES }
+        if (preEnqueue) check(prefs.edit().putBoolean("$id:$name:all_accounts", false).commit())
         if (result.getString("error") == "store_unavailable") return false
         adoptGoogleAccount(id, name, result)
         if (prefs.getBoolean("$id:$name:owner_account", false) && result.getLong("version_code") > 0) {
