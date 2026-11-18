@@ -181,8 +181,12 @@ internal class MigrationInstallQueue(private val context: Context,
         }
         if (doc.containsKey("version_code")) edit.putLong("$id:$name:expectedVersion", doc.getLong("version_code"))
     }
-    fun select(documents: List<Bundle>) = synchronized(LOCK) {
+    fun select(documents: List<Bundle>) {
+        // Aurora is asked outside LOCK: with Switch's update hold on, a slow answer must not hold the queue's bookkeeping.
         check(storeReady()) { "Update App Store before transferring apps" }
+        record(documents)
+    }
+    private fun record(documents: List<Bundle>) = synchronized(LOCK) {
         val id = session()
         check(!prefs.getBoolean("$id:selection_closed", false)) { "App selection is already closed" }
         val names = documents.map { requireNotNull(it.getString("package_name")) }.toSet()

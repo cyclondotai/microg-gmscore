@@ -98,6 +98,30 @@ class MigrationLockTest {
         } finally { release.countDown(); job.shutdown() }
     }
 
+    /** Review of #100: with Switch's update hold on, a chunk asks Aurora whether it holds updates; never under LOCK. */
+    @Test fun aChunkAsksAuroraForTheUpdateHoldOutsideTheLock() {
+        val asking = CountDownLatch(1); val release = CountDownLatch(1)
+        val queue = MigrationInstallQueue(context, storeCall = { _, name ->
+            Bundle().apply { putString("package_name", name); putString("status", "none") }
+        }, controlCall = { operation, _ ->
+            if (operation == 7) { asking.countDown(); release.await(10, TimeUnit.SECONDS) }
+            Bundle().apply { putBoolean("success", true); putBoolean("automatic_update_hold", true) }
+        })
+        queue.select(listOf(Bundle().apply { putString("package_name", "a.example.app") }))
+        queue.requireUpdateHold()
+        val job = Executors.newSingleThreadExecutor()
+        try {
+            val chunk = job.submit { queue.select(listOf(Bundle().apply { putString("package_name", "b.example.app") })) }
+            assertTrue(asking.await(5, TimeUnit.SECONDS))
+            val started = System.nanoTime()
+            queue.recordOptions(Bundle().apply { putString("restore_source", "android") })
+            assertTrue("the queue's bookkeeping waited for Aurora", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 1000)
+            release.countDown()
+            chunk.get(5, TimeUnit.SECONDS)
+            assertEquals(setOf("a.example.app", "b.example.app"), queue.selected())
+        } finally { release.countDown(); job.shutdown() }
+    }
+
     @Test fun anAppPlayKeepsRefusingGoesBehindTheOthersAcrossSessions() {
         val queue = MigrationInstallQueue(context) { operation, name ->
             if (operation == 3) Bundle().apply { putString("package_name", name); putString("status", "none") }
