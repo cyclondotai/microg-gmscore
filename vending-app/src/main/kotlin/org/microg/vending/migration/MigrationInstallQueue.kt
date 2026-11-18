@@ -446,16 +446,18 @@ internal class MigrationInstallQueue(private val context: Context,
      * reads them again under the lock.
      */
     fun dispatch(name: String, id: String = session()): Boolean {
-        val asked = synchronized(LOCK) { if (name !in pending(id)) return true; revision(id, name) }
-        val current = bridge(3, name)
-        if (current.getString("error") == "store_unavailable") return false
-        val request = synchronized(LOCK) {
-            // The app changed while Aurora was asked (a summary saved it, the owner retried): decide in the next round.
-            if (revision(id, name) != asked) return false
-            decide(name, id, current)?.also { if (it.done == null) IN_FLIGHT += key(id, name); bump(id, name) }
-        } ?: return true
-        if (request.done != null) return request.done
+        // In flight from before Aurora is asked about it: a summary meanwhile leaves the app alone (and saves nothing that
+        // would make this answer look stale).
+        val asked = synchronized(LOCK) { if (name !in pending(id)) return true; IN_FLIGHT += key(id, name); revision(id, name) }
         try {
+            val current = bridge(3, name)
+            if (current.getString("error") == "store_unavailable") return false
+            val request = synchronized(LOCK) {
+                // The owner retried while Aurora was asked: decide in the next round.
+                if (revision(id, name) != asked) return false
+                decide(name, id, current)?.also { bump(id, name) }
+            } ?: return true
+            if (request.done != null) return request.done
             val result = bridge(2, name, request.options)
             // Aurora's answers that need another Aurora call, asked before taking the lock again.
             val supported = if (result.getString("error") in ANONYMOUS_FAILURES && !request.ownerAccount) ownerAccountSupported() else false
@@ -615,9 +617,10 @@ class MigrationInstallJob : JobService() {
                     retry = false
                     if (!queue.dispatchRound(cancelled = { cancelled.get() })) retry = true
                     if (cancelled.get()) return@execute
+                    val states = mutableMapOf<String, Bundle>()
                     for (id in queue.sessions()) {
                         // The job's own loop goes on by itself: scheduling the same job here would stop it.
-                        val state = queue.summary(id, reschedule = false)
+                        val state = queue.summary(id, reschedule = false).also { states[id] = it }
                         queue.changed(id)
                         MigrationNotifications.selectionOpen(this, id, state)
                         if (state.getBoolean("complete")) {
@@ -630,7 +633,7 @@ class MigrationInstallJob : JobService() {
                             queue.renewPause(id)
                         }
                     }
-                    MigrationSetupReceivers.publish(queue)
+                    MigrationSetupReceivers.publish(queue, states)
                     if (retry && !cancelled.get()) Thread.sleep(if (queue.throttled) 30_000 else 2000)
                 } while (retry && !cancelled.get() && System.nanoTime() < deadline)
             } catch (_: Exception) { retry = true }

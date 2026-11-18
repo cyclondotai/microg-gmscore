@@ -30,14 +30,18 @@ internal object MigrationSetupReceivers {
 
     internal fun clearForTests() = synchronized(lock) { listeners.clear(); holds.clear() }
 
-    fun publish(queue: MigrationInstallQueue) {
+    /**
+     * Sends each subscribed session its summary. [known] are the summaries the install job just collected: the job
+     * publishes those, so it never runs a second summary that could queue a retry and reschedule (and so stop) itself.
+     */
+    fun publish(queue: MigrationInstallQueue, known: Map<String, android.os.Bundle> = emptyMap()) {
         val (subscribers, waiting) = synchronized(lock) {
             listeners.keys.removeAll { !it.isBinderAlive }
             holds.keys.removeAll { !it.isBinderAlive }
             listeners.toMap() to holds.toMap()
         }
         for (session in (subscribers.values + waiting.values).map { it.session }.distinct()) {
-            val summary = runCatching { queue.summary(session) }.getOrNull() ?: continue
+            val summary = known[session] ?: runCatching { queue.summary(session) }.getOrNull() ?: continue
             val complete = summary.getBoolean("complete")
             for ((key, listener) in subscribers.filterValues { it.session == session }) {
                 val failed = !key.isBinderAlive || runCatching {
