@@ -38,6 +38,8 @@ internal class AuroraMigrationClient(private val context: Context) : Closeable {
         check(binder.interfaceDescriptor == DESCRIPTOR) { "Wrong Aurora migration bridge" }
     }
     private val wire by lazy { AuroraMigrationWire(binder) }
+    /** False once Aurora's process died: a caller keeping this client for several calls binds again. */
+    val alive: Boolean get() = binder.isBinderAlive
     fun call(operation: Int, name: String, options: Bundle? = null): Bundle = wire.call(operation, name, options)
     fun control(operation: Int, options: Bundle): Bundle = wire.control(operation, options)
     override fun close() { if (bound) context.unbindService(connection) }

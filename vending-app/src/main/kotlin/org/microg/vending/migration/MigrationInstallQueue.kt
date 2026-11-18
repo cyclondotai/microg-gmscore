@@ -20,20 +20,23 @@ internal class MigrationInstallQueue(private val context: Context,
     private val storeCall: ((Int, String) -> Bundle)? = null) {
     /** Tests: the options each faked [storeCall] request would carry to Aurora. */
     internal var sentOptions: ((Int, Bundle?) -> Unit)? = null
-    private val prefs get() = context.getSharedPreferences("migration-installs", Context.MODE_PRIVATE)
+    private val prefs = context.getSharedPreferences("migration-installs", Context.MODE_PRIVATE)
     /** Play answered 429 since the job last cleared this; stop the round and wait before asking again. */
     @Volatile var throttled = false
     /** Pending installs across sessions. Apps Play refused most recently go last, so one cannot block the rest. */
-    fun dispatchOrder(): List<Pair<String, String>> = sessions().flatMap { id -> pending(id).sorted().map { id to it } }
-        .sortedWith(compareBy({ (id, name) -> prefs.getLong("$id:$name:throttled_at", 0) }, { (id, name) -> tier(id, name) }))
+    fun dispatchOrder(): List<Pair<String, String>> = sessions().flatMap { id ->
+        // Each app's sort keys are read once, not on every comparison (a stable sort on the same keys: the same order).
+        val priority = prefs.getStringSet("$id:priority", emptySet()).orEmpty()
+        pending(id).sorted().map { name -> Triple(id to name, prefs.getLong("$id:$name:throttled_at", 0), tier(id, name, priority)) }
+    }.sortedWith(compareBy({ it.second }, { it.third })).map { it.first }
     /**
      * Within a session's open apps: the ones Setup asked for first ([prioritize]: the sign-in apps), then the ones going to
      * the phone's Google account after Play refused the anonymous session, then the rest in package order (11-17
      * founders-02: Google Authenticator waited behind every "ai.", "app." and "ch." app, and two refused apps behind the
      * whole 287-app pass).
      */
-    private fun tier(id: String, name: String): Int = when {
-        name in prefs.getStringSet("$id:priority", emptySet()).orEmpty() -> 0
+    private fun tier(id: String, name: String, priority: Set<String>): Int = when {
+        name in priority -> 0
         prefs.getBoolean("$id:$name:owner_account", false) -> 1
         else -> 2
     }
@@ -49,7 +52,7 @@ internal class MigrationInstallQueue(private val context: Context,
         val wanted = packages.filter { PACKAGE.matches(it) }.take(MAX_PRIORITY).toSet()
         val priority = prefs.getStringSet("$id:priority", emptySet()).orEmpty() + wanted
         check(prefs.edit().putStringSet("$id:priority", priority.toSet()).commit())
-        val open = wanted.count { it in pending(id) }
+        val open = wanted.count { isPending(id, it) }
         if (open > 0) schedule()
         Bundle().apply { putBoolean("supported", true); putBoolean("accepted", true); putInt("prioritized", open) }
     }
@@ -263,6 +266,9 @@ internal class MigrationInstallQueue(private val context: Context,
     }
     fun selected(id: String = currentSessionId().orEmpty()): Set<String> = prefs.getStringSet("$id:packages", emptySet()).orEmpty().toSet()
     fun pending(id: String = currentSessionId().orEmpty()): Set<String> = prefs.getStringSet("$id:pending", emptySet()).orEmpty().toSet()
+    /** Membership in the stored set without copying its ~300 entries; the set SharedPreferences returns is never changed. */
+    private fun isPending(id: String, name: String) = prefs.getStringSet("$id:pending", null)?.contains(name) == true
+    private fun isSelected(id: String, name: String) = prefs.getStringSet("$id:packages", null)?.contains(name) == true
     fun save(name: String, result: Bundle, dispatched: Boolean = false, id: String = session()) = synchronized(LOCK) {
         val before = row(id, name)
         val edit = prefs.edit()
@@ -286,7 +292,7 @@ internal class MigrationInstallQueue(private val context: Context,
         prefs.getString("$id:$name:status", null), prefs.getString("$id:$name:error", null),
         prefs.getBoolean("$id:$name:installed", false), prefs.getBoolean("$id:$name:terminal", false),
         prefs.getLong("$id:$name:installedVersion", 0), prefs.getBoolean("$id:$name:ever_installed", false),
-        name in pending(id), prefs.getBoolean("$id:$name:uncertain", false),
+        isPending(id, name), prefs.getBoolean("$id:$name:uncertain", false),
         prefs.getBoolean("$id:$name:acknowledged", false), prefs.getBoolean("$id:$name:owner_retry", false))
     fun retryDocuments(id: String = currentSessionId().orEmpty()): List<Bundle> = (selected(id).filter { name ->
         prefs.getString("$id:$name:status", null) in setOf("failed", "cancelled", "unavailable", "owner_action_required") &&
@@ -294,7 +300,7 @@ internal class MigrationInstallQueue(private val context: Context,
     } + recoverableExclusions(id)).map { name -> document(id, name) }
     /** Apps Switch left out because the store could not check them in time; the owner may still add them here. */
     private fun recoverableExclusions(id: String) = prefs.getStringSet("$id:excluded", emptySet()).orEmpty()
-        .filter { it !in selected(id) && prefs.getBoolean("$id:$it:recoverable", false) }.sorted()
+        .filter { !isSelected(id, it) && prefs.getBoolean("$id:$it:recoverable", false) }.sorted()
     /** Whether Aurora can install with the phone's Google account, the fallback when the anonymous session fails. */
     fun ownerAccountSupported(): Boolean = control(7, Bundle()).getBoolean("owner_account_fallback")
     /** Aurora's answer to [allAccountsSupported] in this round; null until asked, or when Aurora could not answer. */
@@ -412,7 +418,7 @@ internal class MigrationInstallQueue(private val context: Context,
                 selected(id).filter { (only == null || it in only!!) && (!(prefs.getBoolean("$id:$it:terminal", false) && it !in pending) || refusedBefore(id, it)) }
                     .associateWith { revision(id, it) }
             }
-            val asked = revs.keys.associateWith { bridge(3, it) }
+            val asked = statuses(revs.keys)
             // An all_accounts request's refusal is Aurora's last account's: nothing is left to queue for the Google account.
             val refused = asked.any { (name, it) -> it.getString("status") == "failed" && it.getString("errorCode") in DOWNLOAD_REFUSALS &&
                 !allAccountsAsked(id, name) }
@@ -431,14 +437,14 @@ internal class MigrationInstallQueue(private val context: Context,
                           reschedule: Boolean, stale: MutableSet<String>): Bundle {
         val results = selected(id).sorted().map { name ->
             val saved = document(id, name)
-            if (saved.getBoolean("terminal") && name !in pending(id) && !refusedBefore(id, name)) return@map saved
+            if (saved.getBoolean("terminal") && !isPending(id, name) && !refusedBefore(id, name)) return@map saved
             // Aurora's answer is stale when the app changed since it was asked, or an install request for it is still
             // waiting on Aurora: keep what was saved (open while in flight) and check it next time. An app that became
             // open after the others were asked is checked next time too, so Aurora is never called under the lock.
             val current = asked[name]
             if (current == null || key(id, name) in IN_FLIGHT || revision(id, name) != revs[name]) {
                 if (key(id, name) !in IN_FLIGHT) stale += name
-                return@map saved.apply { if (name in pending(id) || key(id, name) in IN_FLIGHT) putBoolean("terminal", false) }
+                return@map saved.apply { if (isPending(id, name) || key(id, name) in IN_FLIGHT) putBoolean("terminal", false) }
             }
             var result = saved.apply {
                 if (current.getString("status") != "none") { remove("error"); remove("errorCode") }
@@ -447,10 +453,10 @@ internal class MigrationInstallQueue(private val context: Context,
                 putAll(current)
             }
             adoptGoogleAccount(id, name, result)
-            val acknowledged = prefs.getBoolean("$id:$name:acknowledged", name !in pending(id) && prefs.contains("$id:$name:status"))
+            val acknowledged = prefs.getBoolean("$id:$name:acknowledged", !isPending(id, name) && prefs.contains("$id:$name:status"))
             val ownerRetry = prefs.getBoolean("$id:$name:owner_retry", false)
             val status = result.getString("status")
-            if (status == "failed" && result.getString("errorCode") in DOWNLOAD_REFUSALS && name !in pending(id) &&
+            if (status == "failed" && result.getString("errorCode") in DOWNLOAD_REFUSALS && !isPending(id, name) &&
                 !allAccountsAsked(id, name) &&
                 !prefs.getBoolean("$id:$name:owner_account", false) && !prefs.getBoolean("$id:$name:ever_installed", false) &&
                 ownerFallback != false) {
@@ -488,16 +494,16 @@ internal class MigrationInstallQueue(private val context: Context,
             } else if (status == "none" && prefs.getString("$id:$name:error", null) != null && !ownerRetry) {
                 result.putString("status", prefs.getString("$id:$name:status", "unavailable"))
                 result.putString("error", prefs.getString("$id:$name:error", null))
-            } else if (status == "installed" && !satisfies(name, result, id) && name !in pending(id)) {
+            } else if (status == "installed" && !satisfies(name, result, id) && !isPending(id, name)) {
                 result = ownerReview(result, "installation_verification_required")
             }
             if (!satisfies(name, result, id)) result.putBoolean("installed", false)
-            val terminal = result.getBoolean("installed") || (name !in pending(id) &&
+            val terminal = result.getBoolean("installed") || (!isPending(id, name) &&
                 result.getString("status") in TERMINAL && result.getString("error") != "store_unavailable")
             result.putBoolean("terminal", terminal)
             save(name, result, id = id)
             result
-        } + prefs.getStringSet("$id:excluded", emptySet()).orEmpty().filter { it !in selected(id) }.sorted().map { name ->
+        } + prefs.getStringSet("$id:excluded", emptySet()).orEmpty().filter { !isSelected(id, it) }.sorted().map { name ->
             document(id, name).apply { putBoolean("terminal", true); putBoolean("excluded", true) }
         }
         return Bundle().apply {
@@ -558,7 +564,7 @@ internal class MigrationInstallQueue(private val context: Context,
     fun dispatch(name: String, id: String = session()): Boolean {
         // In flight from before Aurora is asked about it: a summary meanwhile leaves the app alone (and saves nothing that
         // would make this answer look stale).
-        val asked = synchronized(LOCK) { if (name !in pending(id)) return true; IN_FLIGHT += key(id, name); revision(id, name) }
+        val asked = synchronized(LOCK) { if (!isPending(id, name)) return true; IN_FLIGHT += key(id, name); revision(id, name) }
         try {
             val current = bridge(3, name)
             if (current.getString("error") == "store_unavailable") return false
@@ -590,7 +596,7 @@ internal class MigrationInstallQueue(private val context: Context,
     private class Request(val options: Bundle, val ownerRetry: Boolean, val ownerAccount: Boolean, val done: Boolean? = null, val retryGen: Int = 0)
     /** What to do with [current]: null when nothing is left to do, a [Request] to send, or one whose [Request.done] is the answer. */
     private fun decide(name: String, id: String, current: Bundle, approvedRetry: Boolean): Request? {
-        if (name !in pending(id)) return null
+        if (!isPending(id, name)) return null
         fun finished(value: Boolean) = Request(Bundle(), false, false, value)
         if (prefs.getBoolean("$id:$name:ever_installed", false)) {
             save(name, if (satisfies(name, current, id)) current else removedResult(current), true, id)
@@ -681,6 +687,27 @@ internal class MigrationInstallQueue(private val context: Context,
         if (retainTarget) check(prefs.edit().putBoolean("$id:$name:acknowledged", true).putBoolean("$id:$name:uncertain", false).commit())
         changed(id)
         return !retainTarget
+    }
+    /**
+     * Aurora's status of each of [names], over one binding (CYC-2573: one bind and unbind per app made Aurora create and
+     * destroy its service for each). A failed call fails only its app, as [bridge] does, and the next app binds again;
+     * so does one after Aurora died. The storeCall test hook keeps one [bridge] call per app.
+     */
+    private fun statuses(names: Collection<String>): Map<String, Bundle> {
+        if (storeCall != null) return names.associateWith { bridge(3, it) }
+        var link: AuroraMigrationClient? = null
+        fun drop() { link?.let { runCatching { it.close() } }; link = null }
+        try {
+            return names.associateWith { name ->
+                try {
+                    if (link?.alive == false) drop()
+                    (link ?: AuroraMigrationClient(context).also { link = it }).call(3, name)
+                } catch (_: Exception) {
+                    drop()
+                    unavailable(name, "store_unavailable")
+                }
+            }
+        } finally { drop() }
     }
     fun bridge(operation: Int, name: String, options: Bundle? = null): Bundle = try {
         storeCall?.let { sentOptions?.invoke(operation, options); it(operation, name) }
