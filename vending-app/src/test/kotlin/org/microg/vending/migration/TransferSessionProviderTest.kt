@@ -179,6 +179,23 @@ class TransferSessionProviderTest {
         assertEquals(listOf("queued", "unavailable"), handoff.getStringArrayList("statuses"))
     }
 
+    @Test fun handoffReportsAnAppAlreadyOnThePhoneAsInstalledNotNone() {
+        val run = "00000000-0000-0000-0000-000000000001"
+        val onPhone = "com.google.android.gm"
+        val queue = MigrationInstallQueue(context) { _, name -> Bundle().apply {
+            putString("package_name", name); putString("status", "none")
+            putBoolean("installed", true); putLong("installed_version_code", 12)
+        } }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false).getBoolean("accepted"))
+        val id = queue.catalogSession()
+        queue.select(listOf(Bundle().apply { putString("package_name", onPhone); putLong("version_code", 12) }))
+        queue.finishSelection(id)
+        queue.dispatchRound()
+        val state = queue.summary(id)
+        assertTrue(state.getBoolean("installs_settled"))
+        assertEquals(listOf("installed"), queue.handoff(run).getStringArrayList("statuses"))
+    }
+
     @Test fun wizardSuccessAndCancelCloseSelectionWithoutClaimingAnInstallSucceeded() {
         for (outcome in listOf("success", "cancelled")) {
             val (queue, id) = selected()
