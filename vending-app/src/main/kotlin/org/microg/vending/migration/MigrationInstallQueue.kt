@@ -129,6 +129,9 @@ internal class MigrationInstallQueue(private val context: Context,
                     name in pending -> "pending"
                     // summary() may have lost its Aurora connection while checking a dispatched app.
                     status == "unavailable" && snapshot["$id:$name:error"] == "store_unavailable" -> "queued"
+                    // An app already on the phone has no Aurora download row: Aurora says "none", and summary() saved it
+                    // as installed (11-18 founders-02: Gmail and Chrome kept Setup's copy at "284 of 287" for good).
+                    status == "none" && snapshot["$id:$name:installed"] == true -> "installed"
                     else -> status
                 }
             }))
