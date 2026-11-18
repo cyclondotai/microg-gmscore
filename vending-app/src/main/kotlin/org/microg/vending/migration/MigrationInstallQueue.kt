@@ -693,12 +693,18 @@ internal class MigrationInstallQueue(private val context: Context,
     private fun schedule() {
         val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
         // Expedited (CYC-2499, 11-18 founders-02): at thermal status 2 Android held the default-priority job back for
-        // minutes (Restricted due to: thermal) while the copy's apps waited; an expedited job still runs there. Out of
-        // expedited quota, Android runs it as a regular job.
-        check(scheduler.schedule(JobInfo.Builder(JOB, ComponentName(context, MigrationInstallJob::class.java))
-            .setPersisted(true).setExpedited(true).build()) == JobScheduler.RESULT_SUCCESS)
+        // minutes (Restricted due to: thermal) while the copy's apps waited; an expedited job still runs there.
+        check(scheduleInstallJob(JobInfo.Builder(JOB, ComponentName(context, MigrationInstallJob::class.java)).setPersisted(true)) { scheduler.schedule(it) })
     }
     companion object {
+        /**
+         * The install job, expedited where Android allows it. Review of #101: Android refuses a new expedited job once the
+         * app's expedited quota is spent (only a pending one is demoted), which left a copy's apps with no install job at
+         * all; then the same job goes in, not expedited. Whether one was scheduled.
+         */
+        internal fun scheduleInstallJob(job: JobInfo.Builder, schedule: (JobInfo) -> Int): Boolean =
+            schedule(job.setExpedited(true).build()) == JobScheduler.RESULT_SUCCESS ||
+                schedule(job.setExpedited(false).build()) == JobScheduler.RESULT_SUCCESS
         const val ACTION_CHANGED = "org.microg.vending.migration.CHANGED"
         internal val LOCK = Any()
         /** Apps whose install request is with Aurora now ("session:package"); in-process, like the job and the service. */

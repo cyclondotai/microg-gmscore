@@ -116,4 +116,16 @@ class MigrationPriorityTest {
         assertTrue(job.isExpedited)
         assertTrue(job.isPersisted)
     }
+
+    /** Review of #101: out of expedited quota Android refuses a new expedited job; the same job goes in, not expedited. */
+    @Test fun anInstallJobAndroidRefusesToExpediteIsScheduledAsARegularOne() {
+        val tried = mutableListOf<Boolean>()
+        val builder = android.app.job.JobInfo.Builder(700714, android.content.ComponentName(context, MigrationInstallJob::class.java)).setPersisted(true)
+        val ok = MigrationInstallQueue.scheduleInstallJob(builder) { job ->
+            tried += job.isExpedited
+            if (job.isExpedited) android.app.job.JobScheduler.RESULT_FAILURE else android.app.job.JobScheduler.RESULT_SUCCESS
+        }
+        assertTrue(ok)
+        assertEquals(listOf(true, false), tried)
+    }
 }
