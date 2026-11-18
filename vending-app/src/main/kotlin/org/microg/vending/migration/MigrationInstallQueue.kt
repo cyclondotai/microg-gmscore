@@ -652,8 +652,11 @@ internal class MigrationInstallQueue(private val context: Context,
     fun changed(id: String) { context.sendBroadcast(Intent(ACTION_CHANGED).setPackage(context.packageName).putExtra("session_id", id)) }
     private fun schedule() {
         val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+        // Expedited (CYC-2499, 11-18 founders-02): at thermal status 2 Android held the default-priority job back for
+        // minutes (Restricted due to: thermal) while the copy's apps waited; an expedited job still runs there. Out of
+        // expedited quota, Android runs it as a regular job.
         check(scheduler.schedule(JobInfo.Builder(JOB, ComponentName(context, MigrationInstallJob::class.java))
-            .setPersisted(true).build()) == JobScheduler.RESULT_SUCCESS)
+            .setPersisted(true).setExpedited(true).build()) == JobScheduler.RESULT_SUCCESS)
     }
     companion object {
         const val ACTION_CHANGED = "org.microg.vending.migration.CHANGED"

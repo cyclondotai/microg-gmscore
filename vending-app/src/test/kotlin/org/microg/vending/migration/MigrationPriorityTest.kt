@@ -105,4 +105,15 @@ class MigrationPriorityTest {
         queue.dispatchRound()
         assertTrue(queue.pending(id).isEmpty())
     }
+
+    /** 11-18 founders-02: the default-priority job was held back at thermal status 2; the expedited one is not. */
+    @Test fun theInstallJobIsExpedited() {
+        val queue = MigrationInstallQueue(context) { _, name -> state(name, "none") }
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf(doc("org.example.app")))
+        val scheduler = context.getSystemService(android.content.Context.JOB_SCHEDULER_SERVICE) as android.app.job.JobScheduler
+        val job = scheduler.allPendingJobs.single()
+        assertTrue(job.isExpedited)
+        assertTrue(job.isPersisted)
+    }
 }
