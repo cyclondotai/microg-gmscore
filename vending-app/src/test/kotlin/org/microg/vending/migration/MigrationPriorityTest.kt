@@ -1,0 +1,72 @@
+/* SPDX-FileCopyrightText: 2026 Cyclon
+ * SPDX-License-Identifier: Apache-2.0 */
+package org.microg.vending.migration
+
+import android.content.Context
+import android.os.Bundle
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import org.robolectric.annotation.Config
+
+/** CYC-2499 (11-17 founders-02): Setup's sign-in apps and Google-account retries go to Aurora before the rest. */
+@RunWith(RobolectricTestRunner::class)
+@Config(manifest = Config.NONE, sdk = [35])
+class MigrationPriorityTest {
+    private val context: Context get() = RuntimeEnvironment.getApplication()
+    private val run = "0f8fad5b-d9cb-469f-a165-70867728950e"
+    @Before fun clear() { context.getSharedPreferences("migration-installs", 0).edit().clear().commit() }
+    private fun doc(name: String) = Bundle().apply { putString("package_name", name); putLong("version_code", 12) }
+    private fun state(name: String, status: String) = Bundle().apply { putString("package_name", name); putString("status", status); putLong("version_code", 12) }
+
+    @Test fun setupsSignInAppsGoFirstAndAPriorityMidRoundGoesNext() {
+        val handed = mutableListOf<String>()
+        lateinit var queue: MigrationInstallQueue
+        queue = MigrationInstallQueue(context) { operation, name ->
+            if (operation == 2) {
+                handed += name
+                // Setup recognizes Duo while the round runs: it goes next, not after the round.
+                if (handed.size == 2) assertEquals(1, queue.prioritize(run, listOf("com.duosecurity.duomobile")).getInt("prioritized"))
+                state(name, "queued")
+            } else state(name, "none")
+        }
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf("ai.x.grok", "app.cashbackplus", "ch.sbb.mobile.android.b2c", "com.duosecurity.duomobile",
+            "com.google.android.apps.authenticator2", "org.example.app").map(::doc))
+        val first = queue.prioritize(run, listOf("com.google.android.apps.authenticator2", "not a package"))
+        assertTrue(first.getBoolean("accepted")); assertEquals(1, first.getInt("prioritized"))
+        queue.dispatchRound()
+        assertEquals(listOf("com.google.android.apps.authenticator2", "ai.x.grok", "com.duosecurity.duomobile", "app.cashbackplus",
+            "ch.sbb.mobile.android.b2c", "org.example.app"), handed)
+    }
+
+    @Test fun anotherRunsPriorityIsRefused() {
+        val queue = MigrationInstallQueue(context) { _, name -> state(name, "none") }
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf(doc("org.example.app")))
+        val other = queue.prioritize("1b4e28ba-2fa1-11d2-883f-0016d3cca427", listOf("org.example.app"))
+        assertTrue(other.getBoolean("supported")); assertFalse(other.getBoolean("accepted"))
+    }
+
+    @Test fun aRefusalQueuedForTheGoogleAccountGoesNextInTheSameRound() {
+        val handed = mutableListOf<String>()
+        var clock = 0L
+        val queue = MigrationInstallQueue(context, controlCall = { _, _ -> Bundle().apply { putBoolean("owner_account_fallback", true) } }) { operation, name ->
+            when {
+                operation == 2 -> { handed += name; clock += 40_000; state(name, "queued") }
+                name == "a.refused.app" && handed.contains(name) -> state(name, "failed").apply { putString("errorCode", "app_not_purchased") }
+                else -> state(name, "none")
+            }
+        }
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf("a.refused.app", "b.example.app", "c.example.app", "d.example.app", "e.example.app").map(::doc))
+        queue.dispatchRound(clock = { clock })
+        // Refused at its first hand-off; the minute's check queues it for the Google account, and it goes right after.
+        assertEquals("a.refused.app", handed[0])
+        assertEquals(2, handed.count { it == "a.refused.app" })
+        assertTrue("retried before the round's end", handed.lastIndexOf("a.refused.app") < handed.size - 1)
+    }
+}

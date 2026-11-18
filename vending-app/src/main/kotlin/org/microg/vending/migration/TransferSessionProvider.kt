@@ -20,10 +20,18 @@ class TransferSessionProvider : ContentProvider() {
         val context = requireNotNull(context)
         val uid = Binder.getCallingUid()
         val manager = context.packageManager
-        val caller = if (method == "getHandoff" || method == "cancelHandoff") CORE else COMPANION
+        val caller = if (method == "getHandoff" || method == "cancelHandoff" || method == "prioritizeHandoff") CORE else COMPANION
         val app = try { manager.getApplicationInfo(caller, 0) }
         catch (_: PackageManager.NameNotFoundException) { throw SecurityException("Transfer caller is not installed") }
         checkCaller(app, uid, manager, caller)
+        if (method == "prioritizeHandoff") {
+            // Setup's sign-in apps go to Aurora first (Core's setup.transfer.handoff.prioritize).
+            val run = requireNotNull(arg).also { require(RUN.matches(it)) { "Invalid transfer run" } }
+            val packages = extras?.getStringArrayList("packages").orEmpty()
+            require(packages.size in 1..50) { "Expected 1 to 50 packages" }
+            val identity = Binder.clearCallingIdentity()
+            try { return MigrationInstallQueue(context).prioritize(run, packages) } finally { Binder.restoreCallingIdentity(identity) }
+        }
         if (method in setOf("beginHandoff", "getHandoff", "endHandoff", "cancelHandoff")) {
             val run = requireNotNull(arg).also { require(RUN.matches(it)) { "Invalid transfer run" } }
             val identity = Binder.clearCallingIdentity()

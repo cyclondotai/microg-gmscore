@@ -132,10 +132,10 @@ class MigrationInstallQueueTest {
         } }
         queue.select(names.map { name -> Bundle().apply { putString("package_name", name); putLong("version_code", 12) } })
         queue.dispatchRound(clock = { now })
-        assertTrue("queued again within the pass, not at its end", refusedPendingAtEnd)
-        assertTrue(names[0] in queue.pending())
-        assertTrue(queue.dispatchRound(clock = { now }))
-        assertEquals(1, ownerInstalls.size)
+        // CYC-2499: queued again within the pass, and handed to the Google account in that same pass (not the next round).
+        assertEquals("retried with the Google account in the same pass", 1, ownerInstalls.size)
+        assertFalse(names[0] in queue.pending())
+        assertFalse("the retry is not the pass's last handoff", refusedPendingAtEnd)
     }
 
     /** #100 review: a status Aurora gave before an install was recorded must not freeze the app for owner review. */

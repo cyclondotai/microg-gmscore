@@ -25,7 +25,34 @@ internal class MigrationInstallQueue(private val context: Context,
     @Volatile var throttled = false
     /** Pending installs across sessions. Apps Play refused most recently go last, so one cannot block the rest. */
     fun dispatchOrder(): List<Pair<String, String>> = sessions().flatMap { id -> pending(id).sorted().map { id to it } }
-        .sortedBy { (id, name) -> prefs.getLong("$id:$name:throttled_at", 0) }
+        .sortedWith(compareBy({ (id, name) -> prefs.getLong("$id:$name:throttled_at", 0) }, { (id, name) -> tier(id, name) }))
+    /**
+     * Within a session's open apps: the ones Setup asked for first ([prioritize]: the sign-in apps), then the ones going to
+     * the phone's Google account after Play refused the anonymous session, then the rest in package order (11-17
+     * founders-02: Google Authenticator waited behind every "ai.", "app." and "ch." app, and two refused apps behind the
+     * whole 287-app pass).
+     */
+    private fun tier(id: String, name: String): Int = when {
+        name in prefs.getStringSet("$id:priority", emptySet()).orEmpty() -> 0
+        prefs.getBoolean("$id:$name:owner_account", false) -> 1
+        else -> 2
+    }
+    /**
+     * Setup's sign-in apps for its handoff [run] go to Aurora before the copy's other apps (Core's
+     * setup.transfer.handoff.prioritize). Only apps of that run's selection count; unknown ones are kept for a later chunk.
+     */
+    fun prioritize(run: String, packages: List<String>): Bundle = synchronized(LOCK) {
+        val id = prefs.getString("handoff_session", null)
+        if (prefs.getString("handoff_run", null) != run || id == null) return Bundle().apply {
+            putBoolean("supported", true); putBoolean("accepted", false); putInt("prioritized", 0)
+        }
+        val wanted = packages.filter { PACKAGE.matches(it) }.take(MAX_PRIORITY).toSet()
+        val priority = prefs.getStringSet("$id:priority", emptySet()).orEmpty() + wanted
+        check(prefs.edit().putStringSet("$id:priority", priority.toSet()).commit())
+        val open = wanted.count { it in pending(id) }
+        if (open > 0) schedule()
+        Bundle().apply { putBoolean("supported", true); putBoolean("accepted", true); putInt("prioritized", open) }
+    }
     init {
         // PlaySetupService opens the queue on the main thread, which must never wait for an install in flight.
         if (legacy()) synchronized(LOCK) {
@@ -451,17 +478,25 @@ internal class MigrationInstallQueue(private val context: Context,
         var settled = true
         var unfrozen: String? = null
         var checkedAt = clock()
+        // Chosen anew after each hand-off (dispatchOrder): a priority Setup set or an app queued again for the Google
+        // account meanwhile goes next, not after the round. Each app once a round per attempt: its key holds what makes
+        // it another attempt (the Google account, the owner's Retry).
+        val attempted = mutableSetOf<String>()
+        fun attempt(id: String, name: String) = "$id:$name:${prefs.getBoolean("$id:$name:owner_account", false)}:${prefs.getInt("$id:$name:retry_gen", 0)}"
+        fun next() = dispatchOrder().firstOrNull { (id, name) -> attempt(id, name) !in attempted }
         try {
-            val order = dispatchOrder()
-            for ((index, entry) in order.withIndex()) {
+            var entry = next()
+            while (entry != null) {
                 val (id, name) = entry
                 if (cancelled()) return false
                 unfrozen = id
+                attempted += attempt(id, name)
                 if (!dispatch(name, id)) settled = false
                 if (throttled) return false // Play limits the store, not one session: pause every install.
                 // Freeze this session's receipts before another session can touch the same Aurora row.
-                if (order.getOrNull(index + 1)?.first != id) { summary(id, reschedule = false, freeze = true); unfrozen = null; checkedAt = clock() }
+                if (next()?.first != id) { summary(id, reschedule = false, freeze = true); unfrozen = null; checkedAt = clock() }
                 else if (clock() - checkedAt >= SUMMARY_EVERY_MS) { summary(id, reschedule = false); checkedAt = clock() }
+                entry = next()
             }
             return settled
         } finally {
@@ -623,6 +658,9 @@ internal class MigrationInstallQueue(private val context: Context,
         internal const val SUMMARY_EVERY_MS = 60_000L
         /** How often a summary at a transfer boundary asks again about apps that changed while it asked Aurora. */
         private const val FREEZE_ATTEMPTS = 3
+        /** At most this many sign-in apps go first ([prioritize]). */
+        private const val MAX_PRIORITY = 50
+        private val PACKAGE = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
         /** The anonymous session's own limits: Play throttling it, not listing the app in its country, or no session. */
         private val ANONYMOUS_FAILURES = setOf(RATE_LIMITED, "not_found", "anonymous_sign_in_required", "not_signed_in", "session_expired")
         /** The store had no usable session: says nothing about the app, so it is tried again like a rate limit. */
