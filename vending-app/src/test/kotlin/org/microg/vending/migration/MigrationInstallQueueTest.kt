@@ -108,6 +108,29 @@ class MigrationInstallQueueTest {
             assertEquals(2, installs.size)
         }
     }
+    /** 11-17 founders-02: refused apps waited for the end of a 287-app pass before their Google-account retry. */
+    @Test fun aLongPassQueuesARefusedAppForTheGoogleAccountWithinAMinute() {
+        val names = (1..5).map { "org.example.app$it" }
+        val downloads = names.associateWith { state("none") }.toMutableMap()
+        val ownerInstalls = mutableListOf<String>()
+        var now = 0L
+        val queue = MigrationInstallQueue(context, { _, _ -> Bundle().apply { putBoolean("owner_account_fallback", true) } }) { operation, name ->
+            if (operation == 3) Bundle(downloads.getValue(name))
+            else {
+                now += 20_000 // each handoff takes 20 s
+                // The first app is refused the anonymous session as soon as it was queued.
+                (if (name == names[0]) state("failed").apply { putString("error", "failed"); putString("errorCode", "app_not_purchased") }
+                    else state("queued")).also { downloads[name] = it }
+            }
+        }.apply { sentOptions = { operation, options -> if (operation == 2 && options!!.getBoolean("owner_account_approved")) ownerInstalls += "x" } }
+        queue.select(names.map { name -> Bundle().apply { putString("package_name", name); putLong("version_code", 12) } })
+        queue.dispatchRound(clock = { now })
+        // Within the pass (by its 4th handoff, 60 s in) the refusal was queued once more, for the Google account.
+        assertTrue(names[0] in queue.pending())
+        assertTrue(queue.dispatchRound(clock = { now }))
+        assertEquals(1, ownerInstalls.size)
+    }
+
     /** 10-30 customer-98: the Google account's Play offered an older version than Switch listed (Blindmate, Tinder). */
     @Test fun theGoogleAccountFallbackAcceptsTheVersionPlayOffersThatAccount() {
         val minimums = mutableListOf<Long>()

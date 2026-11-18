@@ -399,11 +399,17 @@ internal class MigrationInstallQueue(private val context: Context,
             putString("cyclon_hold_state", if (getBoolean("complete")) "complete" else "installing")
         }
     }
-    /** One pass over every pending install; false if any must be tried again. */
-    fun dispatchRound(cancelled: () -> Boolean = { false }): Boolean {
+    /**
+     * One pass over every pending install; false if any must be tried again. A pass over a whole copy takes as long as the
+     * copy, so the session's results are also checked every [SUMMARY_EVERY_MS] on the way: that check queues Play's
+     * refusals of the anonymous session once more for the Google account (11-17 founders-02: eight refused apps would
+     * otherwise wait for the end of a 287-app pass).
+     */
+    fun dispatchRound(cancelled: () -> Boolean = { false }, clock: () -> Long = { System.currentTimeMillis() }): Boolean {
         throttled = false
         var settled = true
         var unfrozen: String? = null
+        var checkedAt = clock()
         try {
             val order = dispatchOrder()
             for ((index, entry) in order.withIndex()) {
@@ -413,7 +419,8 @@ internal class MigrationInstallQueue(private val context: Context,
                 if (!dispatch(name, id)) settled = false
                 if (throttled) return false // Play limits the store, not one session: pause every install.
                 // Freeze this session's receipts before another session can touch the same Aurora row.
-                if (order.getOrNull(index + 1)?.first != id) { summary(id); unfrozen = null }
+                if (order.getOrNull(index + 1)?.first != id) { summary(id); unfrozen = null; checkedAt = clock() }
+                else if (clock() - checkedAt >= SUMMARY_EVERY_MS) { summary(id); checkedAt = clock() }
             }
             return settled
         } finally {
@@ -551,6 +558,8 @@ internal class MigrationInstallQueue(private val context: Context,
         private const val JOB = 700714
         private const val RATE_LIMITED = "rate_limited"
         private const val MAX_RATE_LIMITED = 3
+        /** How often a long pass checks its session's results (and queues refused apps for the Google account). */
+        internal const val SUMMARY_EVERY_MS = 60_000L
         /** The anonymous session's own limits: Play throttling it, not listing the app in its country, or no session. */
         private val ANONYMOUS_FAILURES = setOf(RATE_LIMITED, "not_found", "anonymous_sign_in_required", "not_signed_in", "session_expired")
         /** The store had no usable session: says nothing about the app, so it is tried again like a rate limit. */
@@ -578,7 +587,7 @@ class MigrationInstallJob : JobService() {
                 val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MINUTES.toNanos(8)
                 do {
                     retry = false
-                    if (!queue.dispatchRound { cancelled.get() }) retry = true
+                    if (!queue.dispatchRound(cancelled = { cancelled.get() })) retry = true
                     if (cancelled.get()) return@execute
                     for (id in queue.sessions()) {
                         val state = queue.summary(id)
