@@ -69,4 +69,40 @@ class MigrationPriorityTest {
         assertEquals(2, handed.count { it == "a.refused.app" })
         assertTrue("retried before the round's end", handed.lastIndexOf("a.refused.app") < handed.size - 1)
     }
+
+    /** 11-17 founders-02: Aurora answered the install request itself with Play's refusal (Stu, SamTrans, C&A). */
+    @Test fun aRefusalInTheInstallReplyGoesToTheGoogleAccountInTheSameRound() {
+        val requests = mutableListOf<Pair<String, Boolean>>()
+        var options: Bundle? = null
+        val queue = MigrationInstallQueue(context, controlCall = { _, _ -> Bundle().apply { putBoolean("owner_account_fallback", true) } }) { operation, name ->
+            if (operation != 2) return@MigrationInstallQueue state(name, "none")
+            val owner = options?.getBoolean("owner_account_approved") == true
+            requests += name to owner
+            if (name == "ch.stu" && !owner) state(name, "failed").apply { putString("error", "failed"); putString("errorCode", "app_not_purchased") }
+            else state(name, "queued")
+        }.apply { sentOptions = { operation, sent -> if (operation == 2) options = sent } }
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf("ch.stu", "x.example.one", "y.example.two").map(::doc))
+        queue.dispatchRound()
+        assertEquals(listOf("ch.stu" to false, "ch.stu" to true, "x.example.one" to false, "y.example.two" to false), requests)
+        assertTrue(queue.pending().isEmpty())
+    }
+
+    /** Refusals saved as failed by an earlier FakeStore are queued for the Google account by the next summary. */
+    @Test fun aRefusalAlreadySavedAsFailedIsQueuedForTheGoogleAccount() {
+        var refused = true
+        val queue = MigrationInstallQueue(context, controlCall = { _, _ -> Bundle().apply { putBoolean("owner_account_fallback", true) } }) { _, name ->
+            if (refused) state(name, "failed").apply { putString("errorCode", "app_not_purchased") } else state(name, "queued")
+        }
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf(doc("ch.stu")))
+        val id = queue.currentSessionId()!!
+        queue.save("ch.stu", state("ch.stu", "failed").apply { putString("errorCode", "app_not_purchased"); putBoolean("terminal", true) }, dispatched = true, id = id)
+        assertTrue(queue.pending(id).isEmpty())
+        queue.summary(id, reschedule = false)
+        assertEquals(setOf("ch.stu"), queue.pending(id))
+        refused = false
+        queue.dispatchRound()
+        assertTrue(queue.pending(id).isEmpty())
+    }
 }

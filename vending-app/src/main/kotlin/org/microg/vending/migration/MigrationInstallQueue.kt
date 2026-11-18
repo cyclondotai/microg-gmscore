@@ -264,6 +264,8 @@ internal class MigrationInstallQueue(private val context: Context,
         val before = row(id, name)
         val edit = prefs.edit()
         for (key in listOf("status", "error")) edit.putString("$id:$name:$key", result.getString(key) ?: if (key == "error") result.getString("errorCode") else "unknown")
+        // The store's own failure code beside the error: a refusal of the anonymous session stays known ([refusedBefore]).
+        if (result.getString("errorCode") != null) edit.putString("$id:$name:errorCode", result.getString("errorCode")) else edit.remove("$id:$name:errorCode")
         edit.putBoolean("$id:$name:installed", result.getBoolean("installed"))
         edit.putBoolean("$id:$name:terminal", result.getBoolean("terminal"))
         edit.putLong("$id:$name:installedVersion", result.getLong("installed_version_code"))
@@ -292,6 +294,18 @@ internal class MigrationInstallQueue(private val context: Context,
         .filter { it !in selected(id) && prefs.getBoolean("$id:$it:recoverable", false) }.sorted()
     /** Whether Aurora can install with the phone's Google account, the fallback when the anonymous session fails. */
     fun ownerAccountSupported(): Boolean = control(7, Bundle()).getBoolean("owner_account_fallback")
+    /**
+     * Play refused the anonymous session: a session failure, or a download refusal (app_not_purchased, rate_limited) in
+     * the install request's own reply. 11-17 founders-02: Aurora answered the request with the refusal (Play refused the
+     * purchase within 0.2 s), which only a later status check matched, so Stu, SamTrans and C&A failed for good.
+     */
+    private fun anonymousRefusal(result: Bundle) = result.getString("error") in ANONYMOUS_FAILURES ||
+        result.getString("errorCode") in DOWNLOAD_REFUSALS || result.getString("error") in DOWNLOAD_REFUSALS
+    /** A failed app the Google account has not tried yet: asked again by [summary], which queues a refusal for the account. */
+    private fun refusedBefore(id: String, name: String) = prefs.getString("$id:$name:status", null) == "failed" &&
+        (prefs.getString("$id:$name:errorCode", null) in DOWNLOAD_REFUSALS || prefs.getString("$id:$name:error", null) in DOWNLOAD_REFUSALS) &&
+        prefs.getString("$id:transfer_outcome", null) == null &&
+        !prefs.getBoolean("$id:$name:owner_account", false) && !prefs.getBoolean("$id:$name:ever_installed", false)
     /** An owner Retry starts again with the anonymous session; the Google account fallback applies again after it. */
     fun retry(id: String, packageName: String? = null) {
         fun names() = retryDocuments(id).map { it.getString("package_name")!! }.filter { packageName == null || it == packageName }
@@ -369,7 +383,7 @@ internal class MigrationInstallQueue(private val context: Context,
         while (true) {
             val revs = synchronized(LOCK) {
                 val pending = pending(id)
-                selected(id).filter { (only == null || it in only!!) && !(prefs.getBoolean("$id:$it:terminal", false) && it !in pending) }
+                selected(id).filter { (only == null || it in only!!) && (!(prefs.getBoolean("$id:$it:terminal", false) && it !in pending) || refusedBefore(id, it)) }
                     .associateWith { revision(id, it) }
             }
             val asked = revs.keys.associateWith { bridge(3, it) }
@@ -389,7 +403,7 @@ internal class MigrationInstallQueue(private val context: Context,
                           reschedule: Boolean, stale: MutableSet<String>): Bundle {
         val results = selected(id).sorted().map { name ->
             val saved = document(id, name)
-            if (saved.getBoolean("terminal") && name !in pending(id)) return@map saved
+            if (saved.getBoolean("terminal") && name !in pending(id) && !refusedBefore(id, name)) return@map saved
             // Aurora's answer is stale when the app changed since it was asked, or an install request for it is still
             // waiting on Aurora: keep what was saved (open while in flight) and check it next time. An app that became
             // open after the others were asked is checked next time too, so Aurora is never called under the lock.
@@ -528,7 +542,7 @@ internal class MigrationInstallQueue(private val context: Context,
             if (request.done != null) return request.done
             val result = bridge(2, name, request.options)
             // Aurora's answers that need another Aurora call, asked before taking the lock again.
-            val supported = if (result.getString("error") in ANONYMOUS_FAILURES && !request.ownerAccount) ownerAccountSupported() else false
+            val supported = if (anonymousRefusal(result) && !request.ownerAccount) ownerAccountSupported() else false
             // Without a store session, ask Aurora to prepare one before the next round (unless the Google account takes over).
             if (result.getString("error") in SESSION_FAILURES && !supported) control(6)
             return synchronized(LOCK) { settle(name, id, result, request, supported) }
@@ -586,7 +600,7 @@ internal class MigrationInstallQueue(private val context: Context,
         if (prefs.getBoolean("$id:$name:owner_account", false) && result.getLong("version_code") > 0) {
             check(prefs.edit().putLong("$id:$name:ownerVersion", result.getLong("version_code")).commit())
         }
-        if (result.getString("error") in ANONYMOUS_FAILURES &&
+        if (anonymousRefusal(result) &&
             !prefs.getBoolean("$id:$name:owner_account", false) && supported) {
             // As on a Pixel, Play may install with the phone's Google account. Aurora refused before enqueuing,
             // so this is no uncertain install: keep the app pending for the account and keep the owner's retry.
