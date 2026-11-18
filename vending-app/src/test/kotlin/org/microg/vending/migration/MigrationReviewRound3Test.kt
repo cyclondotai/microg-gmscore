@@ -161,4 +161,52 @@ class MigrationReviewRound3Test {
         assertTrue(queue.dispatch(app, id))
         assertTrue(queue.summary(id).getBoolean("complete"))
     }
+
+    private fun receipt(queue: MigrationInstallQueue, id: String) =
+        queue.summary(id, reschedule = false).getParcelableArray("cyclon_app_results")!!.map { it as Bundle }.single()
+
+    /** Round 3 review: a poll saving the same receipt again while the boundary summary asked Aurora hid a failure. */
+    private fun boundaryKeepsTheFailure(overlap: String, freeze: Boolean) {
+        lateinit var queue: MigrationInstallQueue
+        var status = "none"
+        var hook: (() -> Unit)? = null
+        queue = MigrationInstallQueue(context) { operation, _ ->
+            if (operation == 2) state("queued") else {
+                hook?.let { hook = null; Thread(it).apply { start(); join(5000) } }
+                state(status).apply { if (status == "failed") putString("errorCode", "download_failed") }
+            }
+        }
+        val id = select(queue)
+        assertTrue(queue.dispatch(app, id))
+        status = "failed"
+        hook = { queue.save(app, state(overlap), id = id) }
+        // What the boundary summary itself left saved, before any later summary could ask Aurora again.
+        val saved = queue.summary(id, reschedule = false, freeze = freeze)
+            .getParcelableArray("cyclon_app_results")!!.map { it as Bundle }.single()
+        assert(hook == null)
+        val prefs = context.getSharedPreferences("migration-installs", 0)
+        assertEquals("failed", saved.getString("status"))
+        assertEquals("failed", prefs.getString("$id:$app:status", null))
+        assertTrue(prefs.getBoolean("$id:$app:terminal", false))
+    }
+    @Test fun anUnchangedSaveDuringTheBoundarySummaryKeepsTheFailure() = boundaryKeepsTheFailure("queued", freeze = false)
+    @Test fun aChangedRowAtTheBoundaryIsAskedAgain() = boundaryKeepsTheFailure("downloading", freeze = true)
+
+    @Test fun anOwnerRetryAsksAuroraWithoutTheLock() {
+        val underLock = mutableListOf<Int>()
+        var installs = 0
+        val queue = MigrationInstallQueue(context, controlCall = { operation, _ ->
+            if (Thread.holdsLock(MigrationInstallQueue.LOCK)) underLock += operation
+            Bundle().apply { putBoolean("success", true); putBoolean("owner_approved_retry", true) }
+        }) { operation, _ -> if (operation == 2) { installs++; state("queued") } else state("awaiting_install") }
+        val id = select(queue)
+        queue.dispatch(app, id)
+        assertEquals("owner_action_required", receipt(queue, id).getString("status"))
+        assertEquals(0, installs)
+        queue.retry(id)
+        assertTrue(app in queue.pending(id))
+        assertTrue(queue.dispatch(app, id))
+        assertEquals(1, installs)
+        assertEquals("Aurora was asked while holding the queue lock", emptyList<Int>(), underLock)
+    }
 }
