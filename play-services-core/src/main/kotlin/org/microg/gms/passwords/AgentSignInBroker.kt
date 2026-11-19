@@ -23,18 +23,17 @@ internal class AgentSignInBroker(private val context: Context) {
     }
 
     fun call(method: String, ref: String?, input: Bundle?): Bundle {
-        requireTargetReady(input?.getBoolean("background", false) == true)
+        requireStorageOpen()
         return when (method) {
             "candidates" -> {
                 if (ref != null) throw SecurityException()
                 candidates(PasswordAgentFillTarget.from(context, input ?: throw SecurityException()))
             }
             "set_access" -> {
-                requireUnlocked()
                 val choice = choice(ref)
                 val level = AgentSignInAccess.Level.of(input?.getString("level")) ?: throw SecurityException()
                 withChoice(choice) {
-                    requireUnlocked()
+                    requireStorageOpen()
                     access.setCurrent(choice.vaultKey, choice.tag, choice.incarnation, level)
                 }
                 Bundle.EMPTY
@@ -57,8 +56,6 @@ internal class AgentSignInBroker(private val context: Context) {
                     state
                 }
                 val requiresAuthentication = grant.requireDeviceAuthentication
-                if (!AgentSignInLockPolicy.deliveryAllowed(locked(), request.background, approval == "once", requiresAuthentication) ||
-                    locked() && grant.level != AgentSignInAccess.Level.ALWAYS) throw SecurityException()
                 if (requiresAuthentication && !(context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager).isDeviceSecure) {
                     throw SecurityException()
                 }
@@ -90,8 +87,7 @@ internal class AgentSignInBroker(private val context: Context) {
             // The earlier affiliation proof covers exactly this entry's current realm.
             if (current.realm != realm || current.username != username || current.blocked || current.password.isEmpty()) throw SecurityException()
             access.redeem(choice.vaultKey, choice.tag, choice.incarnation, once, deviceAuthenticated = authenticated?.invoke() == true) {
-                requireTargetReady(request.background)
-                if (!AgentSignInLockPolicy.deliveryAllowed(locked(), request.background, once, authenticated != null)) throw SecurityException()
+                requireStorageOpen()
                 // Authentication is native request-local state, rechecked immediately before handover.
                 if (authenticated != null && !authenticated() || !request.valid(context)) throw SecurityException()
                 request.deliver(context, current.password.toCharArray())
@@ -116,7 +112,7 @@ internal class AgentSignInBroker(private val context: Context) {
                     withChoice(initial, vault, checkIncarnation = false) { current ->
                         if (current.realm != entry.data.realm || current.username != entry.data.username ||
                             current.blocked || current.password.isEmpty()) return@withChoice
-                        requireTargetReady(target.background)
+                        requireStorageOpen()
                         if (!target.valid(context)) throw SecurityException()
                         val state = access.get(initial.vaultKey, entry.id)
                         val choice = Choice(account, userId, entry.id, state.incarnation)
@@ -133,20 +129,17 @@ internal class AgentSignInBroker(private val context: Context) {
             } catch (_: Exception) { /* Account disabled, removed or locked while enumerating. */ }
         }
         if (!target.valid(context)) throw SecurityException()
-        requireTargetReady(target.background)
+        requireStorageOpen()
         return Bundle().apply { putParcelableArrayList("accounts", rows); putBoolean("background_signin_v1", true) }
     }
 
-    private fun requireUnlocked() {
-        requireTargetReady(false)
-    }
-    private fun requireTargetReady(background: Boolean) {
+    /**
+     * CYC-2677: the lock state decides nothing here; a locked phone signs in as the unlocked one does. Before the first
+     * unlock after a restart the vault's credential-encrypted storage is closed, which is the one thing that waits.
+     */
+    private fun requireStorageOpen() {
         val users = context.getSystemService(Context.USER_SERVICE) as? UserManager ?: throw SecurityException()
-        if (!AgentSignInLockPolicy.targetReady(users.isUserUnlocked, locked(), background)) throw SecurityException()
-    }
-    private fun locked(): Boolean {
-        val keyguard = context.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager ?: throw SecurityException()
-        return keyguard.isDeviceLocked || keyguard.isKeyguardLocked
+        if (!AgentSignInLockPolicy.storageOpen(users.isUserUnlocked)) throw SecurityException()
     }
     private fun stableId(account: Account?): String? {
         if (account == null) return null
