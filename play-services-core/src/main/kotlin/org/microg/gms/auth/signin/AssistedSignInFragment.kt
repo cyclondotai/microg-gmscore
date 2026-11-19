@@ -22,8 +22,6 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
-import androidx.collection.ArraySet
-import androidx.collection.arraySetOf
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import androidx.lifecycle.lifecycleScope
@@ -78,7 +76,7 @@ class AssistedSignInFragment : BottomSheetDialogFragment() {
     private var loginJob: Job? = null
     private var isSigningIn = false
     private var signInBack = false
-    private val authStatusList = arraySetOf<Pair<String, Boolean?>>()
+    private var chooserAccounts: List<Pair<String, Boolean?>> = emptyList()
 
     private var lastChooseAccount: Account? = null
 
@@ -134,33 +132,29 @@ class AssistedSignInFragment : BottomSheetDialogFragment() {
         }
     }
 
-    private suspend fun filterAccountsLogin(multiMethod: (ArraySet<Pair<String, Boolean?>>) -> Unit, loginMethod: (String, Boolean) -> Unit) {
-        accounts.forEach { account ->
+    private suspend fun filterAccountsLogin(multiMethod: (List<Pair<String, Boolean?>>) -> Unit, loginMethod: (String, Boolean) -> Unit) {
+        val statuses = accounts.map { account ->
             val authStatus = try {
                 checkAccountAuthStatus(requireContext(), clientPackageName, options.scopes, account)
             } catch (e: Exception) {
                 Log.d(TAG, "checkAccountAuthStatus: account:${account.name} auth error ", e)
                 null
             }
-            authStatusList.add(Pair(account.name, authStatus))
+            Pair(account.name, authStatus)
         }
-        Log.d(TAG, "filterAccountsLogin: authStatusList: $authStatusList")
-        val checkAccounts = authStatusList.filter { it.second != null }
-        if (checkAccounts.size == 1) {
-            val pair = checkAccounts[0]
-            loginMethod(pair.first, pair.second!!)
-            return
-        }
+        Log.d(TAG, "filterAccountsLogin: statuses: $statuses")
         val filterByAuthorizedAccounts = beginSignInRequest.googleIdTokenRequestOptions.filterByAuthorizedAccounts()
-        val authorizedAccounts = authStatusList.filter { it.second == true }
-        if (filterByAuthorizedAccounts && authorizedAccounts.isNotEmpty()) {
-            loginMethod(checkAccounts.first().first, true)
-            return
+        chooserAccounts = statuses
+        when (val choice = chooseAssistedSignIn(statuses, filterByAuthorizedAccounts)) {
+            is AssistedSignInChoice.Single -> loginMethod(choice.accountName, choice.permitted)
+            is AssistedSignInChoice.Chooser -> {
+                chooserAccounts = choice.accounts
+                multiMethod(choice.accounts)
+            }
         }
-        multiMethod(authStatusList)
     }
 
-    private fun prepareMultiSignIn(authorizedAccounts: ArraySet<Pair<String, Boolean?>>) {
+    private fun prepareMultiSignIn(authorizedAccounts: List<Pair<String, Boolean?>>) {
         lifecycleScope.launch {
             notifyCancelBtn(true)
             container?.removeAllViews()
@@ -195,7 +189,7 @@ class AssistedSignInFragment : BottomSheetDialogFragment() {
                     }
                     accountView.setOnClickListener(null)
                 }
-                if (index == accounts.size - 1) {
+                if (index == authorizedAccounts.size - 1) {
                     accountView.findViewById<View>(R.id.multi_account_line).visibility = View.GONE
                 }
                 accountViews.addView(accountView)
@@ -231,7 +225,7 @@ class AssistedSignInFragment : BottomSheetDialogFragment() {
 
     private fun prepareChooseLogin(accountName: String, permitted: Boolean = false) {
         lifecycleScope.launch {
-            notifyCancelBtn(visible = true, backToMulti = authStatusList.size > 1)
+            notifyCancelBtn(visible = true, backToMulti = chooserAccounts.size > 1)
             container?.removeAllViews()
             val reloadView =
                 LayoutInflater.from(requireContext()).inflate(R.layout.assisted_signin_back_consent_layout, null)
@@ -311,7 +305,7 @@ class AssistedSignInFragment : BottomSheetDialogFragment() {
         cancelBtn?.isClickable = visible
         cancelBtn?.setOnClickListener {
             if (backToMulti) {
-                prepareMultiSignIn(authStatusList)
+                prepareMultiSignIn(chooserAccounts)
                 return@setOnClickListener
             }
             dismiss()
