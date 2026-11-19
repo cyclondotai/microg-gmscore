@@ -13,7 +13,8 @@ class AssistedSignInChoiceTest {
     private val c = "c@example.com"
 
     @Test fun onlyAuthorizedAccountIsUsedEvenWhenNotFirst() {
-        assertEquals(Single(b, true), chooseAssistedSignIn(listOf(a to false, b to true), true))
+        // Back from b's confirmation must not offer a: the chooser holds only b, so Back closes the sheet.
+        assertEquals(Single(b, true, listOf(b to true)), chooseAssistedSignIn(listOf(a to false, b to true), true))
     }
 
     @Test fun severalAuthorizedAccountsShowChooserLimitedToThem() {
@@ -34,8 +35,9 @@ class AssistedSignInChoiceTest {
     }
 
     @Test fun singleCheckableAccountIsUsedAsBefore() {
-        assertEquals(Single(b, false), chooseAssistedSignIn(listOf(a to null, b to false), true))
-        assertEquals(Single(a, true), chooseAssistedSignIn(listOf(a to true), false))
+        val withFailed = listOf(a to null, b to false)
+        assertEquals(Single(b, false, withFailed), chooseAssistedSignIn(withFailed, true))
+        assertEquals(Single(a, true, listOf(a to true)), chooseAssistedSignIn(listOf(a to true), false))
     }
 
     @Test fun failedChecksDoNotCountAsAuthorized() {

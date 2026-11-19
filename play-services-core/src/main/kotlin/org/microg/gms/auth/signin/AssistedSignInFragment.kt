@@ -144,13 +144,11 @@ class AssistedSignInFragment : BottomSheetDialogFragment() {
         }
         Log.d(TAG, "filterAccountsLogin: statuses: $statuses")
         val filterByAuthorizedAccounts = beginSignInRequest.googleIdTokenRequestOptions.filterByAuthorizedAccounts()
-        chooserAccounts = statuses
-        when (val choice = chooseAssistedSignIn(statuses, filterByAuthorizedAccounts)) {
+        val choice = chooseAssistedSignIn(statuses, filterByAuthorizedAccounts)
+        chooserAccounts = choice.chooser
+        when (choice) {
             is AssistedSignInChoice.Single -> loginMethod(choice.accountName, choice.permitted)
-            is AssistedSignInChoice.Chooser -> {
-                chooserAccounts = choice.accounts
-                multiMethod(choice.accounts)
-            }
+            is AssistedSignInChoice.Chooser -> multiMethod(choice.chooser)
         }
     }
 
@@ -313,13 +311,16 @@ class AssistedSignInFragment : BottomSheetDialogFragment() {
     }
 
     private fun startLogin(accountName: String) {
+        // onResume runs initView again; an earlier countdown must not sign in after the owner cancels the new one.
+        loginJob?.cancel()
         loginJob = lifecycleScope.launch {
-            lastChooseAccount = accounts.find { it.name == accountName } ?: throw RuntimeException("account not found")
+            val account = accounts.find { it.name == accountName } ?: throw RuntimeException("account not found")
+            lastChooseAccount = account
             isSigningIn = true
             delay(3000)
             runCatching {
                 val (_, googleSignInAccount) = withContext(Dispatchers.IO) {
-                    performSignIn(requireContext(), clientPackageName, options, lastChooseAccount!!, true, beginSignInRequest.googleIdTokenRequestOptions.nonce)
+                    performSignIn(requireContext(), clientPackageName, options, account, true, beginSignInRequest.googleIdTokenRequestOptions.nonce)
                 }
                 loginResult(googleSignInAccount)
             }.onFailure {

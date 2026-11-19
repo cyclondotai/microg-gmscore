@@ -5,17 +5,26 @@ package org.microg.gms.auth.signin
 /**
  * What the one-tap sheet does with the accounts it checked: sign in with one account, or show the chooser.
  * Each status pair is (account name, auth status): true = the app is already authorized for that account,
- * false = not authorized yet, null = the check failed.
+ * false = not authorized yet, null = the check failed. [chooser] is the list the chooser shows, which is
+ * also where Back returns from an account's confirmation screen; with one entry, Back closes the sheet.
  */
 internal sealed interface AssistedSignInChoice {
-    data class Single(val accountName: String, val permitted: Boolean) : AssistedSignInChoice
-    data class Chooser(val accounts: List<Pair<String, Boolean?>>) : AssistedSignInChoice
+    val chooser: List<Pair<String, Boolean?>>
+
+    data class Single(
+        val accountName: String,
+        val permitted: Boolean,
+        override val chooser: List<Pair<String, Boolean?>>,
+    ) : AssistedSignInChoice
+
+    data class Chooser(override val chooser: List<Pair<String, Boolean?>>) : AssistedSignInChoice
 }
 
 /**
  * With [filterByAuthorizedAccounts] the app asks only for accounts it was authorized with before, as in
  * Play services' `GoogleIdTokenRequestOptions.filterByAuthorizedAccounts`: exactly one such account is used
- * directly (auto-select applies later); several are offered in the chooser, limited to them. Otherwise, or
+ * directly (auto-select applies later); several are offered in the chooser, limited to them; in both cases
+ * no other account is offered, not even after Back. Otherwise, or
  * when none is authorized, the chooser lists every account.
  */
 internal fun chooseAssistedSignIn(
@@ -23,10 +32,10 @@ internal fun chooseAssistedSignIn(
     filterByAuthorizedAccounts: Boolean,
 ): AssistedSignInChoice {
     val checked = statuses.filter { it.second != null }
-    if (checked.size == 1) return AssistedSignInChoice.Single(checked[0].first, checked[0].second!!)
+    if (checked.size == 1) return AssistedSignInChoice.Single(checked[0].first, checked[0].second!!, statuses)
     if (filterByAuthorizedAccounts) {
         val authorized = statuses.filter { it.second == true }
-        if (authorized.size == 1) return AssistedSignInChoice.Single(authorized[0].first, true)
+        if (authorized.size == 1) return AssistedSignInChoice.Single(authorized[0].first, true, authorized)
         if (authorized.size > 1) return AssistedSignInChoice.Chooser(authorized)
     }
     return AssistedSignInChoice.Chooser(statuses)
