@@ -145,19 +145,12 @@ class AssistedSignInFragment : BottomSheetDialogFragment() {
             authStatusList.add(Pair(account.name, authStatus))
         }
         Log.d(TAG, "filterAccountsLogin: authStatusList: $authStatusList")
-        val checkAccounts = authStatusList.filter { it.second != null }
-        if (checkAccounts.size == 1) {
-            val pair = checkAccounts[0]
-            loginMethod(pair.first, pair.second!!)
-            return
-        }
+        // Which account, and whether the owner chooses: AssistedAccountChoice.kt (never the list's first for an authorized one).
         val filterByAuthorizedAccounts = beginSignInRequest.googleIdTokenRequestOptions.filterByAuthorizedAccounts()
-        val authorizedAccounts = authStatusList.filter { it.second == true }
-        if (filterByAuthorizedAccounts && authorizedAccounts.isNotEmpty()) {
-            loginMethod(checkAccounts.first().first, true)
-            return
+        when (val choice = chooseAssistedAccount(authStatusList.toList(), filterByAuthorizedAccounts)) {
+            is AssistedAccountChoice.Single -> loginMethod(choice.accountName, choice.permitted)
+            is AssistedAccountChoice.Choose -> multiMethod(ArraySet(choice.accounts))
         }
-        multiMethod(authStatusList)
     }
 
     private fun prepareMultiSignIn(authorizedAccounts: ArraySet<Pair<String, Boolean?>>) {
@@ -195,7 +188,7 @@ class AssistedSignInFragment : BottomSheetDialogFragment() {
                     }
                     accountView.setOnClickListener(null)
                 }
-                if (index == accounts.size - 1) {
+                if (index == authorizedAccounts.size - 1) {
                     accountView.findViewById<View>(R.id.multi_account_line).visibility = View.GONE
                 }
                 accountViews.addView(accountView)
