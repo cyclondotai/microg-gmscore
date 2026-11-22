@@ -267,4 +267,26 @@ class ContactsLocalSyncLoopTest {
         }))
         assertFalse(LocalUploadSync.isLocalUpload(Bundle()))
     }
+
+    @Test fun localUploadSyncProviderErrorIsRecordedNotThrown() = fixture {
+        val failingProvider = object : android.content.ContentProvider() {
+            override fun onCreate() = true
+            override fun query(uri: android.net.Uri, p: Array<out String>?, s: String?, a: Array<out String>?, o: String?): android.database.Cursor {
+                throw SecurityException("provider boom")
+            }
+            override fun getType(uri: android.net.Uri) = null
+            override fun insert(uri: android.net.Uri, values: ContentValues?) = null
+            override fun delete(uri: android.net.Uri, s: String?, a: Array<out String>?) = 0
+            override fun update(uri: android.net.Uri, values: ContentValues?, s: String?, a: Array<out String>?) = 0
+        }
+        failingProvider.attachInfo(context, ProviderInfo().apply { authority = "com.cyclon.test.failing.contacts" })
+        ShadowContentResolver.registerProviderInternal("com.cyclon.test.failing.contacts", failingProvider)
+        context.contentResolver.acquireContentProviderClient("com.cyclon.test.failing.contacts")!!.use { badClient ->
+            val result = SyncResult()
+            adapter().onPerformSync(account, Bundle().apply { putBoolean(ContentResolver.SYNC_EXTRAS_UPLOAD, true) },
+                ContactsContract.AUTHORITY, badClient, result)
+            assertEquals("local", prefs.status)
+            assertEquals(1L, result.stats.numParseExceptions)
+        }
+    }
 }

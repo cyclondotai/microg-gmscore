@@ -39,8 +39,7 @@ class ContactSyncService : Service() {
                 lock.lock()
                 try {
                     if (prefs.mode == SyncMode.OFF) return
-                    if (LocalUploadSync.isLocalUpload(extras) && !localUploadDue(account, provider, result, prefs)) return
-                    performLocked(account, provider, result, prefs)
+                    performLocked(account, extras, provider, result, prefs)
                 } finally { lock.unlock() }
             }
             /** Android's LOCAL upload sync runs the pass only with local changes to send, at most once per cooldown (CYC-2304). */
@@ -53,10 +52,11 @@ class ContactSyncService : Service() {
                 if (decision.action != LocalUploadSync.Action.RUN) Log.i(TAG, "stage=local_upload action=${decision.action} later=${decision.syncWhenHoldEnds}")
                 return decision.action == LocalUploadSync.Action.RUN
             }
-            private fun performLocked(account: Account, provider: ContentProviderClient, result: SyncResult, prefs: ContactSyncPreferences) {
+            private fun performLocked(account: Account, extras: Bundle, provider: ContentProviderClient, result: SyncResult, prefs: ContactSyncPreferences) {
                 if (prefs.blockedClientContext == privatePeopleContext.binding) { prefs.status = "needs_update"; return }
                 var usedToken: String? = null
                 try {
+                    if (LocalUploadSync.isLocalUpload(extras) && !localUploadDue(account, provider, result, prefs)) return
                     val mode = prefs.mode
                     if (!AndroidContactStore(provider, account, prefs, backendOwner = PrivatePeopleApi.OWNER,
                             checkpointBinding = privatePeopleContext.binding).preparePrivateSync()) {
