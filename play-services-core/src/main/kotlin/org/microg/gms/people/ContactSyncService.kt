@@ -114,6 +114,13 @@ class ContactSyncService : Service() {
                         store.commitCheckpoint(); groups.commitCheckpoint()
                         prefs.lastSuccess = System.currentTimeMillis()
                     }
+                    // CYC-2304: Android drops a LOCAL upload request that arrives while this LOCAL pass is still
+                    // active (SyncManager duplicate active-job deduplication). Re-check once before returning so an
+                    // edit saved mid-pass still schedules a single follow-up when the cooldown ends instead of
+                    // waiting for the hourly periodic sync.
+                    if (LocalUploadSync.isLocalUpload(extras) && LocalUploadSync(provider, account, prefs).hasLocalChanges()) {
+                        result.fullSyncRequested = true
+                    }
                 } catch (e: PeopleClientUpdateRequired) {
                     prefs.status = "needs_update"
                     prefs.blockedClientContext = privatePeopleContext.binding
