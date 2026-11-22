@@ -31,8 +31,10 @@ class AndroidGroupStore(private val provider: ContentProviderClient, private val
             val floor = provider.query(Groups.CONTENT_URI, arrayOf(Groups._ID), null, null, "${Groups._ID} DESC")!!.use { if (it.moveToFirst()) it.getLong(0) else 0L }
             prefs.initializeGroupFloor(floor)
         }
-        provider.update(uri(), ContentValues().apply { put(Groups.GROUP_IS_READ_ONLY, if (prefs.mode == SyncMode.TWO_WAY) 0 else 1) },
-            "$scope AND ${Groups.SYNC4}=? AND ${Groups.SYSTEM_ID} IS NULL", args + backendOwner)
+        // Only labels whose flag differs: a no-op write still bumps versions and notifies every observer each pass (CYC-2304).
+        val readOnly = if (prefs.mode == SyncMode.TWO_WAY) 0 else 1
+        provider.update(uri(), ContentValues().apply { put(Groups.GROUP_IS_READ_ONLY, readOnly) },
+            "$scope AND ${Groups.SYNC4}=? AND ${Groups.SYSTEM_ID} IS NULL AND ${Groups.GROUP_IS_READ_ONLY}!=?", args + arrayOf(backendOwner, readOnly.toString()))
     }
     override fun groupCheckpoint() = if (privateBackend) prefs.privateGroupCheckpoint(checkNotNull(checkpointBinding)) else prefs.groupCheckpoint
     override fun groupCheckpoint(token: String) {

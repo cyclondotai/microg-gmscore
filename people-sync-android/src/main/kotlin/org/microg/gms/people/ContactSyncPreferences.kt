@@ -83,6 +83,10 @@ class ContactSyncPreferences(internal val context: Context, val account: Account
     var lastSuccess: Long
         get() = prefs.getLong(prefix + "lastSuccess", 0)
         set(value) { prefs.edit().putLong(prefix + "lastSuccess", value).apply() }
+    /** When the last LOCAL upload sync started its cooldown (LocalUploadSync); committed so a restart keeps it. */
+    var lastLocalUploadSync: Long
+        get() = prefs.getLong(prefix + "lastLocalUploadSync", 0)
+        set(value) { check(prefs.edit().putLong(prefix + "lastLocalUploadSync", value).commit()) }
 
     fun ensureDefaults() {
         // Do not override a saved owner choice, including OFF/download-only.
