@@ -81,15 +81,24 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
         provider.update(syncUri(RawContacts.CONTENT_URI), ContentValues().apply {
             put(RawContacts.RAW_CONTACT_IS_READ_ONLY, readOnly)
         }, "$scope AND ${RawContacts.SYNC4}=? AND ${RawContacts.RAW_CONTACT_IS_READ_ONLY}!=?", args + arrayOf(backendOwner, readOnly.toString()))
+        // Written only when a value differs, and as the sync adapter (CYC-2304): ContactsProvider2 queues an upload sync
+        // after every Settings write without CALLER_IS_SYNCADAPTER, even one that changes nothing, and that sync ran this
+        // again. A no-op UNGROUPED_VISIBLE write also recomputes every contact's visibility and notifies all observers.
+        val settingsScope = "${ContactsContract.Settings.ACCOUNT_NAME}=? AND ${ContactsContract.Settings.ACCOUNT_TYPE}=? AND " +
+            "${ContactsContract.Settings.DATA_SET} IS NULL"
+        val configured = provider.query(ContactsContract.Settings.CONTENT_URI, arrayOf(ContactsContract.Settings.SHOULD_SYNC,
+            ContactsContract.Settings.UNGROUPED_VISIBLE), settingsScope, args, null)?.use {
+            if (!it.moveToFirst()) null else (0..1).all { column -> !it.isNull(column) && it.getInt(column) == 1 }
+        }
+        if (configured == true) return
         val settings = ContentValues().apply {
             put(ContactsContract.Settings.ACCOUNT_NAME, account.name)
             put(ContactsContract.Settings.ACCOUNT_TYPE, account.type)
             put(ContactsContract.Settings.SHOULD_SYNC, 1)
             put(ContactsContract.Settings.UNGROUPED_VISIBLE, 1)
         }
-        if (provider.update(ContactsContract.Settings.CONTENT_URI, settings,
-            "${ContactsContract.Settings.ACCOUNT_NAME}=? AND ${ContactsContract.Settings.ACCOUNT_TYPE}=? AND ${ContactsContract.Settings.DATA_SET} IS NULL", args) == 0) {
-            provider.insert(ContactsContract.Settings.CONTENT_URI, settings)
+        if (provider.update(syncUri(ContactsContract.Settings.CONTENT_URI), settings, settingsScope, args) == 0) {
+            provider.insert(syncUri(ContactsContract.Settings.CONTENT_URI), settings)
         }
     }
     override fun checkpoint(): String? = ContactsContract.SyncState.get(provider, account)?.let { bytes ->

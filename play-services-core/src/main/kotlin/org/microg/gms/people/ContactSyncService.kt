@@ -37,12 +37,28 @@ class ContactSyncService : Service() {
                 // Turning sync off removes synced contacts under the same lock; never write after that.
                 val lock = ContactSyncLock.of(account)
                 lock.lock()
-                try { if (prefs.mode != SyncMode.OFF) performLocked(account, provider, result, prefs) } finally { lock.unlock() }
+                try {
+                    if (prefs.mode == SyncMode.OFF) return
+                    performLocked(account, extras, provider, result, prefs)
+                } finally { lock.unlock() }
             }
-            private fun performLocked(account: Account, provider: ContentProviderClient, result: SyncResult, prefs: ContactSyncPreferences) {
+            /** Android's LOCAL upload sync runs the pass only with local changes to send, at most once per cooldown (CYC-2304). */
+            private fun localUploadDue(account: Account, provider: ContentProviderClient, result: SyncResult, prefs: ContactSyncPreferences): Boolean {
+                val decision = LocalUploadSync(provider, account, prefs).decide(deviceContactsToMove = {
+                    autoMove(account, prefs) && DeviceContacts(provider, this@ContactSyncService).list().any { it.supported }
+                })
+                if (decision.holdUntilMillis > 0L) {
+                    result.delayUntil = maxOf(result.delayUntil, (decision.holdUntilMillis + 999) / 1000)
+                }
+                if (decision.syncWhenHoldEnds) result.fullSyncRequested = true
+                if (decision.action != LocalUploadSync.Action.RUN) Log.i(TAG, "stage=local_upload action=${decision.action} later=${decision.syncWhenHoldEnds}")
+                return decision.action == LocalUploadSync.Action.RUN
+            }
+            private fun performLocked(account: Account, extras: Bundle, provider: ContentProviderClient, result: SyncResult, prefs: ContactSyncPreferences) {
                 if (prefs.blockedClientContext == privatePeopleContext.binding) { prefs.status = "needs_update"; return }
                 var usedToken: String? = null
                 try {
+                    if (LocalUploadSync.isLocalUpload(extras) && !localUploadDue(account, provider, result, prefs)) return
                     val mode = prefs.mode
                     if (!AndroidContactStore(provider, account, prefs, backendOwner = PrivatePeopleApi.OWNER,
                             checkpointBinding = privatePeopleContext.binding).preparePrivateSync()) {
@@ -55,8 +71,8 @@ class ContactSyncService : Service() {
                     // Opted in to Google's "Automatically back up & sync device contacts": move this phone's device-only
                     // contacts into the account first, so this pass uploads them. Never while uploads are paused.
                     // Rechecked before every contact: turning sync or the opt-in off, or a transfer hold, stops it at once.
-                    val autoMove = { prefs.mode == SyncMode.TWO_WAY && DeviceContacts.autoAccount(this@ContactSyncService) == account.name &&
-                        !ContactMigrationPrivacy(this@ContactSyncService).held }
+                    // A normal (not sync-adapter) write on purpose: the moved rows stay DIRTY until this pass uploads them.
+                    val autoMove = { autoMove(account, prefs) }
                     if (mode == SyncMode.TWO_WAY && autoMove()) {
                         val device = DeviceContacts(provider, this@ContactSyncService)
                         val result = device.moveTo(account, device.list().filter { it.supported }.map { it.id }, autoMove)
@@ -100,6 +116,13 @@ class ContactSyncService : Service() {
                         store.commitCheckpoint(); groups.commitCheckpoint()
                         prefs.lastSuccess = System.currentTimeMillis()
                     }
+                    // CYC-2304: Android drops a LOCAL upload request that arrives while this LOCAL pass is still
+                    // active (SyncManager duplicate active-job deduplication). Re-check once before returning so an
+                    // edit saved mid-pass still schedules a single follow-up when the cooldown ends instead of
+                    // waiting for the hourly periodic sync.
+                    if (LocalUploadSync.isLocalUpload(extras) && LocalUploadSync(provider, account, prefs).hasLocalChanges()) {
+                        result.fullSyncRequested = true
+                    }
                 } catch (e: PeopleClientUpdateRequired) {
                     prefs.status = "needs_update"
                     prefs.blockedClientContext = privatePeopleContext.binding
@@ -113,13 +136,15 @@ class ContactSyncService : Service() {
                     }
                     prefs.status = if (e.status == 401 || e.status == 403) "authorization" else "network"
                     if (e.status == 401 || e.status == 403) result.stats.numAuthExceptions++ else result.stats.numIoExceptions++
-                    if (e.retryAfterSeconds > 0) result.delayUntil = System.currentTimeMillis() / 1000 + e.retryAfterSeconds
+                    if (e.retryAfterSeconds > 0) result.delayUntil = maxOf(result.delayUntil, System.currentTimeMillis() / 1000 + e.retryAfterSeconds)
+                    else if (e.status != 401 && e.status != 403) result.delayUntil = 0L
                     prefs.diagnostic = ContactsDiagnostics.activation(ActivationStage.API, e)
                     Log.w(TAG, "sync " + prefs.diagnostic)
                 } catch (e: AuthenticatorException) {
                     prefs.status = "authorization"
                     result.stats.numAuthExceptions++
                 } catch (e: IOException) {
+                    result.delayUntil = 0L
                     prefs.status = "network"
                     result.stats.numIoExceptions++
                     Log.w(TAG, "Contacts transport interrupted")
@@ -132,6 +157,9 @@ class ContactSyncService : Service() {
         }
     }
     override fun onBind(intent: Intent) = adapter.syncAdapterBinder
+
+    private fun autoMove(account: Account, prefs: ContactSyncPreferences) = prefs.mode == SyncMode.TWO_WAY &&
+        DeviceContacts.autoAccount(this) == account.name && !ContactMigrationPrivacy(this).held
 
     companion object {
         private const val TAG = "GmsContactSync"

@@ -26,7 +26,7 @@ internal class ImportContactsProvider : ContentProvider() {
             version INTEGER NOT NULL DEFAULT 1, dirty INTEGER NOT NULL DEFAULT 0,
             deleted INTEGER NOT NULL DEFAULT 0, starred INTEGER NOT NULL DEFAULT 0,
             raw_contact_is_read_only INTEGER NOT NULL DEFAULT 0, contact_id INTEGER,
-            aggregation_mode INTEGER NOT NULL DEFAULT 0)
+            aggregation_mode INTEGER NOT NULL DEFAULT 0, custom_ringtone TEXT, send_to_voicemail INTEGER NOT NULL DEFAULT 0)
         """.trimIndent())
         execSQL("""CREATE TABLE data (
             _id INTEGER PRIMARY KEY AUTOINCREMENT, raw_contact_id INTEGER NOT NULL, mimetype TEXT,
@@ -56,6 +56,13 @@ internal class ImportContactsProvider : ContentProvider() {
 
     /** Runs outside the batch transaction so a simulated concurrent edit survives rollback. */
     var beforeBatch: (() -> Unit)? = null
+    /** Writes that make ContactsProvider2 notify observers (an insert, or an update or delete that matched rows), by table
+     *  and whether they came from a sync adapter. */
+    data class Write(val table: String, val syncAdapter: Boolean)
+    val writes = mutableListOf<Write>()
+    /** Writes after which ContactsProvider2 calls notifyChange(syncToNetwork = true), so Android queues a LOCAL upload
+     *  sync for every contacts sync adapter: any of these tables written without CALLER_IS_SYNCADAPTER (a superset). */
+    val uploadSyncRequests: List<Write> get() = writes.filter { !it.syncAdapter && it.table != "syncstate" }
     val rawIds: List<Long> get() = ids("raw_contacts", null, null)
     var completeNameAvailable = true
     var completeNameResponse: ((Map<String, String>) -> ContentValues)? = null
@@ -135,6 +142,7 @@ internal class ImportContactsProvider : ContentProvider() {
 
     override fun insert(uri: Uri, values: ContentValues?): Uri {
         val table = table(uri)
+        writes.add(Write(table, syncAdapter(uri)))
         val inserted = ContentValues(requireNotNull(values))
         if (table == "raw_contacts" && !syncAdapter(uri) && !inserted.containsKey(RawContacts.DIRTY)) inserted.put(RawContacts.DIRTY, 1)
         val id = if (table == "syncstate") database.insertWithOnConflict(table, null, inserted, SQLiteDatabase.CONFLICT_REPLACE)
@@ -144,7 +152,10 @@ internal class ImportContactsProvider : ContentProvider() {
         return ContentUris.withAppendedId(uri, id)
     }
 
-    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int {
+    override fun update(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int =
+        updateRows(uri, values, selection, selectionArgs).also { if (it > 0) writes.add(Write(table(uri), syncAdapter(uri))) }
+
+    private fun updateRows(uri: Uri, values: ContentValues?, selection: String?, selectionArgs: Array<out String>?): Int {
         val table = table(uri)
         val where = selection(uri, selection)
         val oldParents = if (table == "data") parents(where, selectionArgs) else emptySet()
@@ -164,7 +175,10 @@ internal class ImportContactsProvider : ContentProvider() {
         return updated
     }
 
-    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
+    override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int =
+        deleteRows(uri, selection, selectionArgs).also { if (it > 0) writes.add(Write(table(uri), syncAdapter(uri))) }
+
+    private fun deleteRows(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int {
         val table = table(uri)
         val where = selection(uri, selection)
         if (table == "raw_contacts") {

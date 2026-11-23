@@ -31,8 +31,10 @@ class AndroidGroupStore(private val provider: ContentProviderClient, private val
             val floor = provider.query(Groups.CONTENT_URI, arrayOf(Groups._ID), null, null, "${Groups._ID} DESC")!!.use { if (it.moveToFirst()) it.getLong(0) else 0L }
             prefs.initializeGroupFloor(floor)
         }
-        provider.update(uri(), ContentValues().apply { put(Groups.GROUP_IS_READ_ONLY, if (prefs.mode == SyncMode.TWO_WAY) 0 else 1) },
-            "$scope AND ${Groups.SYNC4}=? AND ${Groups.SYSTEM_ID} IS NULL", args + backendOwner)
+        // Only labels whose flag differs: a no-op write still bumps versions and notifies every observer each pass (CYC-2304).
+        val readOnly = if (prefs.mode == SyncMode.TWO_WAY) 0 else 1
+        provider.update(uri(), ContentValues().apply { put(Groups.GROUP_IS_READ_ONLY, readOnly) },
+            "$scope AND ${Groups.SYNC4}=? AND ${Groups.SYSTEM_ID} IS NULL AND ${Groups.GROUP_IS_READ_ONLY}!=?", args + arrayOf(backendOwner, readOnly.toString()))
     }
     override fun groupCheckpoint() = if (privateBackend) prefs.privateGroupCheckpoint(checkNotNull(checkpointBinding)) else prefs.groupCheckpoint
     override fun groupCheckpoint(token: String) {
@@ -57,7 +59,7 @@ class AndroidGroupStore(private val provider: ContentProviderClient, private val
             }
         }
     }
-    private fun values(group: ContactGroup) = ContentValues().apply {
+    private fun values(group: ContactGroup, includeShouldSync: Boolean = false) = ContentValues().apply {
         put(Groups.ACCOUNT_NAME, account.name); put(Groups.ACCOUNT_TYPE, account.type)
         put(Groups.SOURCE_ID, group.resource); put(Groups.SYNC1, group.etag); put(Groups.SYNC2, group.name)
         putNull(Groups.SYNC3); put(Groups.SYNC4, backendOwner)
@@ -67,14 +69,17 @@ class AndroidGroupStore(private val provider: ContentProviderClient, private val
         put(Groups.FAVORITES, if (group.resource == starredResource) 1 else 0)
         put(Groups.GROUP_IS_READ_ONLY, if (group.system || prefs.mode != SyncMode.TWO_WAY) 1 else 0)
         put(Groups.GROUP_VISIBLE, if (!group.system || group.resource in setOf(myContactsResource, starredResource) || group.json.optString("_privateSystemId") in setOf("friends", "family", "coworkers")) 1 else 0)
-        put(Groups.SHOULD_SYNC, 1); put(Groups.DIRTY, 0)
+        // Android's ContactsProvider2 calls requestSync() whenever SHOULD_SYNC=1 appears in a group update, even with
+        // CALLER_IS_SYNCADAPTER=true (CYC-2304). Set it on insert only so updates don't queue an extra full sync.
+        if (includeShouldSync) put(Groups.SHOULD_SYNC, 1)
+        put(Groups.DIRTY, 0)
     }
     override fun applyGroup(group: ContactGroup, existing: LocalGroup?) {
         check(prefs.mode != SyncMode.OFF); check(!group.deleted)
         val operations = arrayListOf<ContentProviderOperation>()
         if (existing != null) operations.add(assertion(existing))
-        operations.add(if (existing == null) ContentProviderOperation.newInsert(uri()).withValues(values(group)).build()
-            else ContentProviderOperation.newUpdate(uri()).withSelection(selection(existing.id), args).withValues(values(group)).withExpectedCount(1).build())
+        operations.add(if (existing == null) ContentProviderOperation.newInsert(uri()).withValues(values(group, includeShouldSync = true)).build()
+            else ContentProviderOperation.newUpdate(uri()).withSelection(selection(existing.id), args).withValues(values(group, includeShouldSync = false)).withExpectedCount(1).build())
         provider.applyBatch(operations)
     }
     override fun removeGroup(existing: LocalGroup) {
