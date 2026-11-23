@@ -114,7 +114,14 @@ class DeviceAccountReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action !in ACTIONS) return
         val pending = goAsync()
-        worker.execute { try { DeviceAccount.hideFromApps(context) } finally { pending.finish() } }
+        worker.execute {
+            try {
+                DeviceAccount.hideFromApps(context)
+                FactoryBaseline.sealIfNeeded(context)
+            } finally {
+                pending.finish()
+            }
+        }
     }
     companion object {
         private val ACTIONS = setOf(AccountManager.LOGIN_ACCOUNTS_CHANGED_ACTION, Intent.ACTION_BOOT_COMPLETED,

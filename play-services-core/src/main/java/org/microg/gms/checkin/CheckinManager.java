@@ -26,6 +26,7 @@ import org.microg.gms.auth.AuthRequest;
 import org.microg.gms.common.Constants;
 import org.microg.gms.common.DeviceConfiguration;
 import org.microg.gms.common.Utils;
+import org.microg.gms.cyclon.FactoryBaseline;
 import org.microg.gms.gservices.GServices;
 import org.microg.gms.settings.SettingsContract;
 
@@ -38,6 +39,7 @@ public class CheckinManager {
 
     @SuppressWarnings("MissingPermission")
     public static synchronized LastCheckinInfo checkin(Context context, boolean force) throws IOException {
+        if (FactoryBaseline.holdsCheckin(context)) return null;
         LastCheckinInfo info = LastCheckinInfo.read(context);
         if (!force && info.getLastCheckin() > System.currentTimeMillis() - MIN_CHECKIN_INTERVAL)
             return null;

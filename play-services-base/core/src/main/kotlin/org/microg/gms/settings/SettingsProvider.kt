@@ -186,7 +186,8 @@ class SettingsProvider : ContentProvider() {
                 CheckIn.DEVICE_DATA_VERSION_INFO -> editor.putString(key, value as String?)
             }
         }
-        editor.apply()
+        // Cyclon: a restored identity must be on disk before Core acknowledges it (CYC-2935).
+        editor.commit()
     }
 
     private fun updateCheckInEnabled(enabled: Boolean) {
