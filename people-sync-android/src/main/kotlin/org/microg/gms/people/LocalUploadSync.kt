@@ -30,9 +30,11 @@ class LocalUploadSync(private val provider: ContentProviderClient, private val a
         if (last in (now - COOLDOWN_MILLIS + 1)..now) {
             return Decision(Action.DEFER, last + COOLDOWN_MILLIS, syncWhenHoldEnds = uploads() && hasLocalChanges(deviceContactsToMove))
         }
+        if (!uploads() || !hasLocalChanges(deviceContactsToMove)) {
+            return Decision(Action.NOTHING_TO_UPLOAD, 0L)
+        }
         prefs.lastLocalUploadSync = now
-        val hold = now + COOLDOWN_MILLIS
-        return if (uploads() && hasLocalChanges(deviceContactsToMove)) Decision(Action.RUN, hold) else Decision(Action.NOTHING_TO_UPLOAD, hold)
+        return Decision(Action.RUN, now + COOLDOWN_MILLIS)
     }
 
     /** Download-only accounts never upload; their changes come with the periodic and manual syncs. */

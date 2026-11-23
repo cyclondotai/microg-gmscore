@@ -221,23 +221,27 @@ class ContactsLocalSyncLoopTest {
         assertEquals(LocalUploadSync.Action.RUN, gate.decide(start + cooldown).action)
         // A clock set back does not hold uploads for the size of the jump.
         assertEquals(LocalUploadSync.Action.RUN, gate.decide(start - 3_600_000L).action)
-        // A LOCAL sync with nothing to send also starts the cooldown, but asks for no later sync.
+        // A LOCAL sync with nothing to send does not arm the cooldown (so clean or download-only accounts
+        // never delay their hourly server syncs or a subsequent real edit).
         pass()
         val idle = gate.decide(start + 10 * cooldown)
-        assertEquals(LocalUploadSync.Action.NOTHING_TO_UPLOAD, idle.action); assertFalse(idle.syncWhenHoldEnds)
-        assertEquals(LocalUploadSync.Action.DEFER, gate.decide(start + 10 * cooldown + 1).action)
-        assertFalse(gate.decide(start + 10 * cooldown + 1).syncWhenHoldEnds)
+        assertEquals(LocalUploadSync.Action.NOTHING_TO_UPLOAD, idle.action)
+        assertEquals(0L, idle.holdUntilMillis)
+        assertFalse(idle.syncWhenHoldEnds)
+        val idleAgain = gate.decide(start + 10 * cooldown + 1)
+        assertEquals(LocalUploadSync.Action.NOTHING_TO_UPLOAD, idleAgain.action)
+        assertEquals(0L, idleAgain.holdUntilMillis)
+        assertFalse(idleAgain.syncWhenHoldEnds)
     }
 
     @Test fun localUploadSyncWithNothingToSendEndsWithoutTouchingTheProvider() = fixture {
         api.remote[person().resource] = person(); pass()
         provider.writes.clear()
-        val before = System.currentTimeMillis()
         val result = localUploadSync()
         assertEquals(emptyList<ImportContactsProvider.Write>(), provider.writes)
         assertFalse(result.hasError()); assertFalse(result.fullSyncRequested)
-        // Android holds this account's next automatic sync (and so the next LOCAL one) for the cooldown.
-        assertTrue(result.delayUntil * 1000 >= before + LocalUploadSync.COOLDOWN_MILLIS)
+        // Clean pass does not hold the account's periodic downloads or immediate next real edit.
+        assertEquals(0L, result.delayUntil)
         assertEquals("", prefs.status)
     }
 

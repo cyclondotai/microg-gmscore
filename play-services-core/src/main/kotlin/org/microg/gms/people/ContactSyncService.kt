@@ -47,7 +47,9 @@ class ContactSyncService : Service() {
                 val decision = LocalUploadSync(provider, account, prefs).decide(deviceContactsToMove = {
                     autoMove(account, prefs) && DeviceContacts(provider, this@ContactSyncService).list().any { it.supported }
                 })
-                result.delayUntil = maxOf(result.delayUntil, (decision.holdUntilMillis + 999) / 1000)
+                if (decision.holdUntilMillis > 0L) {
+                    result.delayUntil = maxOf(result.delayUntil, (decision.holdUntilMillis + 999) / 1000)
+                }
                 if (decision.syncWhenHoldEnds) result.fullSyncRequested = true
                 if (decision.action != LocalUploadSync.Action.RUN) Log.i(TAG, "stage=local_upload action=${decision.action} later=${decision.syncWhenHoldEnds}")
                 return decision.action == LocalUploadSync.Action.RUN
@@ -135,12 +137,14 @@ class ContactSyncService : Service() {
                     prefs.status = if (e.status == 401 || e.status == 403) "authorization" else "network"
                     if (e.status == 401 || e.status == 403) result.stats.numAuthExceptions++ else result.stats.numIoExceptions++
                     if (e.retryAfterSeconds > 0) result.delayUntil = maxOf(result.delayUntil, System.currentTimeMillis() / 1000 + e.retryAfterSeconds)
+                    else if (e.status != 401 && e.status != 403) result.delayUntil = 0L
                     prefs.diagnostic = ContactsDiagnostics.activation(ActivationStage.API, e)
                     Log.w(TAG, "sync " + prefs.diagnostic)
                 } catch (e: AuthenticatorException) {
                     prefs.status = "authorization"
                     result.stats.numAuthExceptions++
                 } catch (e: IOException) {
+                    result.delayUntil = 0L
                     prefs.status = "network"
                     result.stats.numIoExceptions++
                     Log.w(TAG, "Contacts transport interrupted")
