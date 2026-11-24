@@ -147,7 +147,11 @@ internal class MigrationInstallQueue(private val context: Context,
     private fun legacy() = !prefs.contains("sessions") && prefs.contains("packages")
     fun currentSessionId(): String? = prefs.getString("current_session", null)
     fun sessions(): List<String> = prefs.getString("sessions", "").orEmpty().split(',').filter { it.isNotEmpty() }
-    fun beginTransfer(): String = synchronized(LOCK) { newSession() }
+    fun beginTransfer(): String {
+        val id = synchronized(LOCK) { newSession() }
+        MigrationAppDataRestore.notifyTransferStarting(context)
+        return id
+    }
 
     private fun newSession(run: String? = null): String {
         val id = UUID.randomUUID().toString()
@@ -236,20 +240,32 @@ internal class MigrationInstallQueue(private val context: Context,
         }
         handoff(run).apply { putBoolean("accepted", true) }
     }
-    fun startPausedTransfer(): String = synchronized(LOCK) {
-        currentSessionId()?.let { if (prefs.getBoolean("$it:pause_requested", false)) resume(it) }
-        beginTransfer()
+    fun startPausedTransfer(): String {
+        val id = synchronized(LOCK) {
+            currentSessionId()?.let { if (prefs.getBoolean("$it:pause_requested", false)) resume(it) }
+            newSession()
+        }
+        MigrationAppDataRestore.notifyTransferStarting(context)
+        return id
     }
-    fun catalogSession(): String = synchronized(LOCK) {
-        val id = currentSessionId()
-        if (id == null) beginTransfer() else if (prefs.getBoolean("$id:selected", false)) {
-            val held = prefs.getBoolean("$id:pause_requested", false)
-            val next = beginTransfer()
-            if (held) { resume(id); pause(next) }
-            next
-        } else id
+    fun catalogSession(): String {
+        val (id, created) = synchronized(LOCK) {
+            val current = currentSessionId()
+            if (current == null) {
+                newSession() to true
+            } else if (prefs.getBoolean("$current:selected", false)) {
+                val held = prefs.getBoolean("$current:pause_requested", false)
+                val next = newSession()
+                if (held) { resume(current); pause(next) }
+                next to true
+            } else {
+                current to false
+            }
+        }
+        if (created) MigrationAppDataRestore.notifyTransferStarting(context)
+        return id
     }
-    private fun session(): String = currentSessionId() ?: beginTransfer()
+    private fun session(): String = currentSessionId() ?: newSession()
     fun options(id: String): Bundle = Bundle().apply {
         putString("session_id", id)
         for (key in listOf("documents_type", "restore_source", "disable_pre_archiving")) {
@@ -270,17 +286,26 @@ internal class MigrationInstallQueue(private val context: Context,
     }
     fun renewPause(id: String) { if (prefs.getBoolean("$id:pause_requested", false)) control(4, options(id)) }
     fun releaseCompletedPause(id: String) { if (prefs.getBoolean("$id:pause_requested", false)) resume(id) }
-    fun recordOptions(options: Bundle) = synchronized(LOCK) {
-        val id = session(); val edit = prefs.edit()
-        for (key in listOf("documents_type", "restore_source", "disable_pre_archiving")) {
-            if (options.containsKey(key)) edit.putString("$id:option:$key", options.get(key).toString())
+    fun recordOptions(options: Bundle) {
+        val created = synchronized(LOCK) {
+            if (currentSessionId() == null) {
+                newSession()
+                true
+            } else false
         }
-        val source = options.get("restore_source")?.toString()?.toIntOrNull()
-        if (source in ANDROID_D2D_RESTORE_SOURCES && !prefs.contains("$id:d2d_seen_elapsed_ms")) {
-            edit.putInt("$id:d2d_seen_boot_count", currentBootCount(context))
-                .putLong("$id:d2d_seen_elapsed_ms", SystemClock.elapsedRealtime())
+        if (created) MigrationAppDataRestore.notifyTransferStarting(context)
+        synchronized(LOCK) {
+            val id = session(); val edit = prefs.edit()
+            for (key in listOf("documents_type", "restore_source", "disable_pre_archiving")) {
+                if (options.containsKey(key)) edit.putString("$id:option:$key", options.get(key).toString())
+            }
+            val source = options.get("restore_source")?.toString()?.toIntOrNull()
+            if (source in ANDROID_D2D_RESTORE_SOURCES && !prefs.contains("$id:d2d_seen_elapsed_ms")) {
+                edit.putInt("$id:d2d_seen_boot_count", currentBootCount(context))
+                    .putLong("$id:d2d_seen_elapsed_ms", SystemClock.elapsedRealtime())
+            }
+            check(edit.commit())
         }
-        check(edit.commit())
     }
     fun recordCatalog(documents: List<Bundle>) = synchronized(LOCK) {
         val id = session(); val edit = prefs.edit()
