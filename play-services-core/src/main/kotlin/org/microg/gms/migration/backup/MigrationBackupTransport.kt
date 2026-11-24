@@ -29,11 +29,12 @@ internal class MigrationBackupTransport(context: Context) : BackupTransport(), C
     override fun getCurrentRestoreSet() = restore.token() ?: 0L
     override fun getAvailableRestoreSets(): Array<RestoreSet> {
         val published = org.microg.gms.migration.MigrationRestoreTransport(appContext).ensureBatchNotified()
-        val deviceTag = if (published) "D2D" else "D2D:pending"
-        // Always return the staged RestoreSet when present so Switch's system restore (tx 6) never fails;
-        // post-install single-package restore treats "D2D:pending" as retryable until publication settles.
+        val setName = if (published) SET_NAME else PENDING_PUBLICATION_SET_NAME
+        // Always keep device == "D2D" so Android 16 ActiveRestoreSession selects BackupDestination.DEVICE_TRANSFER
+        // eligibility rules (not CLOUD) for Switch's system restore (tx 6); post-install single-package restore
+        // treats PENDING_PUBLICATION_SET_NAME as retryable until batchStarted publication settles.
         return restore.token()?.let {
-            arrayOf(RestoreSet("Phone transfer", deviceTag, it, 2))
+            arrayOf(RestoreSet(setName, "D2D", it, 2))
         } ?: emptyArray()
     }
     @Synchronized override fun startRestore(token: Long, packages: Array<PackageInfo>): Int = runCatching {
@@ -83,5 +84,11 @@ internal class MigrationBackupTransport(context: Context) : BackupTransport(), C
     override fun finishBackup() = ERROR
     override fun sendBackupData(bytes: Int) = ERROR
     override fun close() = restore.close()
-    companion object { private const val CHUNK = 32 * 1024; private const val OK = 0; private const val ERROR = -1000 }
+    companion object {
+        private const val CHUNK = 32 * 1024
+        private const val OK = 0
+        private const val ERROR = -1000
+        internal const val SET_NAME = "Phone transfer"
+        internal const val PENDING_PUBLICATION_SET_NAME = "Phone transfer (pending)"
+    }
 }

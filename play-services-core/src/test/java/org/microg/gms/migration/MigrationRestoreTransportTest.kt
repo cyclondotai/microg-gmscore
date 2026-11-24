@@ -122,8 +122,8 @@ class MigrationRestoreTransportTest {
         startWrite(batch1, "com.example.three")
         val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
         // Drop batch2 during staging completely; MigrationBackupTransport.getAvailableRestoreSets() still returns
-        // the staged RestoreSet (so Switch tx 6 system restore never aborts), tagging device="D2D:pending" while
-        // publication fails and returning device="D2D" once publication recovers with batchSeq=2 + original timestamp.
+        // the staged RestoreSet with device="D2D" (so Android 16 ActiveRestoreSession keeps DEVICE_TRANSFER rules
+        // for Switch tx 6 system restore), carrying publication status in RestoreSet.name until batchSeq=2 settles.
         val store = MigrationArtifactStore(context)
         store.file("@pm@").writeBytes(byteArrayOf(1))
         store.file("restore_token_file").writeText("1")
@@ -136,12 +136,20 @@ class MigrationRestoreTransportTest {
             val pendingSets = transport.getAvailableRestoreSets()
             assertEquals(1, pendingSets.size)
             assertEquals(1L, pendingSets[0].token)
-            assertEquals("D2D:pending", pendingSets[0].device)
+            assertEquals("D2D", pendingSets[0].device)
+            assertEquals(
+                org.microg.gms.migration.backup.MigrationBackupTransport.PENDING_PUBLICATION_SET_NAME,
+                pendingSets[0].name,
+            )
 
             val recoveredSets = transport.getAvailableRestoreSets()
             assertEquals(1, recoveredSets.size)
             assertEquals(1L, recoveredSets[0].token)
             assertEquals("D2D", recoveredSets[0].device)
+            assertEquals(
+                org.microg.gms.migration.backup.MigrationBackupTransport.SET_NAME,
+                recoveredSets[0].name,
+            )
         } finally {
             transport.close()
         }
