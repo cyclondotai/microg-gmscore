@@ -62,8 +62,29 @@ class SwitchFlagsTest {
         assertEquals(expectedRows, rows(provider))
         val decoded = android.util.Base64.decode(expectedRows.getValue(iosAppAllowlistName), 3)
         assertArrayEquals(Base64.getDecoder().decode(SwitchFlags.IOS_WHATSAPP_ALLOWLIST_BASE64), decoded)
-        assertTrue(String(decoded, Charsets.UTF_8).contains("net.whatsapp.WhatsApp"))
-        assertTrue(String(decoded, Charsets.UTF_8).contains("group.net.whatsapp.WhatsApp.shared"))
+        // Parse outer imf { entries(1): ime { android_package(1), bundle_id(2), group_container(3), flavor(4) } }
+        assertEquals(0x0a, decoded[0].toInt() and 0xff)
+        val entryLen = decoded[1].toInt() and 0xff
+        assertEquals(decoded.size - 2, entryLen)
+        val fields = linkedMapOf<Int, Any>()
+        var i = 2
+        while (i < decoded.size) {
+            val tag = decoded[i++].toInt() and 0xff
+            val fieldNum = tag ushr 3
+            when (tag and 0x7) {
+                0 -> fields[fieldNum] = decoded[i++].toInt() and 0xff
+                2 -> {
+                    val len = decoded[i++].toInt() and 0xff
+                    fields[fieldNum] = String(decoded, i, len, Charsets.UTF_8)
+                    i += len
+                }
+                else -> fail("Unexpected wire type for tag $tag")
+            }
+        }
+        assertEquals("com.whatsapp", fields[1])
+        assertEquals("net.whatsapp.WhatsApp", fields[2])
+        assertEquals("group.net.whatsapp.WhatsApp.shared", fields[3])
+        assertEquals(9, fields[4])
     }
 
     @Test fun foreignAndMalformedNamespacesDoNotReceiveContactFlags() {

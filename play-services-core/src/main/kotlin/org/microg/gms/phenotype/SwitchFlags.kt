@@ -17,12 +17,15 @@ object SwitchFlags {
     // Switch 1140078 ren.java:22,24 defaults IosAppFilesD2d__enable_ios_app_files_d2d to false
     // and IosAppFilesD2d__app_allowlist (imf proto with repeated ime entries) to empty, causing
     // MigrateUtil (drd.java:410) to hide WhatsApp chat transfer completely.
-    // Protobuf imf { entries(1): ime { name(1)="whatsapp", bundle_id(2)="net.whatsapp.WhatsApp",
+    // Protobuf imf { entries(1): ime { android_package(1)="com.whatsapp",
+    //   bundle_id(2)="net.whatsapp.WhatsApp",
     //   group_container(3)="group.net.whatsapp.WhatsApp.shared", flavor(4)=IOS_WHATSAPP(9) } }.
+    // UsbD2dMigrateFlowActivity.aH() compares field 1 (ime.c) against the matched Android package
+    // name (ena.i, e.g. "com.whatsapp") before enabling IOS_WHATSAPP for export.
     // Switch reads proto flags from ConfigurationProvider via Base64.decode(str, NO_PADDING|NO_WRAP)
     // (lla.java) and from PhenotypeService as Flag.DATA_TYPE_BYTES.
     const val IOS_WHATSAPP_ALLOWLIST_BASE64 =
-        "CkcKCHdoYXRzYXBwEhVuZXQud2hhdHNhcHAuV2hhdHNBcHAaImdyb3VwLm5ldC53aGF0c2FwcC5XaGF0c0FwcC5zaGFyZWQgCQ"
+        "CksKDGNvbS53aGF0c2FwcBIVbmV0LndoYXRzYXBwLldoYXRzQXBwGiJncm91cC5uZXQud2hhdHNhcHAuV2hhdHNBcHAuc2hhcmVkIAk"
     private val IOS_WHATSAPP_ALLOWLIST_BYTES: ByteArray = Base64.getDecoder().decode(IOS_WHATSAPP_ALLOWLIST_BASE64)
 
     // Switch 1140078 rct.java:164 defaults this off; dou.java:2469 then passes no
