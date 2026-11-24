@@ -86,7 +86,11 @@ internal class EmptyMigrateHelper(uid: Int, private val context: Context? = null
         }
     }
     @Synchronized private fun beginStaging() {
-        if (!stagingStarted) { requireNotNull(store).startBatch(); stagingStarted = true }
+        if (!stagingStarted) {
+            requireNotNull(store).startBatch()
+            stagingStarted = true
+            context?.let { MigrationRestoreTransport(it).notifyBatchStarted() }
+        }
     }
     private val io get() = MigrationHelperIo.executor
     private fun complete(callback: IBinder, action: () -> Unit) {

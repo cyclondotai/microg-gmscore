@@ -68,6 +68,62 @@ class MigrationRestoreTransportTest {
         provider.failure = SecurityException("Denied")
         assertThrows(SecurityException::class.java) { selection.acquire() }
     }
+
+    @Test fun notifyBatchStartedNeverCallsUntrustedProviders() {
+        for ((name, flags) in listOf("org.example.other" to ApplicationInfo.FLAG_SYSTEM, "ai.cyclon.migration" to 0)) {
+            val bad = provider(name, flags)
+            MigrationRestoreTransport(context).notifyBatchStarted()
+            assertTrue(bad.calls.isEmpty())
+        }
+    }
+
+    @Test fun notifyBatchStartedSignalsEachA2aStagingBatchOnceAndIgnoresOlderCompanions() {
+        // Trusted system companion receives batchStarted once per Android D2D staging batch (tx 3 startWrite),
+        // even when a batch stages multiple packages, and fires again when a second batch starts.
+        val trusted = provider()
+        val descriptor = "com.google.android.gms.backup.migrate.helper.ID2dMigrateHelper"
+        fun startWrite(helper: EmptyMigrateHelper, pkg: String) {
+            val file = java.io.File.createTempFile("migration", ".fixture", context.cacheDir).apply { writeBytes(byteArrayOf(1, 2, 3)) }
+            val pfd = android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+            val latch = java.util.concurrent.CountDownLatch(1)
+            var result = 0
+            val cb = object : android.os.Binder() {
+                override fun onTransact(code: Int, data: android.os.Parcel, reply: android.os.Parcel?, flags: Int): Boolean {
+                    data.enforceInterface("com.google.android.gms.backup.migrate.helper.IVoidCallbacks")
+                    result = code
+                    latch.countDown()
+                    return true
+                }
+            }
+            val req = android.os.Parcel.obtain()
+            val reply = android.os.Parcel.obtain()
+            try {
+                req.writeInterfaceToken(descriptor)
+                req.writeString(pkg)
+                req.writeInt(1)
+                pfd.writeToParcel(req, android.os.Parcelable.PARCELABLE_WRITE_RETURN_VALUE)
+                req.writeStrongBinder(cb)
+                assertTrue(helper.transact(3, req, reply, 0))
+                reply.readException()
+            } finally {
+                req.recycle()
+                reply.recycle()
+            }
+            assertTrue(latch.await(2, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(1, result)
+        }
+
+        val batch1 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
+        startWrite(batch1, "com.example.one")
+        startWrite(batch1, "com.example.two")
+        val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
+        startWrite(batch2, "com.example.one")
+        assertEquals(listOf("batchStarted" to null, "batchStarted" to null), trusted.calls)
+
+        // Older companion throwing on unknown method never fails staging.
+        trusted.failure = IllegalArgumentException("unknown")
+        MigrationRestoreTransport(context).notifyBatchStarted()
+    }
 }
 
 internal fun installRestoreTransportOwner(context: Context, owner: String = "ai.cyclon.migration", flags: Int = ApplicationInfo.FLAG_SYSTEM) {

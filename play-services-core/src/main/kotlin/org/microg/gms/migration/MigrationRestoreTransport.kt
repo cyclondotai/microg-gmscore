@@ -20,6 +20,17 @@ internal class MigrationRestoreTransport(private val context: Context) {
         } finally { Binder.restoreCallingIdentity(identity) }
     }
 
+    /** Notifies Transfer Phone that `migration-staging/` rotated to a new transfer batch (both Android D2D and iOS). */
+    fun notifyBatchStarted() {
+        val identity = Binder.clearCallingIdentity()
+        try {
+            val provider = context.packageManager.resolveContentProvider(AUTHORITY.authority!!, 0) ?: return
+            if (provider.packageName != "ai.cyclon.migration" ||
+                (provider.applicationInfo?.flags ?: 0) and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0) return
+            runCatching { context.contentResolver.call(AUTHORITY, "batchStarted", null, null) }
+        } finally { Binder.restoreCallingIdentity(identity) }
+    }
+
     companion object {
         private val AUTHORITY = Uri.parse("content://ai.cyclon.migration.restore")
     }
