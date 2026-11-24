@@ -5,6 +5,7 @@
 
 package org.microg.gms.checkin
 
+import android.content.ContentValues
 import android.content.Context
 import org.microg.gms.settings.SettingsContract
 
@@ -53,16 +54,40 @@ data class LastCheckinInfo(
                 put(SettingsContract.CheckIn.SECURITY_TOKEN, 0L)
                 put(SettingsContract.CheckIn.VERSION_INFO, "")
                 put(SettingsContract.CheckIn.DEVICE_DATA_VERSION_INFO, "")
+                putNull(SettingsContract.CheckIn.RESTORE_MARKER)
+            }
+
+        /** Cyclon: the marker of a factory-baseline restore that has not finished, or null (CYC-2935). */
+        @JvmStatic
+        fun restoreMarker(context: Context): String? = SettingsContract.getSettings(
+            context,
+            SettingsContract.CheckIn.getContentUri(context),
+            arrayOf(SettingsContract.CheckIn.RESTORE_MARKER),
+        ) { c -> c.getString(0) }
+
+        @JvmStatic
+        fun clearRestoreMarker(context: Context) =
+            SettingsContract.setSettingsDurably(context, SettingsContract.CheckIn.getContentUri(context)) {
+                putNull(SettingsContract.CheckIn.RESTORE_MARKER)
             }
     }
 
     fun write(context: Context) =
-        SettingsContract.setSettings(context, SettingsContract.CheckIn.getContentUri(context)) {
-            put(SettingsContract.CheckIn.ANDROID_ID, androidId)
-            put(SettingsContract.CheckIn.DIGEST, digest)
-            put(SettingsContract.CheckIn.LAST_CHECK_IN, lastCheckin)
-            put(SettingsContract.CheckIn.SECURITY_TOKEN, securityToken)
-            put(SettingsContract.CheckIn.VERSION_INFO, versionInfo)
-            put(SettingsContract.CheckIn.DEVICE_DATA_VERSION_INFO, deviceDataVersionInfo)
+        SettingsContract.setSettings(context, SettingsContract.CheckIn.getContentUri(context)) { putIdentity() }
+
+    /** Cyclon: this identity and its restore marker in one commit, so neither can be on disk without the other. */
+    fun write(context: Context, restoreMarker: String) =
+        SettingsContract.setSettingsDurably(context, SettingsContract.CheckIn.getContentUri(context)) {
+            putIdentity()
+            put(SettingsContract.CheckIn.RESTORE_MARKER, restoreMarker)
         }
+
+    private fun ContentValues.putIdentity() {
+        put(SettingsContract.CheckIn.ANDROID_ID, androidId)
+        put(SettingsContract.CheckIn.DIGEST, digest)
+        put(SettingsContract.CheckIn.LAST_CHECK_IN, lastCheckin)
+        put(SettingsContract.CheckIn.SECURITY_TOKEN, securityToken)
+        put(SettingsContract.CheckIn.VERSION_INFO, versionInfo)
+        put(SettingsContract.CheckIn.DEVICE_DATA_VERSION_INFO, deviceDataVersionInfo)
+    }
 }

@@ -26,6 +26,7 @@ import org.microg.gms.auth.AuthRequest;
 import org.microg.gms.common.Constants;
 import org.microg.gms.common.DeviceConfiguration;
 import org.microg.gms.common.Utils;
+import org.microg.gms.cyclon.FactoryBaseline;
 import org.microg.gms.gservices.GServices;
 import org.microg.gms.settings.SettingsContract;
 
@@ -38,6 +39,7 @@ public class CheckinManager {
 
     @SuppressWarnings("MissingPermission")
     public static synchronized LastCheckinInfo checkin(Context context, boolean force) throws IOException {
+        if (FactoryBaseline.holdsCheckin(context)) return null;
         LastCheckinInfo info = LastCheckinInfo.read(context);
         if (!force && info.getLastCheckin() > System.currentTimeMillis() - MIN_CHECKIN_INTERVAL)
             return null;
@@ -59,7 +61,7 @@ public class CheckinManager {
         CheckinRequest request = CheckinClient.makeRequest(context,
                 new DeviceConfiguration(context), Utils.getDeviceIdentifier(context),
                 Utils.getPhoneInfo(context), info, Utils.getLocale(context), accounts);
-        return handleResponse(context, CheckinClient.request(request));
+        return handleResponse(context, CheckinClient.request(request), info.getAndroidId());
     }
 
     private static LastCheckinInfo createLastCheckinInfo(CheckinResponse r) {
@@ -73,9 +75,10 @@ public class CheckinManager {
         );
     }
 
-    private static LastCheckinInfo handleResponse(Context context, CheckinResponse response) {
+    /** Null when a factory-baseline restore replaced the identity this check-in was requested for (CYC-2935). */
+    static LastCheckinInfo handleResponse(Context context, CheckinResponse response, long requestedFor) throws IOException {
         LastCheckinInfo info = createLastCheckinInfo(response);
-        info.write(context);
+        if (!FactoryBaseline.storeCheckinResponse(context, requestedFor, info)) return null;
 
         ContentResolver resolver = context.getContentResolver();
         for (CheckinResponse.GservicesSetting setting : response.setting) {

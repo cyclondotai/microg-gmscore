@@ -20,6 +20,8 @@
 
     <queries>
         <provider android:authorities="ai.cyclon.migration.restore" />
+        <!-- Cyclon: factory baseline; the seal checks who holds Core's authority before sending. -->
+        <package android:name="ai.cyclon.core" />
     </queries>
 
     <permission
@@ -672,6 +674,13 @@
             android:authorities="com.google.android.gms.cyclon.enrollment"
             android:exported="true"
             android:process=":ui"
+            android:permission="ai.cyclon.microg.permission.ENROLLMENT_CHALLENGE" />
+
+        <!-- Cyclon: Core restores the sealed baseline after a factory reset (CYC-2935); the caller is checked in call(). -->
+        <provider
+            android:name="org.microg.gms.cyclon.FactoryBaselineProvider"
+            android:authorities="com.google.android.gms.cyclon.factory_baseline"
+            android:exported="true"
             android:permission="ai.cyclon.microg.permission.ENROLLMENT_CHALLENGE" />
 
         <activity

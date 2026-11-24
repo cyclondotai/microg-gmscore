@@ -81,6 +81,17 @@ data class GcmPrefs(
             prefs.setEnabled(context, enabled)
         }
 
+        /**
+         * Cyclon: turns push on, saved to disk before it returns; throws when it could not be saved (CYC-2935). Always
+         * asks for a reconnect, because a resumed restore may find the flag already on with push never started.
+         */
+        fun enableDurably(context: Context) {
+            SettingsContract.setSettingsDurably(context, Gcm.getContentUri(context)) {
+                put(Gcm.ENABLE_GCM, true)
+            }
+            context.sendBroadcast(Intent(FORCE_TRY_RECONNECT, null, context, TriggerReceiver::class.java))
+        }
+
         @JvmStatic
         fun clearLastPersistedId(context: Context) {
             setSettings(context, Gcm.getContentUri(context)) {

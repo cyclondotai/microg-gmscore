@@ -29,4 +29,12 @@ object CheckinPreferences {
         }
     }
 
+    /** Cyclon: [setEnabled] on, saved to disk before it returns; throws when it could not be saved (CYC-2935). */
+    fun enableDurably(context: Context) {
+        SettingsContract.setSettingsDurably(context, CheckIn.getContentUri(context)) {
+            put(CheckIn.ENABLED, true)
+        }
+        context.sendOrderedBroadcast(Intent(context, TriggerReceiver::class.java), null)
+    }
+
 }
