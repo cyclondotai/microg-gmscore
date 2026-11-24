@@ -210,6 +210,12 @@ internal class MigrationInstallQueue(private val context: Context,
             putStringArrayList("packages", ArrayList(names))
             putStringArrayList("titles", ArrayList(names.map { name -> (snapshot["$id:$name:title"] as? String)?.take(80) ?: name }))
             val pending = snapshot["$id:pending"] as? Set<*> ?: emptySet<String>()
+            val restoreEligible = id != null && id == snapshot["current_session"] &&
+                (snapshot["$id:option:restore_source"] as? String)?.toIntOrNull() in ANDROID_D2D_RESTORE_SOURCES &&
+                (appDataRestore != null || snapshot["$id:start_acknowledged"] == true)
+            val restorePending = if (restoreEligible) {
+                (snapshot["$id:app_data_restore_pending"] as? Set<*>)?.filterIsInstance<String>().orEmpty().toSet()
+            } else emptySet()
             val statuses = ArrayList<String>(names.size)
             val errors = ArrayList<String>(names.size)
             for (name in names) {
@@ -217,7 +223,7 @@ internal class MigrationInstallQueue(private val context: Context,
                 val rawError = (snapshot["$id:$name:error"] as? String).orEmpty()
                 val rawErrorCode = (snapshot["$id:$name:errorCode"] as? String).orEmpty()
                 val inSelection = name in handoffPackages
-                val status = when {
+                val baseStatus = when {
                     name in pending -> "pending"
                     // summary() may have lost its Aurora connection while checking a dispatched app.
                     inSelection && rawStatus == "unavailable" && rawError == "store_unavailable" -> "queued"
@@ -227,6 +233,20 @@ internal class MigrationInstallQueue(private val context: Context,
                     !inSelection && rawStatus.isEmpty() -> "unavailable"
                     else -> rawStatus
                 }
+                // Hold Setup sign-in launch on Android-to-Android copies until post-install app-data restore settles,
+                // covering both pending restores already queued by summary() and newly installed APKs before summary()
+                // has run, so BackupManagerService.restorePackages(pkg) cannot force-stop and wipe a newly signed-in app.
+                val awaitingSummaryRestore = restoreEligible &&
+                    baseStatus !in TERMINAL &&
+                    snapshot["$id:$name:app_data_restore_done"] != true &&
+                    snapshot["$id:$name:preexisting"] != true &&
+                    (snapshot["$id:$name:install_dispatched"] == true || snapshot["$id:$name:observed_not_installed"] == true) &&
+                    isInstalledAtExpectedVersion(snapshot, id!!, name)
+                val status = if ((baseStatus == "installed" && name in restorePending) || awaitingSummaryRestore) {
+                    "restoring_data"
+                } else {
+                    baseStatus
+                }
                 val error = if (status in TERMINAL) rawErrorCode.ifEmpty { rawError } else ""
                 statuses += status
                 errors += error
@@ -234,6 +254,21 @@ internal class MigrationInstallQueue(private val context: Context,
             putStringArrayList("statuses", statuses)
             putStringArrayList("errors", errors)
         }
+    }
+
+    private fun isInstalledAtExpectedVersion(snapshot: Map<String, *>, id: String, name: String): Boolean {
+        val info = try {
+            context.packageManager.getPackageInfo(name, 0)
+        } catch (_: Exception) {
+            return false
+        }
+        val listed = snapshot["$id:$name:expectedVersion"] as? Long ?: 0L
+        val expected = if (snapshot["$id:$name:owner_account"] == true) {
+            snapshot["$id:$name:ownerVersion"] as? Long ?: listed
+        } else {
+            listed
+        }
+        return info.longVersionCode >= expected
     }
 
     fun endHandoff(run: String, outcome: String): Bundle = synchronized(LOCK) {
@@ -314,7 +349,7 @@ internal class MigrationInstallQueue(private val context: Context,
     }
     fun recordCatalog(documents: List<Bundle>) = synchronized(LOCK) {
         val id = session(); val edit = prefs.edit()
-        val excluded = documents.filter { it.getInt("availability") != 1 }
+        val excluded = documents.filter { it.getInt("availability") != 1 && it.getString("error") != "provided_by_os" }
         val names = documents.map { it.getString("package_name")!! }.toSet()
         val previousExcluded = prefs.getStringSet("$id:excluded", emptySet()).orEmpty()
         val nextExcluded = (previousExcluded - names) + excluded.map { it.getString("package_name")!! }
@@ -411,6 +446,7 @@ internal class MigrationInstallQueue(private val context: Context,
         result: MigrationAppDataRestore.Result,
         nowMs: Long = System.currentTimeMillis(),
     ) {
+        var cleared = false
         synchronized(LOCK) {
             val current = pendingAppDataRestores(id)
             val staleSession = id != currentSessionId() || !isAppDataRestoreEligible(id)
@@ -432,17 +468,20 @@ internal class MigrationInstallQueue(private val context: Context,
                         .putBoolean("$id:$name:app_data_restore_done", true)
                         .commit(),
                 )
-                return
+                cleared = name in current
+            } else {
+                val terminal = result.status in APP_DATA_RESTORE_TERMINAL
+                val attempts = prefs.getInt("$id:$name:app_data_restore_attempts", 0) + 1
+                val edit = prefs.edit().putInt("$id:$name:app_data_restore_attempts", attempts)
+                if (terminal || staleSession || attempts >= MAX_APP_DATA_RESTORE_ATTEMPTS) {
+                    edit.putStringSet("$id:app_data_restore_pending", current - name)
+                        .putBoolean("$id:$name:app_data_restore_done", true)
+                    cleared = name in current
+                }
+                check(edit.commit())
             }
-            val terminal = result.status in APP_DATA_RESTORE_TERMINAL
-            val attempts = prefs.getInt("$id:$name:app_data_restore_attempts", 0) + 1
-            val edit = prefs.edit().putInt("$id:$name:app_data_restore_attempts", attempts)
-            if (terminal || staleSession || attempts >= MAX_APP_DATA_RESTORE_ATTEMPTS) {
-                edit.putStringSet("$id:app_data_restore_pending", current - name)
-                    .putBoolean("$id:$name:app_data_restore_done", true)
-            }
-            check(edit.commit())
         }
+        if (cleared) changed(id)
     }
 
     /** Retries pending Android-to-Android post-install app-data restores for the current session only. */
@@ -879,7 +918,11 @@ internal class MigrationInstallQueue(private val context: Context,
                 if (throttled) return false // Play limits the store, not one session: pause every install.
                 // Freeze this session's receipts before another session can touch the same Aurora row.
                 if (next()?.first != id) { summary(id, reschedule = false, freeze = true); unfrozen = null; checkedAt = clock() }
-                else if (clock() - checkedAt >= SUMMARY_EVERY_MS) { summary(id, reschedule = false); checkedAt = clock() }
+                else if (clock() - checkedAt >= SUMMARY_EVERY_MS) {
+                    summary(id, reschedule = false)
+                    if (pendingAppDataRestores(id).isNotEmpty()) processPendingAppDataRestores(cancelled, clock)
+                    checkedAt = clock()
+                }
                 entry = next()
             }
             if (processRestores && !processPendingAppDataRestores(cancelled)) settled = false

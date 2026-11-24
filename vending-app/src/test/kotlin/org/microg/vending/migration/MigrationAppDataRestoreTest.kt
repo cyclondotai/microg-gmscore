@@ -346,6 +346,70 @@ class MigrationAppDataRestoreTest {
         assertEquals(1, legacy.calls.size)
     }
 
+    @Test fun handoffReportsRestoringDataUntilA2aRestoreSettlesAndExcludesProvidedByOs() {
+        val run = "00000000-0000-0000-0000-000000000009"
+        var replyStatus = "busy"
+        var installed = false
+        val queue = MigrationInstallQueue(context) { operation, name ->
+            Bundle().apply {
+                putString("package_name", name)
+                putString("status", if (operation == 2) "queued" else if (installed) "installed" else "downloading")
+                putBoolean("installed", installed)
+                putLong("installed_version_code", if (installed) 12 else 0)
+                putLong("version_code", 12)
+            }
+        }.apply {
+            appDataRestore = { _, _ -> MigrationAppDataRestore.Result(ok = replyStatus == "restored", status = replyStatus) }
+        }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false).getBoolean("accepted"))
+        val sessionId = queue.catalogSession()
+        queue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
+        // OS-provided apps (e.g. CyclonClockBridge com.google.android.deskclock) must not appear as failed exclusions.
+        queue.recordCatalog(listOf(
+            Bundle().apply { putString("package_name", app); putString("title", "Third Party"); putInt("availability", 1); putLong("version_code", 12) },
+            MigrationInstallQueue.unavailable("com.google.android.deskclock", "provided_by_os"),
+        ))
+        queue.select(listOf(Bundle().apply { putString("package_name", app); putString("title", "Third Party"); putLong("version_code", 12) }))
+        queue.dispatch(app, sessionId)
+
+        // Even before summary() runs, once PackageManager sees the newly dispatched APK at expected version,
+        // handoff() must already report restoring_data so Setup cannot race ahead of summary() + restorePackage().
+        shadowOf(context.packageManager).installPackage(PackageInfo().apply {
+            packageName = app
+            longVersionCode = 12L
+            applicationInfo = ApplicationInfo().apply { packageName = app }
+        })
+        assertEquals(listOf("restoring_data"), queue.handoff(run).getStringArrayList("statuses"))
+
+        installed = true
+        val summary = queue.summary(sessionId, reschedule = false)
+        assertTrue(summary.getBoolean("all_installed"))
+        val restoring = queue.handoff(run)
+        assertEquals(listOf(app), restoring.getStringArrayList("packages"))
+        assertEquals(listOf("restoring_data"), restoring.getStringArrayList("statuses"))
+
+        // Once Switch releases the backup transport lease and restore finishes, handoff flips to installed.
+        replyStatus = "restored"
+        assertTrue(queue.processPendingAppDataRestores())
+        val settled = queue.handoff(run)
+        assertEquals(listOf("installed"), settled.getStringArrayList("statuses"))
+
+        // A superseded transfer's handoff must never remain stuck in restoring_data.
+        val run2 = "00000000-0000-0000-0000-00000000000a"
+        replyStatus = "busy"
+        installed = false
+        assertTrue(queue.beginHandoff(run2, resumeOnly = false).getBoolean("accepted"))
+        val s2 = queue.catalogSession()
+        queue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
+        queue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
+        queue.dispatch(app, s2)
+        installed = true
+        queue.summary(s2, reschedule = false)
+        assertEquals(listOf("restoring_data"), queue.handoff(run2).getStringArrayList("statuses"))
+        queue.beginTransfer()
+        assertEquals(listOf("installed"), queue.handoff(run2).getStringArrayList("statuses"))
+    }
+
     private data class Call(
         val method: String,
         val arg: String?,
