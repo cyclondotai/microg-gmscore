@@ -82,6 +82,11 @@ class AuroraMigrationWireTest {
         assertEquals(listOf(7, 2, 4, 5, 6), store.calls)
         assertTrue(store.installOptions.single().getBoolean("owner_approved_retry"))
         assertEquals(3, store.installOptions.single().getInt("documents_type"))
+        // Aurora without prioritize_downloads does not receive op 8.
+        val priorityUnsupported = client.control(8, options())
+        assertFalse(priorityUnsupported.getBoolean("success"))
+        assertTrue(priorityUnsupported.getBoolean("unsupported"))
+        assertEquals(listOf(7, 2, 4, 5, 6), store.calls)
     }
     @Test fun catalogAndStatusKeepOriginalStringOnlyWire() {
         val store = Store(false)

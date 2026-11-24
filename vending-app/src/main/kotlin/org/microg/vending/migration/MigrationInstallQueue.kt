@@ -21,15 +21,38 @@ internal class MigrationInstallQueue(private val context: Context,
     private val storeCall: ((Int, String) -> Bundle)? = null) {
     /** Tests: the options each faked [storeCall] request would carry to Aurora. */
     internal var sentOptions: ((Int, Bundle?) -> Unit)? = null
+    /** Tests: optional override for post-install app-data restore dispatch. */
+    internal var appDataRestore: ((String, String) -> Unit)? = null
     private val prefs = context.getSharedPreferences("migration-installs", Context.MODE_PRIVATE)
     /** Play answered 429 since the job last cleared this; stop the round and wait before asking again. */
     @Volatile var throttled = false
+    private data class DispatchEntry(
+        val item: Pair<String, String>,
+        val throttledAt: Long,
+        val tier: Int,
+        val priorityRank: Int,
+    )
+    /** Ordered priority packages for [id], falling back to the legacy unordered set if no order was stored. */
+    fun priorityOrder(id: String = currentSessionId().orEmpty()): List<String> {
+        val stored = prefs.getString("$id:priority_order", null)
+        if (stored != null) return stored.split(',').filter { it.isNotEmpty() }
+        return prefs.getStringSet("$id:priority", emptySet()).orEmpty().sorted()
+    }
     /** Pending installs across sessions. Apps Play refused most recently go last, so one cannot block the rest. */
     fun dispatchOrder(): List<Pair<String, String>> = sessions().flatMap { id ->
         // Each app's sort keys are read once, not on every comparison (a stable sort on the same keys: the same order).
-        val priority = prefs.getStringSet("$id:priority", emptySet()).orEmpty()
-        pending(id).sorted().map { name -> Triple(id to name, prefs.getLong("$id:$name:throttled_at", 0), tier(id, name, priority)) }
-    }.sortedWith(compareBy({ it.second }, { it.third })).map { it.first }
+        val ordered = priorityOrder(id)
+        val priority = ordered.toSet()
+        val rank = if (prefs.contains("$id:priority_order")) ordered.withIndex().associate { (i, name) -> name to i } else emptyMap()
+        pending(id).sorted().map { name ->
+            DispatchEntry(
+                id to name,
+                prefs.getLong("$id:$name:throttled_at", 0),
+                tier(id, name, priority),
+                rank[name] ?: Int.MAX_VALUE,
+            )
+        }
+    }.sortedWith(compareBy({ it.throttledAt }, { it.tier }, { it.priorityRank })).map { it.item }
     /**
      * Within a session's open apps: the ones Setup asked for first ([prioritize]: the sign-in apps), then the ones going to
      * the phone's Google account after Play refused the anonymous session, then the rest in package order (11-17
@@ -41,19 +64,32 @@ internal class MigrationInstallQueue(private val context: Context,
         prefs.getBoolean("$id:$name:owner_account", false) -> 1
         else -> 2
     }
+    /** Already dispatched to Aurora and waiting in its queue (not actively downloading/installing or settled). */
+    private fun isQueuedNotActive(id: String, name: String): Boolean {
+        if (!isSelected(id, name) || isPending(id, name)) return false
+        if (prefs.getBoolean("$id:$name:terminal", false) || prefs.getBoolean("$id:$name:installed", false)) return false
+        val status = prefs.getString("$id:$name:status", null)
+        return status == "queued" || status == "none" || status.isNullOrEmpty()
+    }
     /**
      * Setup's sign-in apps for its handoff [run] go to Aurora before the copy's other apps (Core's
-     * setup.transfer.handoff.prioritize). Only apps of that run's selection count; unknown ones are kept for a later chunk.
+     * setup.transfer.handoff.prioritize). Requested packages move to the front of the priority order so
+     * pending and already-queued (non-downloading) apps run next right after any active download.
      */
     fun prioritize(run: String, packages: List<String>): Bundle = synchronized(LOCK) {
         val id = prefs.getString("handoff_session", null)
         if (prefs.getString("handoff_run", null) != run || id == null) return Bundle().apply {
             putBoolean("supported", true); putBoolean("accepted", false); putInt("prioritized", 0)
         }
-        val wanted = packages.filter { PACKAGE.matches(it) }.take(MAX_PRIORITY).toSet()
-        val priority = prefs.getStringSet("$id:priority", emptySet()).orEmpty() + wanted
-        check(prefs.edit().putStringSet("$id:priority", priority.toSet()).commit())
-        val open = wanted.count { isPending(id, it) }
+        val wanted = packages.filter { PACKAGE.matches(it) }.distinct().take(MAX_PRIORITY)
+        val wantedSet = wanted.toSet()
+        val ordered = (wanted + priorityOrder(id).filterNot { it in wantedSet }).take(MAX_PRIORITY_TOTAL)
+        val edit = prefs.edit()
+            .putString("$id:priority_order", ordered.joinToString(","))
+            .putStringSet("$id:priority", ordered.toSet())
+        if (wanted.isNotEmpty()) edit.putBoolean("$id:priority_dirty", true)
+        check(edit.commit())
+        val open = wanted.count { isPending(id, it) || isQueuedNotActive(id, it) }
         if (open > 0) schedule()
         Bundle().apply { putBoolean("supported", true); putBoolean("accepted", true); putInt("prioritized", open) }
     }
@@ -120,25 +156,41 @@ internal class MigrationInstallQueue(private val context: Context,
             putString("outcome", outcome)
             putBoolean("selection_closed", if (id == null) outcome != null else snapshot["$id:selection_closed"] == true)
             putLong("selection_changed_at", snapshot["$id:selection_changed_at"] as? Long ?: 0)
-            val selected = (snapshot["$id:handoff_packages"] as? Set<*>)?.filterIsInstance<String>().orEmpty().sorted()
+            val handoffPackages = (snapshot["$id:handoff_packages"] as? Set<*>)?.filterIsInstance<String>().orEmpty().toSet()
+            val includeExcluded = id != null && (snapshot["$id:selected"] == true || snapshot["$id:selection_closed"] == true)
+            val excludedPackages = if (includeExcluded) {
+                (snapshot["$id:excluded"] as? Set<*>)?.filterIsInstance<String>().orEmpty().toSet()
+            } else emptySet()
+            val selected = (handoffPackages + excludedPackages).sorted()
             val names = selected.drop(offset).take(64)
             putInt("total", selected.size)
             if (offset + names.size < selected.size) putInt("next_offset", offset + names.size)
             putStringArrayList("packages", ArrayList(names))
             putStringArrayList("titles", ArrayList(names.map { name -> (snapshot["$id:$name:title"] as? String)?.take(80) ?: name }))
             val pending = snapshot["$id:pending"] as? Set<*> ?: emptySet<String>()
-            putStringArrayList("statuses", ArrayList(names.map { name ->
-                val status = (snapshot["$id:$name:status"] as? String).orEmpty()
-                when {
+            val statuses = ArrayList<String>(names.size)
+            val errors = ArrayList<String>(names.size)
+            for (name in names) {
+                val rawStatus = (snapshot["$id:$name:status"] as? String).orEmpty()
+                val rawError = (snapshot["$id:$name:error"] as? String).orEmpty()
+                val rawErrorCode = (snapshot["$id:$name:errorCode"] as? String).orEmpty()
+                val inSelection = name in handoffPackages
+                val status = when {
                     name in pending -> "pending"
                     // summary() may have lost its Aurora connection while checking a dispatched app.
-                    status == "unavailable" && snapshot["$id:$name:error"] == "store_unavailable" -> "queued"
+                    inSelection && rawStatus == "unavailable" && rawError == "store_unavailable" -> "queued"
                     // An app already on the phone has no Aurora download row: Aurora says "none", and summary() saved it
                     // as installed (11-18 founders-02: Gmail and Chrome kept Setup's copy at "284 of 287" for good).
-                    status == "none" && snapshot["$id:$name:installed"] == true -> "installed"
-                    else -> status
+                    rawStatus == "none" && snapshot["$id:$name:installed"] == true -> "installed"
+                    !inSelection && rawStatus.isEmpty() -> "unavailable"
+                    else -> rawStatus
                 }
-            }))
+                val error = if (status in TERMINAL) rawErrorCode.ifEmpty { rawError } else ""
+                statuses += status
+                errors += error
+            }
+            putStringArrayList("statuses", statuses)
+            putStringArrayList("errors", errors)
         }
     }
 
@@ -201,10 +253,17 @@ internal class MigrationInstallQueue(private val context: Context,
         val id = session(); val edit = prefs.edit()
         val excluded = documents.filter { it.getInt("availability") != 1 }
         val names = documents.map { it.getString("package_name")!! }.toSet()
-        edit.putStringSet("$id:excluded", (prefs.getStringSet("$id:excluded", emptySet()).orEmpty() - names) + excluded.map { it.getString("package_name")!! })
+        val previousExcluded = prefs.getStringSet("$id:excluded", emptySet()).orEmpty()
+        val nextExcluded = (previousExcluded - names) + excluded.map { it.getString("package_name")!! }
+        edit.putStringSet("$id:excluded", nextExcluded)
+        if (prefs.getString("handoff_session", null) == id && prefs.getBoolean("$id:selected", false) &&
+            (nextExcluded - previousExcluded).isNotEmpty()) {
+            edit.putLong("$id:selection_changed_at", System.currentTimeMillis())
+        }
         for (doc in documents) {
             metadata(edit, id, doc)
-            edit.putBoolean("$id:${doc.getString("package_name")}:recoverable", doc.getInt("availability") != 1 && doc.getBoolean("recoverable"))
+            val pkg = doc.getString("package_name")!!
+            edit.putBoolean("$id:$pkg:recoverable", doc.getInt("availability") != 1 && doc.getBoolean("recoverable"))
         }
         check(edit.commit())
     }
@@ -270,23 +329,35 @@ internal class MigrationInstallQueue(private val context: Context,
     /** Membership in the stored set without copying its ~300 entries; the set SharedPreferences returns is never changed. */
     private fun isPending(id: String, name: String) = prefs.getStringSet("$id:pending", null)?.contains(name) == true
     private fun isSelected(id: String, name: String) = prefs.getStringSet("$id:packages", null)?.contains(name) == true
-    fun save(name: String, result: Bundle, dispatched: Boolean = false, id: String = session()) = synchronized(LOCK) {
-        val before = row(id, name)
-        val edit = prefs.edit()
-        for (key in listOf("status", "error")) edit.putString("$id:$name:$key", result.getString(key) ?: if (key == "error") result.getString("errorCode") else "unknown")
-        // The store's own failure code beside the error: a refusal of the anonymous session stays known ([refusedBefore]).
-        if (result.getString("errorCode") != null) edit.putString("$id:$name:errorCode", result.getString("errorCode")) else edit.remove("$id:$name:errorCode")
-        edit.putBoolean("$id:$name:installed", result.getBoolean("installed"))
-        edit.putBoolean("$id:$name:terminal", result.getBoolean("terminal"))
-        edit.putLong("$id:$name:installedVersion", result.getLong("installed_version_code"))
-        if (result.getBoolean("installed") && result.getLong("installed_version_code") >= expectedVersion(id, name))
-            edit.putBoolean("$id:$name:ever_installed", true)
-        if (dispatched) edit.putStringSet("$id:pending", pending(id) - name).putBoolean("$id:$name:uncertain", false)
-            .putBoolean("$id:$name:acknowledged", true).putBoolean("$id:$name:owner_retry", false)
-        check(edit.commit())
-        // Only a change makes a status asked before it stale: a poll saving the same receipt again must not make
-        // another summary drop the newer answer it just read (round 3: a failure lost at a transfer boundary).
-        if (row(id, name) != before) bump(id, name)
+    fun save(name: String, result: Bundle, dispatched: Boolean = false, id: String = session()) {
+        var triggerRestore = false
+        synchronized(LOCK) {
+            val before = row(id, name)
+            val edit = prefs.edit()
+            for (key in listOf("status", "error")) edit.putString("$id:$name:$key", result.getString(key) ?: if (key == "error") result.getString("errorCode") else "unknown")
+            // The store's own failure code beside the error: a refusal of the anonymous session stays known ([refusedBefore]).
+            if (result.getString("errorCode") != null) edit.putString("$id:$name:errorCode", result.getString("errorCode")) else edit.remove("$id:$name:errorCode")
+            edit.putBoolean("$id:$name:installed", result.getBoolean("installed"))
+            edit.putBoolean("$id:$name:terminal", result.getBoolean("terminal"))
+            edit.putLong("$id:$name:installedVersion", result.getLong("installed_version_code"))
+            val nowInstalled = result.getBoolean("installed") && result.getLong("installed_version_code") >= expectedVersion(id, name)
+            if (nowInstalled) {
+                edit.putBoolean("$id:$name:ever_installed", true)
+                if (!prefs.getBoolean("$id:$name:app_data_restore_requested", false)) {
+                    edit.putBoolean("$id:$name:app_data_restore_requested", true)
+                    triggerRestore = true
+                }
+            }
+            if (dispatched) edit.putStringSet("$id:pending", pending(id) - name).putBoolean("$id:$name:uncertain", false)
+                .putBoolean("$id:$name:acknowledged", true).putBoolean("$id:$name:owner_retry", false)
+            check(edit.commit())
+            // Only a change makes a status asked before it stale: a poll saving the same receipt again must not make
+            // another summary drop the newer answer it just read (round 3: a failure lost at a transfer boundary).
+            if (row(id, name) != before) bump(id, name)
+        }
+        if (triggerRestore) {
+            appDataRestore?.invoke(name, id) ?: MigrationAppDataRestore.triggerAsync(context, name, id)
+        }
     }
     /** What [save] writes for one app, to tell a change from the same receipt saved again. */
     private fun row(id: String, name: String): List<Any?> = listOf(
@@ -521,6 +592,26 @@ internal class MigrationInstallQueue(private val context: Context,
             putString("cyclon_hold_state", if (getBoolean("complete")) "complete" else "installing")
         }
     }
+    /** Forwards a session's ordered priority list to Aurora when it advertises `prioritize_downloads`. */
+    private fun syncStorePriority(id: String) {
+        val ordered = synchronized(LOCK) {
+            if (!prefs.getBoolean("$id:priority_dirty", false)) return
+            priorityOrder(id)
+        }
+        if (ordered.isEmpty()) {
+            synchronized(LOCK) { check(prefs.edit().putBoolean("$id:priority_dirty", false).commit()) }
+            return
+        }
+        val capabilities = control(7, Bundle())
+        if (capabilities.getString("error") == "store_unavailable") return
+        if (capabilities.getBoolean("prioritize_downloads")) {
+            val reply = control(8, options(id).apply { putStringArrayList("packages", ArrayList(ordered)) })
+            if (reply.getString("error") == "store_unavailable") return
+        }
+        synchronized(LOCK) {
+            if (priorityOrder(id) == ordered) check(prefs.edit().putBoolean("$id:priority_dirty", false).commit())
+        }
+    }
     /**
      * One pass over every pending install; false if any must be tried again. A pass over a whole copy takes as long as the
      * copy, so the session's results are also checked every [SUMMARY_EVERY_MS] on the way: that check queues Play's
@@ -540,10 +631,15 @@ internal class MigrationInstallQueue(private val context: Context,
         fun attempt(id: String, name: String) = "$id:$name:${prefs.getBoolean("$id:$name:owner_account", false)}:${prefs.getInt("$id:$name:retry_gen", 0)}"
         fun next() = dispatchOrder().firstOrNull { (id, name) -> attempt(id, name) !in attempted }
         try {
+            for (id in sessions()) {
+                if (cancelled()) return false
+                syncStorePriority(id)
+            }
             var entry = next()
             while (entry != null) {
                 val (id, name) = entry
                 if (cancelled()) return false
+                syncStorePriority(id)
                 unfrozen = id
                 attempted += attempt(id, name)
                 if (!dispatch(name, id)) settled = false
@@ -628,6 +724,7 @@ internal class MigrationInstallQueue(private val context: Context,
             check(prefs.edit().putBoolean("$id:$name:uncertain", true)
                 .putBoolean("$id:$name:owner_retry", false).commit())
             val ownerAccount = prefs.getBoolean("$id:$name:owner_account", false)
+            val priorityRank = priorityOrder(id).indexOf(name)
             return Request(options(id).apply {
                 // The Google account gets whatever version Play offers it; the reply's version_code becomes the floor.
                 putLong("minimum_version_code", if (ownerAccount) 0 else expectedVersion(id, name))
@@ -635,6 +732,10 @@ internal class MigrationInstallQueue(private val context: Context,
                 putBoolean("owner_account_approved", ownerAccount)
                 // summary() queues a download Play refuses the anonymous session once more for the Google account.
                 putBoolean("owner_retry_on_refusal", !ownerAccount)
+                if (priorityRank >= 0) {
+                    putBoolean("priority", true)
+                    putInt("priority_rank", priorityRank)
+                }
             }, ownerRetry, ownerAccount, retryGen = prefs.getInt("$id:$name:retry_gen", 0))
         } else current
         return finished(record(name, id, result, requestedInstall = false, ownerRetry = ownerRetry))
@@ -763,8 +864,10 @@ internal class MigrationInstallQueue(private val context: Context,
         internal const val SUMMARY_EVERY_MS = 60_000L
         /** How often a summary at a transfer boundary asks again about apps that changed while it asked Aurora. */
         private const val FREEZE_ATTEMPTS = 3
-        /** At most this many sign-in apps go first ([prioritize]). */
+        /** At most this many sign-in apps go first per call ([prioritize]). */
         private const val MAX_PRIORITY = 50
+        /** Maximum total ordered priority packages retained for one session. */
+        private const val MAX_PRIORITY_TOTAL = 200
         private val PACKAGE = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
         /** The anonymous session's own limits: Play throttling it, not listing the app in its country, or no session. */
         private val ANONYMOUS_FAILURES = setOf(RATE_LIMITED, "not_found", "anonymous_sign_in_required", "not_signed_in", "session_expired")
