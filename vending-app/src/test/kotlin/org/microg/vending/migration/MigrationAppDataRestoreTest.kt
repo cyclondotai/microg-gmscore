@@ -123,8 +123,10 @@ class MigrationAppDataRestoreTest {
         assertEquals(setOf(app), queue.pendingAppDataRestores(sessionId))
 
         // 30 consecutive busy polls while Switch still owns the lease must NOT exhaust the 20-attempt error cap.
+        var now = 1_000_000L
         repeat(30) {
-            assertFalse(queue.processPendingAppDataRestores())
+            now += 60_000L
+            assertFalse(queue.processPendingAppDataRestores(clock = { now }))
             assertEquals(setOf(app), queue.pendingAppDataRestores(sessionId))
         }
         assertEquals(31, calls.size)
@@ -134,6 +136,31 @@ class MigrationAppDataRestoreTest {
         assertTrue(queue.dispatchRound())
         assertEquals(32, calls.size)
         assertTrue(queue.pendingAppDataRestores(sessionId).isEmpty())
+
+        // Busy retries still stop after the 6-hour wall-clock ceiling so a permanently leaked lease never polls forever.
+        val stuckApp = "com.example.stuck"
+        var stuckInstalled = false
+        val stuckQueue = MigrationInstallQueue(context) { operation, _ ->
+            Bundle().apply {
+                putString("package_name", stuckApp)
+                putString("status", if (operation == 2) "queued" else if (stuckInstalled) "installed" else "downloading")
+                putBoolean("installed", stuckInstalled)
+                putLong("installed_version_code", if (stuckInstalled) 5 else 0)
+                putLong("version_code", 5)
+            }
+        }.apply {
+            appDataRestore = { _, _ -> MigrationAppDataRestore.Result(ok = false, status = "busy") }
+        }
+        val stuckSession = stuckQueue.beginTransfer()
+        stuckQueue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
+        stuckQueue.select(listOf(Bundle().apply { putString("package_name", stuckApp); putLong("version_code", 5) }))
+        stuckQueue.dispatch(stuckApp, stuckSession)
+        stuckInstalled = true
+        stuckQueue.summary(stuckSession, reschedule = false)
+        assertEquals(setOf(stuckApp), stuckQueue.pendingAppDataRestores(stuckSession))
+        val farFuture = System.currentTimeMillis() + 7L * 60L * 60_000L
+        assertTrue(stuckQueue.processPendingAppDataRestores(clock = { farFuture }))
+        assertTrue("busy past 6h ceiling should stop retrying", stuckQueue.pendingAppDataRestores(stuckSession).isEmpty())
 
         // Non-busy errors still respect the bounded attempt budget so broken restores don't retry forever.
         val errApp = "com.example.broken"

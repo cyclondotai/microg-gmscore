@@ -33,6 +33,8 @@ internal object MigrationAppDataRestore {
         context: Context,
         packageName: String,
         sessionId: String? = null,
+        d2dSeenBootCount: Int = -1,
+        d2dSeenElapsedMs: Long = -1L,
         shouldRun: () -> Boolean = { true },
         onResult: ((Result) -> Unit)? = null,
     ) {
@@ -46,7 +48,9 @@ internal object MigrationAppDataRestore {
                 onResult?.invoke(Result(ok = false, status = "stale_session"))
                 return@execute
             }
-            val result = runCatching { restorePackage(appContext, packageName, sessionId) }
+            val result = runCatching {
+                restorePackage(appContext, packageName, sessionId, d2dSeenBootCount, d2dSeenElapsedMs)
+            }
                 .onFailure { Log.w(TAG, "Post-install app-data restore failed for $packageName", it) }
                 .getOrElse { Result(ok = false, status = "error") }
             onResult?.invoke(result)
@@ -70,7 +74,13 @@ internal object MigrationAppDataRestore {
         return null
     }
 
-    internal fun restorePackage(context: Context, packageName: String, sessionId: String? = null): Result {
+    internal fun restorePackage(
+        context: Context,
+        packageName: String,
+        sessionId: String? = null,
+        d2dSeenBootCount: Int = -1,
+        d2dSeenElapsedMs: Long = -1L,
+    ): Result {
         val authorityName = resolveTrustedAuthority(context)
         if (authorityName == null) {
             Log.d(TAG, "RestoreTransportProvider absent or untrusted; skipping app-data restore for $packageName")
@@ -80,6 +90,10 @@ internal object MigrationAppDataRestore {
         return try {
             val extras = Bundle().apply {
                 if (!sessionId.isNullOrEmpty()) putString("sessionId", sessionId)
+                if (d2dSeenElapsedMs >= 0L) {
+                    putInt("d2d_seen_boot_count", d2dSeenBootCount)
+                    putLong("d2d_seen_elapsed_ms", d2dSeenElapsedMs)
+                }
             }
             val reply = context.contentResolver.call(
                 Uri.parse("content://$authorityName"),

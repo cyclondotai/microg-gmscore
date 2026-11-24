@@ -11,6 +11,8 @@ import android.content.Context
 import android.content.Intent
 import android.os.Bundle
 import android.os.DeadObjectException
+import android.os.SystemClock
+import android.provider.Settings
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -273,6 +275,11 @@ internal class MigrationInstallQueue(private val context: Context,
         for (key in listOf("documents_type", "restore_source", "disable_pre_archiving")) {
             if (options.containsKey(key)) edit.putString("$id:option:$key", options.get(key).toString())
         }
+        val source = options.get("restore_source")?.toString()?.toIntOrNull()
+        if (source in ANDROID_D2D_RESTORE_SOURCES && !prefs.contains("$id:d2d_seen_elapsed_ms")) {
+            edit.putInt("$id:d2d_seen_boot_count", currentBootCount(context))
+                .putLong("$id:d2d_seen_elapsed_ms", SystemClock.elapsedRealtime())
+        }
         check(edit.commit())
     }
     fun recordCatalog(documents: List<Bundle>) = synchronized(LOCK) {
@@ -365,12 +372,33 @@ internal class MigrationInstallQueue(private val context: Context,
     fun pendingAppDataRestores(id: String = currentSessionId().orEmpty()): Set<String> =
         prefs.getStringSet("$id:app_data_restore_pending", emptySet()).orEmpty().toSet()
 
-    internal fun recordAppDataRestoreResult(id: String, name: String, result: MigrationAppDataRestore.Result) {
+    internal fun recordAppDataRestoreResult(
+        id: String,
+        name: String,
+        result: MigrationAppDataRestore.Result,
+        nowMs: Long = System.currentTimeMillis(),
+    ) {
         synchronized(LOCK) {
             val current = pendingAppDataRestores(id)
             val staleSession = id != currentSessionId() || !isAndroidD2dTransfer(id)
             if (result.status == "busy" && !staleSession) {
-                // Switch still owns the backup transport lease during the copy: keep pending without burning attempts.
+                // Switch still owns the backup transport lease during the copy: keep pending without burning
+                // error attempts, bounded by elapsed wall-clock time so a stale task never polls forever.
+                val firstBusyKey = "$id:$name:app_data_restore_first_busy_at"
+                val firstBusyAt = prefs.getLong(firstBusyKey, -1L)
+                if (firstBusyAt < 0L) {
+                    check(prefs.edit().putLong(firstBusyKey, nowMs).commit())
+                    return
+                }
+                if (nowMs - firstBusyAt < MAX_APP_DATA_RESTORE_BUSY_MS) {
+                    return
+                }
+                check(
+                    prefs.edit()
+                        .putStringSet("$id:app_data_restore_pending", current - name)
+                        .putBoolean("$id:$name:app_data_restore_done", true)
+                        .commit(),
+                )
                 return
             }
             val terminal = result.status in APP_DATA_RESTORE_TERMINAL
@@ -385,7 +413,10 @@ internal class MigrationInstallQueue(private val context: Context,
     }
 
     /** Retries pending Android-to-Android post-install app-data restores for the current session only. */
-    fun processPendingAppDataRestores(cancelled: () -> Boolean = { false }): Boolean {
+    fun processPendingAppDataRestores(
+        cancelled: () -> Boolean = { false },
+        clock: () -> Long = { System.currentTimeMillis() },
+    ): Boolean {
         val currentId = currentSessionId() ?: return true
         // Drop stale pending restores from older transfers so they never read a newer transfer's staging directory.
         synchronized(LOCK) {
@@ -404,6 +435,8 @@ internal class MigrationInstallQueue(private val context: Context,
             return true
         }
         val names = synchronized(LOCK) { pendingAppDataRestores(currentId).sorted() }
+        val d2dBoot = prefs.getInt("$currentId:d2d_seen_boot_count", -1)
+        val d2dElapsed = prefs.getLong("$currentId:d2d_seen_elapsed_ms", -1L)
         var settled = true
         for (name in names) {
             if (cancelled()) return false
@@ -418,12 +451,12 @@ internal class MigrationInstallQueue(private val context: Context,
                     MigrationAppDataRestore.Result(ok = false, status = "stale_session")
                 } else {
                     appDataRestore?.invoke(name, currentId)
-                        ?: MigrationAppDataRestore.restorePackage(context, name, currentId)
+                        ?: MigrationAppDataRestore.restorePackage(context, name, currentId, d2dBoot, d2dElapsed)
                 }
             } finally {
                 RESTORE_IN_FLIGHT.remove(restoreKey)
             }
-            recordAppDataRestoreResult(currentId, name, result)
+            recordAppDataRestoreResult(currentId, name, result, nowMs = clock())
             if (result.status !in APP_DATA_RESTORE_TERMINAL && name in pendingAppDataRestores(currentId)) {
                 settled = false
             }
@@ -487,15 +520,24 @@ internal class MigrationInstallQueue(private val context: Context,
                 }
                 recordAppDataRestoreResult(id, name, res)
             } else {
+                val d2dBoot = prefs.getInt("$id:d2d_seen_boot_count", -1)
+                val d2dElapsed = prefs.getLong("$id:d2d_seen_elapsed_ms", -1L)
                 MigrationAppDataRestore.triggerAsync(
                     context = context,
                     packageName = name,
                     sessionId = id,
+                    d2dSeenBootCount = d2dBoot,
+                    d2dSeenElapsedMs = d2dElapsed,
                     shouldRun = { currentSessionId() == id && isAndroidD2dTransfer(id) },
                 ) { res ->
                     RESTORE_IN_FLIGHT.remove(restoreKey)
                     recordAppDataRestoreResult(id, name, res)
-                    if (res.status !in APP_DATA_RESTORE_TERMINAL && name in pendingAppDataRestores(id)) {
+                    // Never call schedule() while MigrationInstallJob is already running (JobScheduler stops and
+                    // restarts an active job on re-schedule, burning expedited quota during A2A copies).
+                    if (!MigrationInstallJob.isRunning() &&
+                        res.status !in APP_DATA_RESTORE_TERMINAL &&
+                        name in pendingAppDataRestores(id)
+                    ) {
                         runCatching { schedule() }
                     }
                 }
@@ -1037,6 +1079,9 @@ internal class MigrationInstallQueue(private val context: Context,
         private val IOS_RESTORE_SOURCES = setOf(5, 6)
         private val APP_DATA_RESTORE_TERMINAL = setOf("restored", "no_data", "unsupported", "stale_session")
         private const val MAX_APP_DATA_RESTORE_ATTEMPTS = 20
+        private const val MAX_APP_DATA_RESTORE_BUSY_MS = 6L * 60L * 60_000L
+        private fun currentBootCount(context: Context): Int =
+            runCatching { Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, 0) }.getOrDefault(0)
         /** Per app, how often its records changed in this process: a status asked of Aurora before a change is stale. */
         private val REVISIONS = java.util.concurrent.ConcurrentHashMap<String, Long>()
         private fun key(id: String, name: String) = "$id:$name"
@@ -1074,6 +1119,7 @@ class MigrationInstallJob : JobService() {
     private var stopped = AtomicBoolean(false)
     override fun onStartJob(params: JobParameters): Boolean {
         val cancelled = AtomicBoolean(false).also { stopped = it }
+        activeRuns.incrementAndGet()
         executor.execute {
             val queue = MigrationInstallQueue(this)
             var retry = false
@@ -1104,11 +1150,20 @@ class MigrationInstallJob : JobService() {
                     if (queue.pendingAppDataRestores().isNotEmpty()) retry = true
                     if (retry && !cancelled.get()) Thread.sleep(if (queue.throttled) 30_000 else 2000)
                 } while (retry && !cancelled.get() && System.nanoTime() < deadline)
-            } catch (_: Exception) { retry = true }
+            } catch (_: Exception) {
+                retry = true
+            } finally {
+                activeRuns.decrementAndGet()
+            }
             if (!cancelled.get()) runCatching { jobFinished(params, retry) }
         }
         return true
     }
     override fun onStopJob(params: JobParameters): Boolean { stopped.set(true); return true }
     override fun onDestroy() { stopped.set(true); executor.shutdownNow(); super.onDestroy() }
+
+    companion object {
+        private val activeRuns = java.util.concurrent.atomic.AtomicInteger(0)
+        internal fun isRunning(): Boolean = activeRuns.get() > 0
+    }
 }
