@@ -128,4 +128,173 @@ class MigrationPriorityTest {
         assertTrue(ok)
         assertEquals(listOf(true, false), tried)
     }
+
+    /**
+     * CYC-2643: 30 apps where the first 10 queued are non-sign-in apps (a.app01..a.app10; a.app01 actively downloading,
+     * a.app02..a.app10 queued) and sign-in apps are later alphabetically (z.onepassword, y.authenticator, x.mail).
+     * When priority arrives after 10 apps are already queued, the prioritized apps dispatch next in the exact requested
+     * order (z.onepassword, y.authenticator, x.mail — NOT alphabetical x, y, z) and Aurora receives the priority list.
+     */
+    @Test fun cyc2643ThirtyAppsPriorityAfterTenQueuedDispatchesRequestedOrderImmediatelyNext() {
+        val apps = (1..27).map { "a.example.app%02d".format(it) } + listOf(
+            "x.example.mail",
+            "y.example.authenticator",
+            "z.example.onepassword",
+        )
+        assertEquals(30, apps.size)
+        // Deliberately reverse-alphabetical priority order: password manager -> authenticator -> mail.
+        val requestedOrder = listOf(
+            "z.example.onepassword",
+            "y.example.authenticator",
+            "x.example.mail",
+        )
+        val handed = mutableListOf<String>()
+        val priorityOptions = mutableListOf<Triple<String, Boolean, Int>>()
+        var pendingOptions: Bundle? = null
+        val storePriorities = mutableListOf<List<String>>()
+        lateinit var queue: MigrationInstallQueue
+        queue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, options ->
+                when (operation) {
+                    7 -> Bundle().apply { putBoolean("prioritize_downloads", true) }
+                    8 -> {
+                        storePriorities += options.getStringArrayList("packages").orEmpty()
+                        Bundle().apply { putBoolean("success", true) }
+                    }
+                    else -> Bundle()
+                }
+            },
+            storeCall = { operation, name ->
+                if (operation == 2) {
+                    handed += name
+                    pendingOptions?.let { opts ->
+                        if (opts.getBoolean("priority", false)) {
+                            priorityOptions += Triple(name, true, opts.getInt("priority_rank", -1))
+                        }
+                    }
+                    val status = if (handed.size == 1) "downloading" else "queued"
+                    if (handed.size == 10) {
+                        val reply = queue.prioritize(run, requestedOrder)
+                        assertTrue(reply.getBoolean("accepted"))
+                        assertEquals(3, reply.getInt("prioritized"))
+                    }
+                    state(name, status)
+                } else state(name, "none")
+            },
+        ).apply {
+            sentOptions = { operation, options -> if (operation == 2) pendingOptions = options?.let(::Bundle) }
+        }
+
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(apps.map(::doc))
+        queue.dispatchRound()
+
+        assertEquals(30, handed.size)
+        // Apps 1..10 were queued before priority arrived.
+        assertEquals((1..10).map { "a.example.app%02d".format(it) }, handed.subList(0, 10))
+        // Immediately next (indices 10, 11, 12): the 3 prioritized apps in exact requested priority order!
+        assertEquals(requestedOrder, handed.subList(10, 13))
+        // Remaining 17 non-priority apps follow after.
+        assertEquals((11..27).map { "a.example.app%02d".format(it) }, handed.subList(13, 30))
+        // Each prioritized install request carried its priority flag and rank, and Aurora received the ordered list.
+        assertEquals(
+            listOf(
+                Triple("z.example.onepassword", true, 0),
+                Triple("y.example.authenticator", true, 1),
+                Triple("x.example.mail", true, 2),
+            ),
+            priorityOptions,
+        )
+        assertEquals(listOf(requestedOrder), storePriorities)
+    }
+
+    /** CYC-2643: an actively downloading app is not counted as re-queued, while an already-queued app is prioritized. */
+    @Test fun activeDownloadingAppIsNotDisturbedWhileAlreadyQueuedAppIsPrioritized() {
+        val storePriorities = mutableListOf<List<String>>()
+        val queue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, options ->
+                when (operation) {
+                    7 -> Bundle().apply { putBoolean("prioritize_downloads", true) }
+                    8 -> {
+                        storePriorities += options.getStringArrayList("packages").orEmpty()
+                        Bundle().apply { putBoolean("success", true) }
+                    }
+                    else -> Bundle()
+                }
+            },
+            storeCall = { _, name -> state(name, "queued") },
+        )
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf("a.active.app", "b.queued.app", "c.pending.app").map(::doc))
+        val id = queue.currentSessionId()!!
+        // a.active.app is actively downloading; b.queued.app is queued in Aurora; c.pending.app is still pending.
+        queue.save("a.active.app", state("a.active.app", "downloading"), dispatched = true, id = id)
+        queue.save("b.queued.app", state("b.queued.app", "queued"), dispatched = true, id = id)
+
+        val reply = queue.prioritize(run, listOf("b.queued.app", "c.pending.app", "a.active.app"))
+        assertTrue(reply.getBoolean("accepted"))
+        // b.queued.app (queued, not active) + c.pending.app (pending) count; a.active.app (downloading) does not.
+        assertEquals(2, reply.getInt("prioritized"))
+
+        queue.dispatchRound()
+        assertEquals(listOf(listOf("b.queued.app", "c.pending.app", "a.active.app")), storePriorities)
+    }
+
+    /** CYC-2643: when Aurora does not advertise prioritize_downloads (op 8), prioritize counts only pending apps. */
+    @Test fun prioritizeCountsOnlyPendingAppsWhenStoreLacksBinderPrioritizeOp() {
+        val queue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, _ ->
+                if (operation == 7) Bundle().apply { putBoolean("prioritize_downloads", false) } else Bundle()
+            },
+            storeCall = { _, name -> state(name, "queued") },
+        )
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf("b.queued.app", "c.pending.app").map(::doc))
+        val id = queue.currentSessionId()!!
+        queue.save("b.queued.app", state("b.queued.app", "queued"), dispatched = true, id = id)
+
+        val reply = queue.prioritize(run, listOf("b.queued.app", "c.pending.app"))
+        assertTrue(reply.getBoolean("accepted"))
+        assertFalse(reply.getBoolean("store_prioritize_supported"))
+        assertEquals(1, reply.getInt("prioritized"))
+    }
+
+    /** CYC-2643: failed op 8 reorder (success=false) leaves priority_dirty set so the next round retries it. */
+    @Test fun failedStorePriorityReorderStaysDirtyAndRetriesOnNextRound() {
+        var allowSuccess = false
+        var attempts = 0
+        val queue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, _ ->
+                when (operation) {
+                    7 -> Bundle().apply { putBoolean("prioritize_downloads", true) }
+                    8 -> {
+                        attempts++
+                        Bundle().apply {
+                            putBoolean("success", allowSuccess)
+                            if (!allowSuccess) putString("error", "busy")
+                        }
+                    }
+                    else -> Bundle()
+                }
+            },
+            storeCall = { _, name -> state(name, "queued") },
+        )
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf("b.queued.app", "c.pending.app").map(::doc))
+        queue.prioritize(run, listOf("c.pending.app", "b.queued.app"))
+
+        queue.dispatchRound()
+        assertTrue("first round should attempt op 8 and fail", attempts >= 1)
+        val afterFirst = attempts
+        allowSuccess = true
+        queue.dispatchRound()
+        assertEquals("second round must retry op 8 once and succeed", afterFirst + 1, attempts)
+        val afterSecond = attempts
+        queue.dispatchRound()
+        assertEquals("once op 8 returns success=true, priority_dirty clears and stops retrying", afterSecond, attempts)
+    }
 }

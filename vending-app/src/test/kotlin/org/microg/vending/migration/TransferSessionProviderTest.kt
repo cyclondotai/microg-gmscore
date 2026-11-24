@@ -196,6 +196,75 @@ class TransferSessionProviderTest {
         assertEquals(listOf("installed"), queue.handoff(run).getStringArrayList("statuses"))
     }
 
+    /**
+     * CYC-2664: a 3-app session where 1 app is rejected at Aurora lookup (unavailable / not_found) must include
+     * all 3 apps in the handoff receipt along with each failed app's status and reason.
+     */
+    @Test fun cyc2664HandoffReceiptIncludesLookupRejectedAppsAndFailureReasons() {
+        val run = "00000000-0000-0000-0000-000000000001"
+        val coreUid = companionUid + 1
+        install("ai.cyclon.core", coreUid, ApplicationInfo.FLAG_SYSTEM, platform)
+        assertTrue(provider.call("beginHandoff", run, null).getBoolean("accepted"))
+
+        val app1 = "org.example.first"
+        val app2 = "org.example.second"
+        val rejected = "org.example.missing"
+        val queue = MigrationInstallQueue(context) { _, name ->
+            Bundle().apply { putString("package_name", name); putString("status", "none") }
+        }
+        val id = queue.catalogSession()
+        queue.recordCatalog(listOf(
+            Bundle().apply { putString("package_name", app1); putString("title", "First App"); putInt("availability", 1); putLong("version_code", 10) },
+            Bundle().apply { putString("package_name", app2); putString("title", "Second App"); putInt("availability", 1); putLong("version_code", 20) },
+            MigrationInstallQueue.unavailable(rejected, "not_found"),
+        ))
+
+        // Before the owner selects or closes selection, catalog-only lookups do not prematurely populate the receipt.
+        ShadowBinder.setCallingUid(coreUid)
+        val beforeSelect = provider.call("getHandoff", run, null)
+        assertTrue(beforeSelect.getStringArrayList("packages")!!.isEmpty())
+
+        // Switch sends only the 2 available apps to setupDocuments/select; the 3rd was rejected at lookup.
+        queue.select(listOf(
+            Bundle().apply { putString("package_name", app1); putString("title", "First App"); putLong("version_code", 10) },
+            Bundle().apply { putString("package_name", app2); putString("title", "Second App"); putLong("version_code", 20) },
+        ))
+        // Simulate app2 failing install with app_not_purchased while app1 stays pending.
+        queue.save(app2, Bundle().apply {
+            putString("package_name", app2)
+            putString("status", "failed")
+            putString("error", "failed")
+            putString("errorCode", "app_not_purchased")
+            putBoolean("terminal", true)
+        }, dispatched = true, id = id)
+
+        val receipt = provider.call("getHandoff", run, null)
+        assertEquals(3, receipt.getInt("total"))
+        assertEquals(listOf(app1, rejected, app2), receipt.getStringArrayList("packages"))
+        assertEquals(listOf("pending", "unavailable", "failed"), receipt.getStringArrayList("statuses"))
+        assertEquals(listOf("", "not_found", "app_not_purchased"), receipt.getStringArrayList("errors"))
+    }
+
+    /** CYC-2664: when every app in a session is rejected at lookup, closing selection still reports them with reasons. */
+    @Test fun cyc2664AllLookupRejectedAppsAppearOnceSelectionCloses() {
+        val run = "00000000-0000-0000-0000-000000000001"
+        val queue = MigrationInstallQueue(context) { _, name ->
+            Bundle().apply { putString("package_name", name); putString("status", "none") }
+        }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false).getBoolean("accepted"))
+        queue.catalogSession()
+        queue.recordCatalog(listOf(
+            MigrationInstallQueue.unavailable("org.example.notfound", "not_found"),
+            MigrationInstallQueue.unavailable("org.example.unsupported", "app_not_supported"),
+        ))
+        val closed = queue.endHandoff(run, "success")
+        assertTrue(closed.getBoolean("accepted"))
+        assertEquals(2, closed.getInt("total"))
+        assertEquals(listOf("org.example.notfound", "org.example.unsupported"), closed.getStringArrayList("packages"))
+        assertEquals(listOf("unavailable", "unavailable"), closed.getStringArrayList("statuses"))
+        assertEquals(listOf("not_found", "app_not_supported"), closed.getStringArrayList("errors"))
+    }
+
     @Test fun wizardSuccessAndCancelCloseSelectionWithoutClaimingAnInstallSucceeded() {
         for (outcome in listOf("success", "cancelled")) {
             val (queue, id) = selected()

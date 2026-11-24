@@ -101,4 +101,94 @@ class MigrationBackupTransportTest {
         }
         assertArrayEquals(data, File(folder, app.packageName).readBytes())
     }
+
+    @Test fun singlePackageThirdPartyRestoreWorksAfterInitialTelephonySystemRestore() {
+        val context = RuntimeEnvironment.getApplication()
+        val folder = File(context.noBackupFilesDir, "migration-staging").apply { mkdirs() }
+        val telephonyArchive = ByteArray(16_384) { (it % 199).toByte() }
+        val fullAppArchive = ByteArray(40_005) { ((it * 7) % 251).toByte() }
+        val kvAppArchive = byteArrayOf(10, 20, 30, 40, 50)
+        File(folder, "restore_token_file").writeText("1")
+        File(folder, "@pm@").writeBytes(byteArrayOf(1, 2, 3, 4))
+        File(folder, "com.android.providers.telephony").writeBytes(telephonyArchive)
+        File(folder, "com.example.fullapp").writeBytes(fullAppArchive)
+        File(folder, "com.example.kvapp").writeBytes(kvAppArchive)
+
+        val pm = PackageInfo().apply { packageName = "@pm@" }
+        val telephony = PackageInfo().apply {
+            packageName = "com.android.providers.telephony"
+            applicationInfo = ApplicationInfo().apply {
+                backupAgentName = "com.android.providers.telephony.TelephonyBackupAgent"
+                flags = ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_FULL_BACKUP_ONLY
+            }
+        }
+        val fullApp = PackageInfo().apply {
+            packageName = "com.example.fullapp"
+            applicationInfo = ApplicationInfo().apply { backupAgentName = null }
+        }
+        val kvApp = PackageInfo().apply {
+            packageName = "com.example.kvapp"
+            applicationInfo = ApplicationInfo().apply {
+                backupAgentName = "com.example.kvapp.KvAgent"
+                flags = 0
+            }
+        }
+
+        // Phase 1: Initial SystemRestoreService restores telephony before third-party apps are installed.
+        MigrationBackupTransport(context).use { transport ->
+            assertEquals(0, transport.startRestore(1L, arrayOf(pm, telephony)))
+            assertEquals("@pm@", transport.nextRestorePackage().packageName)
+            val out1 = File(context.cacheDir, "sys-restore-out")
+            ParcelFileDescriptor.open(out1, ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_READ_WRITE).use { fd ->
+                assertEquals(0, transport.getRestoreData(fd))
+                assertEquals(telephony.packageName, transport.nextRestorePackage().packageName)
+                var total = 0
+                while (true) {
+                    val count = transport.getNextFullRestoreDataChunk(fd)
+                    if (count == -1) break
+                    total += count
+                }
+                assertEquals(telephonyArchive.size, total)
+            }
+            assertEquals("no more packages after telephony", "NO_MORE_PACKAGES", transport.nextRestorePackage().packageName)
+            transport.finishRestore()
+        }
+
+        // Phase 2: Later, a fresh transport instance restores each newly installed third-party app one at a time.
+        MigrationBackupTransport(context).use { transport ->
+            assertEquals(1L, transport.availableRestoreSets.single().token)
+            assertEquals(0, transport.startRestore(1L, arrayOf(fullApp)))
+            val desc = transport.nextRestorePackage()
+            assertEquals(fullApp.packageName, desc.packageName)
+            assertEquals(2, desc.dataType) // TYPE_FULL_STREAM
+            val out2 = File(context.cacheDir, "full-single-out")
+            ParcelFileDescriptor.open(out2, ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_READ_WRITE).use { fd ->
+                var total = 0
+                while (true) {
+                    val count = transport.getNextFullRestoreDataChunk(fd)
+                    if (count == -1) break
+                    total += count
+                }
+                assertEquals(fullAppArchive.size, total)
+            }
+            assertEquals("NO_MORE_PACKAGES", transport.nextRestorePackage().packageName)
+            transport.finishRestore()
+
+            // Key-value third-party app restored in a subsequent single-package session.
+            assertEquals(0, transport.startRestore(1L, arrayOf(kvApp)))
+            val kvDesc = transport.nextRestorePackage()
+            assertEquals(kvApp.packageName, kvDesc.packageName)
+            assertEquals(1, kvDesc.dataType) // TYPE_KEY_VALUE
+            val out3 = File(context.cacheDir, "kv-single-out")
+            ParcelFileDescriptor.open(out3, ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_READ_WRITE).use { fd ->
+                assertEquals(0, transport.getRestoreData(fd))
+            }
+            assertEquals("NO_MORE_PACKAGES", transport.nextRestorePackage().packageName)
+            transport.finishRestore()
+        }
+
+        // Staged archives remain intact across all single-package restores.
+        assertArrayEquals(fullAppArchive, File(folder, fullApp.packageName).readBytes())
+        assertArrayEquals(kvAppArchive, File(folder, kvApp.packageName).readBytes())
+    }
 }

@@ -17,6 +17,7 @@ import java.io.File
  * allowBackup/data-extraction rules, versions and restore-agent results.
  * This is not a Google cloud backup transport and never accepts backup writes. */
 internal class MigrationBackupTransport(context: Context) : BackupTransport(), Closeable {
+    private val appContext = context.applicationContext ?: context
     private val restore = StagedRestoreSet(File(context.noBackupFilesDir, "migration-staging"))
     override fun name() = "com.google.android.gms/.backup.BackupTransportService"
     override fun transportDirName() = "cyclonMigrationRestore"
@@ -26,9 +27,16 @@ internal class MigrationBackupTransport(context: Context) : BackupTransport(), C
     override fun dataManagementIntentLabel(): CharSequence? = null
     override fun getTransportFlags() = 2 // FLAG_DEVICE_TO_DEVICE_TRANSFER, not cloud/encrypted backup.
     override fun getCurrentRestoreSet() = restore.token() ?: 0L
-    override fun getAvailableRestoreSets(): Array<RestoreSet> = restore.token()?.let {
-        arrayOf(RestoreSet("Phone transfer", "D2D", it, 2))
-    } ?: emptyArray()
+    override fun getAvailableRestoreSets(): Array<RestoreSet> {
+        val published = org.microg.gms.migration.MigrationRestoreTransport(appContext).ensureBatchNotified()
+        val setName = if (published) SET_NAME else PENDING_PUBLICATION_SET_NAME
+        // Always keep device == "D2D" so Android 16 ActiveRestoreSession selects BackupDestination.DEVICE_TRANSFER
+        // eligibility rules (not CLOUD) for Switch's system restore (tx 6); post-install single-package restore
+        // treats PENDING_PUBLICATION_SET_NAME as retryable until batchStarted publication settles.
+        return restore.token()?.let {
+            arrayOf(RestoreSet(setName, "D2D", it, 2))
+        } ?: emptyArray()
+    }
     @Synchronized override fun startRestore(token: Long, packages: Array<PackageInfo>): Int = runCatching {
         val requested = packages.map { pkg ->
             val app = pkg.applicationInfo
@@ -76,5 +84,11 @@ internal class MigrationBackupTransport(context: Context) : BackupTransport(), C
     override fun finishBackup() = ERROR
     override fun sendBackupData(bytes: Int) = ERROR
     override fun close() = restore.close()
-    companion object { private const val CHUNK = 32 * 1024; private const val OK = 0; private const val ERROR = -1000 }
+    companion object {
+        private const val CHUNK = 32 * 1024
+        private const val OK = 0
+        private const val ERROR = -1000
+        internal const val SET_NAME = "Phone transfer"
+        internal const val PENDING_PUBLICATION_SET_NAME = "Phone transfer (pending)"
+    }
 }

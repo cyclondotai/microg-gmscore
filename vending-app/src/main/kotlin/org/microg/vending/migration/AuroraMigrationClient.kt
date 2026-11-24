@@ -65,6 +65,7 @@ internal class AuroraMigrationWire(private val binder: IBinder) {
         val feature = when (operation) {
             4, 5 -> "automatic_update_hold"
             6 -> "anonymous_prepare"
+            8 -> "prioritize_downloads"
             else -> error("Unknown Aurora migration control")
         }
         if (!capabilities.getBoolean(feature)) return Bundle().apply {
