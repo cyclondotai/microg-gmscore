@@ -106,6 +106,39 @@ class MigrationAppDataRestoreTest {
         assertEquals(2, provider.calls.count { it.method == "transferStarting" })
     }
 
+    @Test fun droppedTransferStartingBlocksRestoreAndRecordOptionsNeverEmitsLateMarker() {
+        val provider = FakeRestoreTransportProvider(
+            response = Bundle().apply { putBoolean("ok", true); putString("status", "restored") },
+            transferStartingResponse = null,
+        )
+        installRestoreProvider(provider)
+
+        var installed = false
+        val queue = MigrationInstallQueue(context) { operation, _ ->
+            if (operation == 2) state("queued")
+            else if (installed) state("installed", installed = true, version = 12)
+            else state("downloading")
+        }
+        // Direct copy whose transferStarting reply is dropped (null) must NOT restore against a prior batch.
+        val unacked = queue.catalogSession()
+        assertEquals(listOf("transferStarting"), provider.calls.map { it.method })
+        queue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
+        queue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
+        queue.dispatch(app, unacked)
+        installed = true
+        queue.summary(unacked, reschedule = false)
+        assertTrue(queue.processPendingAppDataRestores())
+        assertTrue("dropped transferStarting must never call restorePackage", provider.calls.none { it.method == "restorePackage" })
+
+        // Calling recordOptions directly without a prior session (e.g. after batchStarted) never emits a late
+        // transferStarting marker that could poison the companion's unpromoted ceiling.
+        clear()
+        provider.calls.clear()
+        installed = false
+        queue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
+        assertTrue("recordOptions must never emit transferStarting", provider.calls.isEmpty())
+    }
+
     @Test fun busyRestoreWhileSwitchHoldsLeaseDoesNotExhaustAttemptsAndRetriesUntilRestored() {
         var replyStatus = "busy"
         val calls = mutableListOf<Pair<String, String>>()
@@ -324,6 +357,7 @@ class MigrationAppDataRestoreTest {
     private class FakeRestoreTransportProvider(
         private val response: Bundle? = Bundle().apply { putBoolean("ok", true); putString("status", "restored") },
         private val failure: RuntimeException? = null,
+        private val transferStartingResponse: Bundle? = Bundle().apply { putBoolean("success", true) },
     ) : ContentProvider() {
         val calls = CopyOnWriteArrayList<Call>()
         val called = CountDownLatch(1)
@@ -336,6 +370,10 @@ class MigrationAppDataRestoreTest {
                 d2dSeenElapsedMs = extras?.getLong("d2d_seen_elapsed_ms", -1L) ?: -1L,
                 threadName = Thread.currentThread().name,
             )
+            if (method == MigrationAppDataRestore.METHOD_TRANSFER_STARTING) {
+                failure?.let { throw it }
+                return transferStartingResponse?.let(::Bundle)
+            }
             if (method == MigrationAppDataRestore.METHOD_RESTORE_PACKAGE) called.countDown()
             failure?.let { throw it }
             return response?.let(::Bundle)

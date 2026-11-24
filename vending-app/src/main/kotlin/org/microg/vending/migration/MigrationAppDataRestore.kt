@@ -61,22 +61,25 @@ internal object MigrationAppDataRestore {
     internal fun hasTrustedProvider(context: Context): Boolean = resolveTrustedAuthority(context) != null
 
     /**
-     * Records a new Switch transfer boundary with Transfer Phone before `op 12` (`recordOptions`)
-     * stamps `d2d_seen_elapsed_ms`, covering direct in-Switch retries that bypass `MigrationActivity`.
-     * Best-effort: if unavailable or on an older companion, Transfer Phone fails closed on `batchStarted`.
+     * Records a new Switch transfer boundary with Transfer Phone before Copy (`op 12` / `tx 3`),
+     * covering direct in-Switch retries that bypass `MigrationActivity`. Returns `true` only when
+     * Transfer Phone explicitly acknowledges (`success == true`); callers block app-data restore
+     * on unacknowledged direct sessions so a dropped marker + no-write disconnect can never read
+     * a previous transfer's staging directory.
      */
-    internal fun notifyTransferStarting(context: Context) {
-        val authorityName = resolveTrustedAuthority(context) ?: return
+    internal fun notifyTransferStarting(context: Context): Boolean {
+        val authorityName = resolveTrustedAuthority(context) ?: return false
         val identity = Binder.clearCallingIdentity()
-        try {
-            runCatching {
+        return try {
+            val reply = runCatching {
                 context.contentResolver.call(
                     Uri.parse("content://$authorityName"),
                     METHOD_TRANSFER_STARTING,
                     null,
                     null,
                 )
-            }
+            }.getOrNull()
+            reply?.getBoolean("success", false) == true
         } finally {
             Binder.restoreCallingIdentity(identity)
         }
