@@ -77,16 +77,18 @@ class MigrationAppDataRestoreTest {
         }
         val sessionId = queue.beginTransfer()
         queue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
+        assertEquals(listOf("registerSession" to sessionId), provider.calls.map { it.method to it.arg })
         queue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
         queue.dispatch(app, sessionId)
-        assertTrue("must not trigger while still downloading", provider.calls.isEmpty())
+        assertTrue("must not trigger restorePackage while still downloading", provider.calls.none { it.method == "restorePackage" })
 
         installed = true
         val summary = queue.summary(sessionId, reschedule = false)
         assertTrue(summary.getBoolean("all_installed"))
         assertTrue("expected async restorePackage call", provider.called.await(5, TimeUnit.SECONDS))
-        assertEquals(1, provider.calls.size)
-        val call = provider.calls.single()
+        val restoreCalls = provider.calls.filter { it.method == "restorePackage" }
+        assertEquals(1, restoreCalls.size)
+        val call = restoreCalls.single()
         assertEquals("restorePackage", call.method)
         assertEquals(app, call.arg)
         assertEquals(sessionId, call.sessionId)
@@ -95,7 +97,7 @@ class MigrationAppDataRestoreTest {
         // Repeated summary polls do not re-trigger restorePackage for the same installed app.
         queue.summary(sessionId, reschedule = false)
         queue.summary(sessionId, reschedule = false)
-        assertEquals(1, provider.calls.size)
+        assertEquals(1, provider.calls.count { it.method == "restorePackage" })
     }
 
     @Test fun busyRestoreWhileSwitchHoldsLeaseDoesNotExhaustAttemptsAndRetriesUntilRestored() {
@@ -316,7 +318,7 @@ class MigrationAppDataRestoreTest {
 
         override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
             calls += Call(method, arg, extras?.getString("sessionId"), Thread.currentThread().name)
-            called.countDown()
+            if (method == MigrationAppDataRestore.METHOD_RESTORE_PACKAGE) called.countDown()
             failure?.let { throw it }
             return response?.let(::Bundle)
         }

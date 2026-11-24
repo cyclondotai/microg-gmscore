@@ -22,6 +22,7 @@ internal object MigrationAppDataRestore {
     private const val LEGACY_AUTHORITY_NAME = "ai.cyclon.migration.restore"
     private const val COMPANION_PACKAGE = "ai.cyclon.migration"
     const val METHOD_RESTORE_PACKAGE = "restorePackage"
+    const val METHOD_REGISTER_SESSION = "registerSession"
 
     data class Result(val ok: Boolean, val status: String)
 
@@ -58,6 +59,26 @@ internal object MigrationAppDataRestore {
     }
 
     internal fun hasTrustedProvider(context: Context): Boolean = resolveTrustedAuthority(context) != null
+
+    /** Explicitly binds a new Android D2D FakeStore session to Transfer Phone's staging batch lifecycle. */
+    internal fun registerSession(context: Context, sessionId: String): Boolean {
+        val authorityName = resolveTrustedAuthority(context) ?: return false
+        val identity = Binder.clearCallingIdentity()
+        return try {
+            val reply = context.contentResolver.call(
+                Uri.parse("content://$authorityName"),
+                METHOD_REGISTER_SESSION,
+                sessionId,
+                null,
+            )
+            reply?.getBoolean("ok", false) == true
+        } catch (t: Throwable) {
+            Log.d(TAG, "registerSession unavailable for $sessionId: ${t.javaClass.simpleName}")
+            false
+        } finally {
+            Binder.restoreCallingIdentity(identity)
+        }
+    }
 
     internal fun resolveTrustedAuthority(context: Context): String? {
         for (authority in listOf(PACKAGE_AUTHORITY_NAME, LEGACY_AUTHORITY_NAME)) {

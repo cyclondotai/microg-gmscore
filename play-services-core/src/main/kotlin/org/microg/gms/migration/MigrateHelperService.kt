@@ -29,6 +29,8 @@ private const val VOID_CALLBACK = "com.google.android.gms.backup.migrate.helper.
 
 /** Signature-bound Switch staging and iOS metadata; actual system restore is a separate gate. */
 class MigrateHelperService : Service() {
+    @Volatile private var activeHelper: EmptyMigrateHelper? = null
+
     override fun onBind(intent: Intent): IBinder = object : MigrationBinder(BROKER, null) {
         override fun dispatch(code: Int, data: Parcel, reply: Parcel?): Boolean {
             requireSwitchCaller()
@@ -37,7 +39,9 @@ class MigrateHelperService : Service() {
             require(data.createByteArray()?.contentEquals(byteArrayOf(8, 1)) == true) { "Unsupported migrate-helper version" }
             val callback = requireNotNull(data.readStrongBinder())
             data.requireEnd()
+            activeHelper?.endStaging()
             val helper = EmptyMigrateHelper(Binder.getCallingUid(), this@MigrateHelperService)
+            activeHelper = helper
             sendCallback(callback, BROKER_CALLBACK, 1) {
                 writeInt(1) // nullable Parcelable containing a protobuf byte array
                 writeByteArray(byteArrayOf(8, 1)) // field 1: broker protocol version 1
@@ -47,6 +51,12 @@ class MigrateHelperService : Service() {
             Log.d("GmsSwitchSupport", "Migrate-helper v1 connected; private local staging")
             return true
         }
+    }
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        activeHelper?.endStaging()
+        activeHelper = null
+        return false
     }
 
     private fun requireSwitchCaller() {
@@ -59,6 +69,7 @@ class MigrateHelperService : Service() {
 internal class EmptyMigrateHelper(uid: Int, private val context: Context? = null) : MigrationBinder(HELPER, uid) {
     private val store by lazy { context?.let { MigrationArtifactStore(it) } }
     @Volatile private var stagingStarted = false
+    @Volatile private var stagingEnded = false
     private data class Write(val file: ParcelFileDescriptor, val completed: CompletableFuture<Unit>, val id: String = java.util.UUID.randomUUID().toString())
     private val writes = mutableMapOf<String, Write>()
     @Synchronized private fun startWrite(name: String, file: ParcelFileDescriptor) {
@@ -92,6 +103,12 @@ internal class EmptyMigrateHelper(uid: Int, private val context: Context? = null
             context?.let { MigrationRestoreTransport(it).notifyBatchStarted() }
         }
     }
+    @Synchronized internal fun endStaging() {
+        if (stagingStarted && !stagingEnded) {
+            stagingEnded = true
+            context?.let { MigrationRestoreTransport(it).notifyBatchEnded() }
+        }
+    }
     private val io get() = MigrationHelperIo.executor
     private fun complete(callback: IBinder, action: () -> Unit) {
         io.execute {
@@ -119,9 +136,13 @@ internal class EmptyMigrateHelper(uid: Int, private val context: Context? = null
                 io.execute {
                     runCatching {
                         MigrationSystemRestore(requireNotNull(context)).start { success ->
+                            endStaging()
                             runCatching { sendCallback(callback, VOID_CALLBACK, if (success) 1 else 2) }
                         }
-                    }.onFailure { runCatching { sendCallback(callback, VOID_CALLBACK, 2) } }
+                    }.onFailure {
+                        endStaging()
+                        runCatching { sendCallback(callback, VOID_CALLBACK, 2) }
+                    }
                 }
             }
             7 -> {

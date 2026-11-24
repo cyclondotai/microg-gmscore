@@ -114,11 +114,18 @@ class MigrationRestoreTransportTest {
         }
 
         val batch1 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
+        batch1.endStaging() // no-op before staging starts
         startWrite(batch1, "com.example.one")
         startWrite(batch1, "com.example.two")
+        batch1.endStaging()
+        batch1.endStaging() // idempotent once ended
         val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
         startWrite(batch2, "com.example.one")
-        assertEquals(listOf("batchStarted" to null, "batchStarted" to null), trusted.calls)
+        batch2.endStaging()
+        assertEquals(
+            listOf("batchStarted" to null, "batchEnded" to null, "batchStarted" to null, "batchEnded" to null),
+            trusted.calls,
+        )
 
         // Older companion throwing on unknown method never fails staging.
         trusted.failure = IllegalArgumentException("unknown")
