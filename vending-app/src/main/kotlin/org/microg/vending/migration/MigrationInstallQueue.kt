@@ -897,6 +897,7 @@ internal class MigrationInstallQueue(private val context: Context,
         if (capabilities.getBoolean("prioritize_downloads")) {
             val reply = control(8, options(id).apply { putStringArrayList("packages", ArrayList(ordered)) })
             if (reply.getString("error") == "store_unavailable") return
+            if (!reply.getBoolean("success", false) && reply.getString("error") != "unsupported_operation") return
         }
         synchronized(LOCK) {
             if (priorityOrder(id) == ordered) check(prefs.edit().putBoolean("$id:priority_dirty", false).commit())
@@ -1028,6 +1029,10 @@ internal class MigrationInstallQueue(private val context: Context,
                 !prefs.getBoolean("$id:$name:observed_not_installed", false)
             ) {
                 edit.putBoolean("$id:$name:preexisting", true)
+            } else if (!current.getBoolean("installed") && !current.getBoolean("package_present")) {
+                // Persist confirmed absence before sending the install IPC so a lost reply (store_unavailable)
+                // cannot make a newly installed app look preexisting when it finishes installing later.
+                edit.putBoolean("$id:$name:observed_not_installed", true)
             }
             check(edit.commit())
             val ownerAccount = prefs.getBoolean("$id:$name:owner_account", false)

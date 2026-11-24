@@ -453,6 +453,34 @@ class MigrationAppDataRestoreTest {
         assertTrue(queue.pendingAppDataRestores(sessionId).isEmpty())
     }
 
+    @Test fun lostInstallReplyAfterConfirmedAbsenceStillRestoresAppData() {
+        var installed = false
+        val restored = mutableListOf<String>()
+        val queue = MigrationInstallQueue(context) { operation, _ ->
+            when {
+                operation == 3 && !installed -> state("none", installed = false, version = 0)
+                operation == 2 -> MigrationInstallQueue.unavailable(app, "store_unavailable")
+                else -> state("installed", installed = true, version = 12)
+            }
+        }.apply {
+            appDataRestore = { pkg, _ ->
+                restored += pkg
+                MigrationAppDataRestore.Result(ok = true, status = "restored")
+            }
+        }
+        val sessionId = queue.beginTransfer()
+        queue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
+        queue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
+
+        // Pre-install status confirms app is absent; install RPC reply is lost (store_unavailable),
+        // yet Aurora actually queued & installed the app.
+        assertFalse(queue.dispatch(app, sessionId))
+        installed = true
+        queue.summary(sessionId, reschedule = false)
+
+        assertEquals("lost install reply after confirmed absence must still trigger app-data restore", listOf(app), restored)
+    }
+
     private data class Call(
         val method: String,
         val arg: String?,

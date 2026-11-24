@@ -261,4 +261,40 @@ class MigrationPriorityTest {
         assertFalse(reply.getBoolean("store_prioritize_supported"))
         assertEquals(1, reply.getInt("prioritized"))
     }
+
+    /** CYC-2643: failed op 8 reorder (success=false) leaves priority_dirty set so the next round retries it. */
+    @Test fun failedStorePriorityReorderStaysDirtyAndRetriesOnNextRound() {
+        var allowSuccess = false
+        var attempts = 0
+        val queue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, _ ->
+                when (operation) {
+                    7 -> Bundle().apply { putBoolean("prioritize_downloads", true) }
+                    8 -> {
+                        attempts++
+                        Bundle().apply {
+                            putBoolean("success", allowSuccess)
+                            if (!allowSuccess) putString("error", "busy")
+                        }
+                    }
+                    else -> Bundle()
+                }
+            },
+            storeCall = { _, name -> state(name, "queued") },
+        )
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf("b.queued.app", "c.pending.app").map(::doc))
+        queue.prioritize(run, listOf("c.pending.app", "b.queued.app"))
+
+        queue.dispatchRound()
+        assertTrue("first round should attempt op 8 and fail", attempts >= 1)
+        val afterFirst = attempts
+        allowSuccess = true
+        queue.dispatchRound()
+        assertEquals("second round must retry op 8 once and succeed", afterFirst + 1, attempts)
+        val afterSecond = attempts
+        queue.dispatchRound()
+        assertEquals("once op 8 returns success=true, priority_dirty clears and stops retrying", afterSecond, attempts)
+    }
 }
