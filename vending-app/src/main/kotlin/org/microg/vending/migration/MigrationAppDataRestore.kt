@@ -18,9 +18,9 @@ import java.util.concurrent.Executors
  */
 internal object MigrationAppDataRestore {
     private const val TAG = "MigrationAppDataRestore"
-    private const val AUTHORITY_NAME = "ai.cyclon.migration.restore"
+    private const val PACKAGE_AUTHORITY_NAME = "ai.cyclon.migration.restore.package"
+    private const val LEGACY_AUTHORITY_NAME = "ai.cyclon.migration.restore"
     private const val COMPANION_PACKAGE = "ai.cyclon.migration"
-    private val AUTHORITY: Uri = Uri.parse("content://$AUTHORITY_NAME")
     const val METHOD_RESTORE_PACKAGE = "restorePackage"
 
     data class Result(val ok: Boolean, val status: String)
@@ -31,24 +31,33 @@ internal object MigrationAppDataRestore {
 
     fun triggerAsync(context: Context, packageName: String, sessionId: String? = null) {
         val appContext = context.applicationContext ?: context
-        if (!hasTrustedProvider(appContext)) return
+        if (resolveTrustedAuthority(appContext) == null) return
         executor.execute {
             runCatching { restorePackage(appContext, packageName, sessionId) }
                 .onFailure { Log.w(TAG, "Post-install app-data restore failed for $packageName", it) }
         }
     }
 
-    internal fun hasTrustedProvider(context: Context): Boolean {
-        val provider = runCatching {
-            context.packageManager.resolveContentProvider(AUTHORITY_NAME, 0)
-        }.getOrNull() ?: return false
-        val flags = provider.applicationInfo?.flags ?: 0
-        return provider.packageName == COMPANION_PACKAGE &&
-            (flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0
+    internal fun hasTrustedProvider(context: Context): Boolean = resolveTrustedAuthority(context) != null
+
+    internal fun resolveTrustedAuthority(context: Context): String? {
+        for (authority in listOf(PACKAGE_AUTHORITY_NAME, LEGACY_AUTHORITY_NAME)) {
+            val provider = runCatching {
+                context.packageManager.resolveContentProvider(authority, 0)
+            }.getOrNull() ?: continue
+            val flags = provider.applicationInfo?.flags ?: 0
+            if (provider.packageName == COMPANION_PACKAGE &&
+                (flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP)) != 0
+            ) {
+                return authority
+            }
+        }
+        return null
     }
 
     internal fun restorePackage(context: Context, packageName: String, sessionId: String? = null): Result {
-        if (!hasTrustedProvider(context)) {
+        val authorityName = resolveTrustedAuthority(context)
+        if (authorityName == null) {
             Log.d(TAG, "RestoreTransportProvider absent or untrusted; skipping app-data restore for $packageName")
             return Result(ok = false, status = "unsupported")
         }
@@ -57,7 +66,12 @@ internal object MigrationAppDataRestore {
             val extras = Bundle().apply {
                 if (!sessionId.isNullOrEmpty()) putString("sessionId", sessionId)
             }
-            val reply = context.contentResolver.call(AUTHORITY, METHOD_RESTORE_PACKAGE, packageName, extras)
+            val reply = context.contentResolver.call(
+                Uri.parse("content://$authorityName"),
+                METHOD_RESTORE_PACKAGE,
+                packageName,
+                extras,
+            )
             if (reply == null) {
                 Log.d(TAG, "RestoreTransportProvider returned null for $packageName")
                 return Result(ok = false, status = "unsupported")

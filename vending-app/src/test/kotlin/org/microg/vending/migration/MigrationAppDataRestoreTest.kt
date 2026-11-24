@@ -38,16 +38,17 @@ class MigrationAppDataRestoreTest {
         provider: FakeRestoreTransportProvider,
         owner: String = "ai.cyclon.migration",
         flags: Int = ApplicationInfo.FLAG_SYSTEM,
+        authority: String = "ai.cyclon.migration.restore.package",
     ) {
-        ShadowContentResolver.registerProviderInternal("ai.cyclon.migration.restore", provider)
+        ShadowContentResolver.registerProviderInternal(authority, provider)
         val appInfo = ApplicationInfo().apply { packageName = owner; this.flags = flags }
         shadowOf(context.packageManager).installPackage(PackageInfo().apply {
             packageName = owner
             applicationInfo = appInfo
             providers = arrayOf(ProviderInfo().apply {
-                authority = "ai.cyclon.migration.restore"
+                this.authority = authority
                 packageName = owner
-                name = "$owner.RestoreTransportProvider"
+                name = "$owner.RestorePackageProvider"
                 applicationInfo = appInfo
             })
         })
@@ -135,6 +136,17 @@ class MigrationAppDataRestoreTest {
             assertNotNull(result.status)
             assertEquals(1, case.calls.size)
         }
+
+        // Legacy authority fallback still works when only ai.cyclon.migration.restore is registered.
+        val legacy = FakeRestoreTransportProvider(response = Bundle().apply {
+            putBoolean("ok", true)
+            putString("status", "restored")
+        })
+        installRestoreProvider(legacy, authority = "ai.cyclon.migration.restore")
+        val legacyResult = MigrationAppDataRestore.restorePackage(context, app, "session-1")
+        assertTrue(legacyResult.ok)
+        assertEquals("restored", legacyResult.status)
+        assertEquals(1, legacy.calls.size)
     }
 
     private data class Call(val method: String, val arg: String?, val sessionId: String?, val threadName: String)
