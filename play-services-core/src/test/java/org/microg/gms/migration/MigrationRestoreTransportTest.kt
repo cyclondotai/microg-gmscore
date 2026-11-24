@@ -113,18 +113,15 @@ class MigrationRestoreTransportTest {
             assertEquals(1, result)
         }
 
-        val batch1 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
-        batch1.endStaging() // no-op before staging starts
+        val batch1 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context, callingPid = 4101)
         startWrite(batch1, "com.example.one")
         startWrite(batch1, "com.example.two")
-        batch1.endStaging()
-        batch1.endStaging() // idempotent once ended
-        val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
+        val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context, callingPid = 4202)
         startWrite(batch2, "com.example.one")
-        batch2.endStaging()
+        assertEquals(listOf("batchStarted" to null, "batchStarted" to null), trusted.calls)
         assertEquals(
-            listOf("batchStarted" to null, "batchEnded" to null, "batchStarted" to null, "batchEnded" to null),
-            trusted.calls,
+            listOf("boot=0:gen=0:pid=4101", "boot=0:gen=0:pid=4202"),
+            trusted.transferIds,
         )
 
         // Older companion throwing on unknown method never fails staging.
@@ -149,8 +146,10 @@ internal class RestoreTransportProvider : ContentProvider() {
     var nullResponse = false
     var failure: RuntimeException? = null
     val calls = mutableListOf<Pair<String, String?>>()
+    val transferIds = mutableListOf<String?>()
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
         calls += method to extras?.getString("lease_id")
+        if (method == "batchStarted") transferIds += extras?.getString("transfer_id")
         if (method == "scan_volume") assertEquals("external_primary", arg) else assertNull(arg)
         failure?.let { throw it }
         return if (nullResponse) null else Bundle().apply {

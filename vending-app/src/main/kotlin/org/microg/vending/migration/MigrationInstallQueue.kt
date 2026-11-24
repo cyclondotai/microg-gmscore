@@ -270,23 +270,43 @@ internal class MigrationInstallQueue(private val context: Context,
     }
     fun renewPause(id: String) { if (prefs.getBoolean("$id:pause_requested", false)) control(4, options(id)) }
     fun releaseCompletedPause(id: String) { if (prefs.getBoolean("$id:pause_requested", false)) resume(id) }
-    fun recordOptions(options: Bundle) {
+    fun recordOptions(options: Bundle, callingPid: Int = android.os.Binder.getCallingPid()) {
         val sessionToRegister = synchronized(LOCK) {
             val id = session(); val edit = prefs.edit()
             for (key in listOf("documents_type", "restore_source", "disable_pre_archiving")) {
                 if (options.containsKey(key)) edit.putString("$id:option:$key", options.get(key).toString())
             }
             val source = options.get("restore_source")?.toString()?.toIntOrNull()
-            val register = if (source in ANDROID_D2D_RESTORE_SOURCES && !prefs.contains("$id:d2d_seen_elapsed_ms")) {
-                edit.putInt("$id:d2d_seen_boot_count", currentBootCount(context))
-                    .putLong("$id:d2d_seen_elapsed_ms", SystemClock.elapsedRealtime())
-                id
-            } else null
+            if (source in ANDROID_D2D_RESTORE_SOURCES) {
+                if (!prefs.contains("$id:d2d_seen_elapsed_ms")) {
+                    edit.putInt("$id:d2d_seen_boot_count", currentBootCount(context))
+                        .putLong("$id:d2d_seen_elapsed_ms", SystemClock.elapsedRealtime())
+                }
+                if (!prefs.contains("$id:transfer_id")) {
+                    edit.putString("$id:transfer_id", currentTransferId(context, callingPid))
+                }
+            }
             check(edit.commit())
-            register
+            if (source in ANDROID_D2D_RESTORE_SOURCES && prefs.getString("$id:session_protocol", null) == null) id else null
         }
         if (sessionToRegister != null) {
-            MigrationAppDataRestore.registerSession(context, sessionToRegister)
+            ensureSessionRegistered(sessionToRegister)
+        }
+    }
+
+    private fun ensureSessionRegistered(id: String): String? {
+        prefs.getString("$id:session_protocol", null)?.let { return it }
+        val transferId = prefs.getString("$id:transfer_id", null) ?: return "legacy"
+        return when (MigrationAppDataRestore.registerSession(context, id, transferId)) {
+            MigrationAppDataRestore.RegistrationStatus.REGISTERED -> {
+                synchronized(LOCK) { check(prefs.edit().putString("$id:session_protocol", "v2").commit()) }
+                "v2"
+            }
+            MigrationAppDataRestore.RegistrationStatus.UNSUPPORTED -> {
+                synchronized(LOCK) { check(prefs.edit().putString("$id:session_protocol", "legacy").commit()) }
+                "legacy"
+            }
+            MigrationAppDataRestore.RegistrationStatus.FAILED -> null
         }
     }
     fun recordCatalog(documents: List<Bundle>) = synchronized(LOCK) {
@@ -444,6 +464,7 @@ internal class MigrationInstallQueue(private val context: Context,
         val names = synchronized(LOCK) { pendingAppDataRestores(currentId).sorted() }
         val d2dBoot = prefs.getInt("$currentId:d2d_seen_boot_count", -1)
         val d2dElapsed = prefs.getLong("$currentId:d2d_seen_elapsed_ms", -1L)
+        val transferId = prefs.getString("$currentId:transfer_id", null)
         var settled = true
         for (name in names) {
             if (cancelled()) return false
@@ -457,8 +478,26 @@ internal class MigrationInstallQueue(private val context: Context,
                 if (currentSessionId() != currentId || !isAndroidD2dTransfer(currentId)) {
                     MigrationAppDataRestore.Result(ok = false, status = "stale_session")
                 } else {
-                    appDataRestore?.invoke(name, currentId)
-                        ?: MigrationAppDataRestore.restorePackage(context, name, currentId, d2dBoot, d2dElapsed)
+                    val override = appDataRestore
+                    if (override != null) {
+                        override.invoke(name, currentId)
+                    } else {
+                        val protocol = ensureSessionRegistered(currentId)
+                        if (protocol == null) {
+                            MigrationAppDataRestore.Result(ok = false, status = "error")
+                        } else {
+                            val requireReg = protocol == "v2"
+                            MigrationAppDataRestore.restorePackage(
+                                context,
+                                name,
+                                currentId,
+                                d2dBoot,
+                                d2dElapsed,
+                                transferId = if (requireReg) transferId else null,
+                                requireRegistered = requireReg,
+                            )
+                        }
+                    }
                 }
             } finally {
                 RESTORE_IN_FLIGHT.remove(restoreKey)
@@ -529,12 +568,15 @@ internal class MigrationInstallQueue(private val context: Context,
             } else {
                 val d2dBoot = prefs.getInt("$id:d2d_seen_boot_count", -1)
                 val d2dElapsed = prefs.getLong("$id:d2d_seen_elapsed_ms", -1L)
+                val transferId = prefs.getString("$id:transfer_id", null)
                 MigrationAppDataRestore.triggerAsync(
                     context = context,
                     packageName = name,
                     sessionId = id,
                     d2dSeenBootCount = d2dBoot,
                     d2dSeenElapsedMs = d2dElapsed,
+                    ensureRegistered = { ensureSessionRegistered(id) },
+                    transferId = transferId,
                     shouldRun = { currentSessionId() == id && isAndroidD2dTransfer(id) },
                 ) { res ->
                     RESTORE_IN_FLIGHT.remove(restoreKey)
@@ -1114,6 +1156,14 @@ internal class MigrationInstallQueue(private val context: Context,
         private val DOWNLOAD_REFUSALS = setOf("app_not_purchased", RATE_LIMITED)
         private val ACTIVE = setOf("queued", "purchasing", "downloading", "verifying", "completed", "installing")
         private val TERMINAL = setOf("failed", "cancelled", "unavailable", "removed", "owner_action_required")
+        private const val SWITCH_GENERATION_KEY = "usb_migration_expected_version"
+        private fun currentTransferId(context: Context, callingPid: Int): String {
+            val boot = currentBootCount(context)
+            val gen = runCatching {
+                android.provider.Settings.Secure.getLong(context.contentResolver, SWITCH_GENERATION_KEY, 0L)
+            }.getOrDefault(0L)
+            return "boot=$boot:gen=$gen:pid=$callingPid"
+        }
         fun unavailable(name: String, reason: String) = Bundle().apply {
             putString("package_name", name); putString("title", name); putInt("availability", 2)
             putString("status", "unavailable"); putString("error", reason); putBoolean("installed", false)
