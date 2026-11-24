@@ -61,7 +61,7 @@ public class CheckinManager {
         CheckinRequest request = CheckinClient.makeRequest(context,
                 new DeviceConfiguration(context), Utils.getDeviceIdentifier(context),
                 Utils.getPhoneInfo(context), info, Utils.getLocale(context), accounts);
-        return handleResponse(context, CheckinClient.request(request));
+        return handleResponse(context, CheckinClient.request(request), info.getAndroidId());
     }
 
     private static LastCheckinInfo createLastCheckinInfo(CheckinResponse r) {
@@ -75,9 +75,10 @@ public class CheckinManager {
         );
     }
 
-    private static LastCheckinInfo handleResponse(Context context, CheckinResponse response) {
+    /** Null when a factory-baseline restore replaced the identity this check-in was requested for (CYC-2935). */
+    static LastCheckinInfo handleResponse(Context context, CheckinResponse response, long requestedFor) throws IOException {
         LastCheckinInfo info = createLastCheckinInfo(response);
-        info.write(context);
+        if (!FactoryBaseline.storeCheckinResponse(context, requestedFor, info)) return null;
 
         ContentResolver resolver = context.getContentResolver();
         for (CheckinResponse.GservicesSetting setting : response.setting) {

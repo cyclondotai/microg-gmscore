@@ -90,6 +90,8 @@ class SettingsProvider : ContentProvider() {
     private val checkInPrefs by lazy {
         context!!.getSharedPreferences(CheckIn.PREFERENCES_NAME, MODE_PRIVATE)
     }
+    /** Cyclon: held across each read and commit of [checkInPrefs], so no reader sees a commit that then fails. */
+    private val checkInFile = Any()
     private val unifiedNlpPreferences by lazy {
         context!!.getSharedPreferences("unified_nlp", MODE_PRIVATE)
     }
@@ -133,9 +135,10 @@ class SettingsProvider : ContentProvider() {
     ): Int {
         warnIfNotMainProcess(context, this.javaClass)
         if (values == null) return 0
+        val durable = selection == SettingsContract.DURABLE_UPDATE
         when (uri.pathSegments.last()) {
-            CheckIn.ID -> updateCheckIn(values)
-            Gcm.ID -> updateGcm(values)
+            CheckIn.ID -> if (!updateCheckIn(values, durable)) return 0
+            Gcm.ID -> if (!updateGcm(values, durable)) return 0
             Auth.ID -> updateAuth(values)
             Exposure.ID -> updateExposure(values)
             SafetyNet.ID -> updateSafetyNet(values)
@@ -150,50 +153,75 @@ class SettingsProvider : ContentProvider() {
         return 1
     }
 
-    private fun queryCheckIn(p: Array<out String>): Cursor = MatrixCursor(p).addRow(p) { key ->
-        when (key) {
-            CheckIn.ENABLED -> getSettingsBoolean(key, false)
-            CheckIn.ANDROID_ID -> checkInPrefs.getLong(key, 0)
-            CheckIn.DIGEST -> checkInPrefs.getString(key, CheckIn.INITIAL_DIGEST)
-                ?: CheckIn.INITIAL_DIGEST
-            CheckIn.LAST_CHECK_IN -> checkInPrefs.getLong(key, 0)
-            CheckIn.SECURITY_TOKEN -> checkInPrefs.getLong(key, 0)
-            CheckIn.VERSION_INFO -> checkInPrefs.getString(key, "") ?: ""
-            CheckIn.DEVICE_DATA_VERSION_INFO -> checkInPrefs.getString(key, "") ?: ""
-            else -> throw IllegalArgumentException()
+    private fun queryCheckIn(p: Array<out String>): Cursor = synchronized(checkInFile) {
+        MatrixCursor(p).addRow(p) { key ->
+            when (key) {
+                CheckIn.ENABLED -> getSettingsBoolean(key, false)
+                CheckIn.ANDROID_ID -> checkInPrefs.getLong(key, 0)
+                CheckIn.DIGEST -> checkInPrefs.getString(key, CheckIn.INITIAL_DIGEST)
+                    ?: CheckIn.INITIAL_DIGEST
+                CheckIn.LAST_CHECK_IN -> checkInPrefs.getLong(key, 0)
+                CheckIn.SECURITY_TOKEN -> checkInPrefs.getLong(key, 0)
+                CheckIn.VERSION_INFO -> checkInPrefs.getString(key, "") ?: ""
+                CheckIn.DEVICE_DATA_VERSION_INFO -> checkInPrefs.getString(key, "") ?: ""
+                CheckIn.RESTORE_MARKER -> checkInPrefs.getString(key, null)
+                else -> throw IllegalArgumentException()
+            }
         }
     }
 
-    private fun updateCheckIn(values: ContentValues) {
-        if (values.size() == 0) return
+    /** False when a write that must reach the disk did not; the values saved before it then stay the visible ones. */
+    private fun updateCheckIn(values: ContentValues, durable: Boolean): Boolean {
+        if (values.size() == 0) return true
         if (values.size() == 1 && values.containsKey(CheckIn.ENABLED)) {
             // special case: only changing enabled state
-            updateCheckInEnabled(values.getAsBoolean(CheckIn.ENABLED))
-            return
+            return updateCheckInEnabled(values.getAsBoolean(CheckIn.ENABLED), durable)
         }
-        val editor = checkInPrefs.edit()
-        values.valueSet().forEach { (key, value) ->
-            if (key == CheckIn.ENABLED) {
-                // special case: not saved in checkInPrefs
-                updateCheckInEnabled(value as Boolean)
+        synchronized(checkInFile) {
+            val previous = checkInPrefs.all
+            val editor = checkInPrefs.edit()
+            var enabledSaved = true
+            values.valueSet().forEach { (key, value) ->
+                if (key == CheckIn.ENABLED) {
+                    // special case: not saved in checkInPrefs
+                    enabledSaved = updateCheckInEnabled(value as Boolean, durable)
+                }
+                when (key) {
+                    CheckIn.ANDROID_ID -> editor.putLong(key, value as Long)
+                    CheckIn.DIGEST -> editor.putString(key, value as String?)
+                    CheckIn.LAST_CHECK_IN -> editor.putLong(key, value as Long)
+                    CheckIn.SECURITY_TOKEN -> editor.putLong(key, value as Long)
+                    CheckIn.VERSION_INFO -> editor.putString(key, value as String?)
+                    CheckIn.DEVICE_DATA_VERSION_INFO -> editor.putString(key, value as String?)
+                    CheckIn.RESTORE_MARKER -> if (value == null) editor.remove(key) else editor.putString(key, value as String)
+                }
             }
-            when (key) {
-                CheckIn.ANDROID_ID -> editor.putLong(key, value as Long)
-                CheckIn.DIGEST -> editor.putString(key, value as String?)
-                CheckIn.LAST_CHECK_IN -> editor.putLong(key, value as Long)
-                CheckIn.SECURITY_TOKEN -> editor.putLong(key, value as Long)
-                CheckIn.VERSION_INFO -> editor.putString(key, value as String?)
-                CheckIn.DEVICE_DATA_VERSION_INFO -> editor.putString(key, value as String?)
-            }
+            // Cyclon: a restored identity must be on disk before Core acknowledges it (CYC-2935).
+            if (editor.commit()) return enabledSaved
+            // SharedPreferences keeps a failed commit in memory, where every reader would take it for the saved values.
+            val rollback = checkInPrefs.edit()
+            values.keySet().filter { it != CheckIn.ENABLED }.forEach { rollback.putPrevious(it, previous[it]) }
+            rollback.commit()
+            return false
         }
-        // Cyclon: a restored identity must be on disk before Core acknowledges it (CYC-2935).
-        editor.commit()
     }
 
-    private fun updateCheckInEnabled(enabled: Boolean) {
-        preferences.edit()
-            .putBoolean(CheckIn.ENABLED, enabled)
-            .apply()
+    private fun SharedPreferences.Editor.putPrevious(key: String, previous: Any?) {
+        when (previous) {
+            null -> remove(key)
+            is Long -> putLong(key, previous)
+            is String -> putString(key, previous)
+        }
+    }
+
+    private fun updateCheckInEnabled(enabled: Boolean, durable: Boolean): Boolean =
+        preferences.edit().putBoolean(CheckIn.ENABLED, enabled).finish(durable)
+
+    /** Cyclon: only a durable update waits for the disk; every other settings path keeps `apply`. */
+    private fun SharedPreferences.Editor.finish(durable: Boolean): Boolean {
+        if (durable) return commit()
+        apply()
+        return true
     }
 
     private fun queryGcm(p: Array<out String>): Cursor = MatrixCursor(p).addRow(p) { key ->
@@ -217,8 +245,8 @@ class SettingsProvider : ContentProvider() {
         }
     }
 
-    private fun updateGcm(values: ContentValues) {
-        if (values.size() == 0) return
+    private fun updateGcm(values: ContentValues, durable: Boolean): Boolean {
+        if (values.size() == 0) return true
         val editor = preferences.edit()
         values.valueSet().forEach { (key, value) ->
             when (key) {
@@ -240,7 +268,7 @@ class SettingsProvider : ContentProvider() {
                 else -> throw IllegalArgumentException("Unknown key: $key")
             }
         }
-        editor.apply()
+        return editor.finish(durable)
     }
 
     private fun queryAuth(p: Array<out String>): Cursor = MatrixCursor(p).addRow(p) { key ->

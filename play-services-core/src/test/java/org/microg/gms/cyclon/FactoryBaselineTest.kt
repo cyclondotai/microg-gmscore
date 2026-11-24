@@ -6,6 +6,7 @@ import android.accounts.Account
 import android.accounts.AccountManager
 import android.content.Context
 import android.content.ContextWrapper
+import android.content.SharedPreferences
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageInfo
 import android.content.pm.ProviderInfo
@@ -18,9 +19,11 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeFalse
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.microg.gms.checkin.CheckinLock
 import org.microg.gms.checkin.CheckinService
 import org.microg.gms.checkin.LastCheckinInfo
 import org.microg.gms.settings.SettingsContract
@@ -33,7 +36,11 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowBinder
 import org.robolectric.shadows.ShadowContentResolver
 import org.robolectric.shadows.ShadowSystemProperties
+import java.io.File
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.FutureTask
+import java.util.concurrent.atomic.AtomicBoolean
 
 private const val DEVICE = "cyclondevice@gmail.com"
 private const val OWNER = "owner@example.invalid"
@@ -44,6 +51,9 @@ private const val SECURITY_TOKEN = -987654321012345678L // gitleaks:allow synthe
 private const val NOW = 1_800_000_000_000L
 
 private fun account(name: String) = Account(name, "com.google")
+
+/** Stands for the process dying at that step: unlike an exception, restore cannot catch it and answer. */
+private class ProcessDeath : Error()
 
 private class FakeHost : FactoryBaselineHost {
     var info = LastCheckinInfo(NOW - 1000, ANDROID_ID, SECURITY_TOKEN, "1-synthetic", "version", "device-version")
@@ -67,9 +77,24 @@ private class FakeHost : FactoryBaselineHost {
     var added: Triple<Account, String, Map<String, String>>? = null
     var written: LastCheckinInfo? = null
     var restoredKey: String? = null
+    var marker: String? = null
+    var lockTaken = false
+    var writeFailure: Throwable? = null
+    var gcmFailure: Throwable? = null
+    var enableFailure: Throwable? = null
+    var clearFailure: Throwable? = null
+    var gcmOn = false
+    var checkinOn = false
+    /** Runs once after the next identity or marker read has taken its value, like another thread between two reads. */
+    var duringNextRead: (() -> Unit)? = null
+
+    private fun <T> read(value: T): T {
+        duringNextRead?.also { duringNextRead = null }?.invoke()
+        return value
+    }
 
     override fun now() = NOW
-    override fun checkin() = info
+    override fun checkin() = read(info)
     override fun checkinEnabled() = true
     override fun googleAccounts() = accounts.toList()
     override fun isDevice(account: Account) = account.name in devices
@@ -105,13 +130,30 @@ private class FakeHost : FactoryBaselineHost {
         restoredKey = key
         return enrollmentResult
     }
-    override fun writeCheckin(info: LastCheckinInfo) {
+    override fun writeCheckin(info: LastCheckinInfo, restoreMarker: String) {
         calls += "checkin"
+        writeFailure?.let { throw it }
         written = info
         this.info = info
+        marker = restoreMarker
     }
-    override fun enableGcm() { calls += "gcm" }
-    override fun enableCheckin() { calls += "enableCheckin" }
+    override fun restoreMarker() = read(marker)
+    override fun clearRestoreMarker() {
+        calls += "clearMarker"
+        clearFailure?.let { throw it }
+        marker = null
+    }
+    override fun tryCheckinLock(block: () -> String) = if (lockTaken) null else block()
+    override fun enableGcm() {
+        calls += "gcm"
+        gcmFailure?.let { throw it }
+        gcmOn = true
+    }
+    override fun enableCheckin() {
+        calls += "enableCheckin"
+        enableFailure?.let { throw it }
+        checkinOn = true
+    }
 }
 
 private fun wiped() = FakeHost().apply {
@@ -229,7 +271,7 @@ class FactoryBaselineTest {
     @Test fun restoreRunsInOrderWithIdentityLast() {
         val host = wiped()
         assertEquals(FactoryBaseline.APPLIED, FactoryBaseline.restore(host, payload()))
-        assertEquals(listOf("addAccount", "hide", "enrollment", "checkin", "gcm", "enableCheckin"), host.calls)
+        assertEquals(listOf("addAccount", "hide", "enrollment", "checkin", "gcm", "enableCheckin", "clearMarker"), host.calls)
         val (account, token, userData) = host.added!!
         assertEquals(account(DEVICE), account)
         assertEquals(DEVICE_TOKEN, token)
@@ -263,8 +305,131 @@ class FactoryBaselineTest {
         }
         assertEquals("partial", FactoryBaseline.state(host))
         assertEquals(FactoryBaseline.APPLIED, FactoryBaseline.restore(host, payload()))
-        assertEquals(listOf("hide", "enrollment", "checkin", "gcm", "enableCheckin"), host.calls)
+        assertEquals(listOf("hide", "enrollment", "checkin", "gcm", "enableCheckin", "clearMarker"), host.calls)
         assertEquals("provisioned", FactoryBaseline.state(host))
+    }
+
+    @Test fun failedIdentityWriteIsBusyAndARetryApplies() {
+        val host = wiped().apply { writeFailure = IllegalArgumentException("not saved") }
+        assertEquals(FactoryBaseline.BUSY, FactoryBaseline.restore(host, payload()))
+        assertNull(host.written)
+        assertNull(host.marker)
+        assertFalse(host.gcmOn || host.checkinOn)
+        assertEquals("partial", FactoryBaseline.state(host))
+
+        host.writeFailure = null
+        assertEquals(FactoryBaseline.APPLIED, FactoryBaseline.restore(host, payload()))
+        assertEquals("provisioned", FactoryBaseline.state(host))
+    }
+
+    @Test fun deathBeforeTheMarkerCommitRestartsTheRestore() {
+        val host = wiped().apply { writeFailure = ProcessDeath() }
+        assertThrows(ProcessDeath::class.java) { FactoryBaseline.restore(host, payload()) }
+        assertNull(host.marker)
+        assertEquals(0L, host.info.androidId)
+        assertEquals("partial", FactoryBaseline.state(host))
+
+        host.writeFailure = null
+        assertEquals(FactoryBaseline.APPLIED, FactoryBaseline.restore(host, payload()))
+        assertEquals(ANDROID_ID, host.info.androidId)
+        assertTrue(host.gcmOn && host.checkinOn)
+        assertEquals("provisioned", FactoryBaseline.state(host))
+    }
+
+    /** Each step after the identity commit, failing with an exception and with the process dying there. */
+    @Test fun anInterruptedRestoreIsNeverProvisionedAndTheRetryFinishesIt() {
+        val steps = listOf<Pair<(FakeHost, Throwable?) -> Unit, List<String>>>(
+            Pair({ host, failure -> host.gcmFailure = failure }, listOf("gcm", "enableCheckin", "clearMarker")),
+            Pair({ host, failure -> host.enableFailure = failure }, listOf("gcm", "enableCheckin", "clearMarker")),
+            Pair({ host, failure -> host.clearFailure = failure }, listOf("gcm", "enableCheckin", "clearMarker")),
+        )
+        for ((arm, resumed) in steps) for (failure in listOf(IllegalArgumentException("not saved"), ProcessDeath())) {
+            val host = wiped()
+            arm(host, failure)
+            if (failure is ProcessDeath) assertThrows(ProcessDeath::class.java) { FactoryBaseline.restore(host, payload()) }
+            else assertEquals(FactoryBaseline.BUSY, FactoryBaseline.restore(host, payload()))
+
+            assertEquals(EnrollmentSession.keyFor(DEVICE, ANDROID_ID), host.marker)
+            assertEquals(ANDROID_ID, host.info.androidId)
+            assertEquals("partial", FactoryBaseline.state(host))
+
+            arm(host, null)
+            host.calls.clear()
+            assertEquals(FactoryBaseline.APPLIED, FactoryBaseline.restore(host, payload()))
+            assertEquals(resumed, host.calls)
+            assertTrue(host.gcmOn && host.checkinOn)
+            assertNull(host.marker)
+            assertEquals("provisioned", FactoryBaseline.state(host))
+            assertEquals(FactoryBaseline.TARGET_PROVISIONED, FactoryBaseline.restore(host, payload()))
+        }
+    }
+
+    @Test fun aRestoreLandingBetweenTheStatusReadsIsNotProvisionedUntilItFinishes() {
+        val host = wiped().apply { gcmFailure = IllegalArgumentException("not saved") }
+        host.duringNextRead = { assertEquals(FactoryBaseline.BUSY, FactoryBaseline.restore(host, payload())) }
+        assertEquals("partial", FactoryBaseline.state(host))
+        assertEquals(ANDROID_ID, host.info.androidId)
+        assertEquals(EnrollmentSession.keyFor(DEVICE, ANDROID_ID), host.marker)
+        assertTrue(!host.gcmOn && !host.checkinOn)
+
+        host.gcmFailure = null
+        host.duringNextRead = { assertEquals(FactoryBaseline.APPLIED, FactoryBaseline.restore(host, payload())) }
+        assertEquals("provisioned", FactoryBaseline.state(host))
+        assertTrue(host.gcmOn && host.checkinOn)
+        assertNull(host.marker)
+    }
+
+    @Test fun anotherBaselineFinishesTheInterruptedRestoreAndKeepsItsIdentity() {
+        val host = wiped().apply { gcmFailure = ProcessDeath() }
+        assertThrows(ProcessDeath::class.java) { FactoryBaseline.restore(host, payload()) }
+        host.gcmFailure = null
+        val other = payload {
+            it.getJSONObject("checkin").put("androidId", "77")
+            it.getJSONObject("enrollment").put("key", EnrollmentSession.keyFor(DEVICE, 77))
+        }
+        assertEquals(FactoryBaseline.TARGET_PROVISIONED, FactoryBaseline.restore(host, other))
+        assertEquals(ANDROID_ID, host.info.androidId)
+        assertTrue(host.gcmOn && host.checkinOn)
+        assertNull(host.marker)
+        assertEquals("provisioned", FactoryBaseline.state(host))
+    }
+
+    @Test fun aCheckinIdentityAfterAnInterruptedRestoreIsKept() {
+        val host = wiped().apply {
+            info = info.copy(androidId = 42)
+            marker = EnrollmentSession.keyFor(DEVICE, ANDROID_ID)
+        }
+        assertEquals("partial", FactoryBaseline.state(host))
+        assertEquals(FactoryBaseline.TARGET_PROVISIONED, FactoryBaseline.restore(host, payload()))
+        assertEquals(42L, host.info.androidId)
+        assertNull(host.written)
+        assertNull(host.marker)
+        assertEquals("provisioned", FactoryBaseline.state(host))
+    }
+
+    @Test fun aMarkerWithoutAnIdentityDoesNotStickOnARefusedRestore() {
+        val host = wiped().apply {
+            accounts += account("other-device@example.invalid")
+            devices += "other-device@example.invalid"
+            marker = EnrollmentSession.keyFor(DEVICE, ANDROID_ID)
+        }
+        assertEquals(FactoryBaseline.TARGET_PROVISIONED, FactoryBaseline.restore(host, payload()))
+        assertNull(host.marker)
+    }
+
+    @Test fun aTakenLockIsBusyAndTouchesNothing() {
+        val host = wiped().apply { lockTaken = true }
+        assertEquals(FactoryBaseline.BUSY, FactoryBaseline.restore(host, payload()))
+        assertTrue(host.calls.isEmpty())
+    }
+
+    @Test fun sealWaitsForAnUnfinishedRestore() {
+        val host = FakeHost().apply { marker = EnrollmentSession.keyFor(DEVICE, ANDROID_ID) }
+        FactoryBaseline.seal(host)
+        assertTrue(host.sealed.isEmpty())
+        host.marker = null
+        FactoryBaseline.seal(host)
+        assertEquals(1, host.sealed.size)
     }
 
     @Test fun restoreRefusesAPhoneThatAlreadyCheckedIn() {
@@ -414,6 +579,25 @@ class FactoryBaselineProviderTest {
         else shadowOf(context.packageManager).setPackagesForUid(coreUid, "ai.cyclon.core")
     }
 
+    /** A SettingsProvider whose commits to [failing] files report failure, as a full disk would. */
+    private fun useSettingsThatFail(failing: MutableSet<String>, keepInMemory: Boolean) =
+        useSettingsThatFail(keepInMemory) { it in failing }
+
+    private fun useSettingsThatFail(
+        keepInMemory: Boolean,
+        onFailedCommit: () -> Unit = {},
+        fails: (String) -> Boolean,
+    ) {
+        val backed = object : ContextWrapper(context) {
+            override fun getSharedPreferences(name: String, mode: Int): SharedPreferences =
+                FailingPreferences(super.getSharedPreferences(name, mode), keepInMemory, onFailedCommit) { fails(name) }
+        }
+        val settings = SettingsProvider().also {
+            it.attachInfo(backed, ProviderInfo().apply { authority = "com.google.android.gms.microg.settings" })
+        }
+        ShadowContentResolver.registerProviderInternal("com.google.android.gms.microg.settings", settings)
+    }
+
     private fun restoreExtras(bytes: ByteArray = payload(), reason: String = "just_reset") = Bundle().apply {
         putInt("schema", 1)
         putString("reason", reason)
@@ -466,6 +650,272 @@ class FactoryBaselineProviderTest {
         assertEquals(SettingsContract.CheckIn.INITIAL_DIGEST, info.digest)
         assertEquals("provisioned", provider.call("status", null, null).getString("state"))
         assertEquals("target_provisioned", provider.call("restore", null, restoreExtras()).getString("outcome"))
+    }
+
+    @Test fun aFailedIdentityCommitIsBusyLeaksNothingAndARetryApplies() {
+        for (keepInMemory in listOf(false, true)) {
+            val failing = mutableSetOf("checkin")
+            useSettingsThatFail(failing, keepInMemory)
+            val failure = assertThrows(IllegalArgumentException::class.java) {
+                LastCheckinInfo(NOW, ANDROID_ID, SECURITY_TOKEN, "1-synthetic", "v", "d").write(context)
+            }
+            assertFalse(failure.message!!.contains(SECURITY_TOKEN.toString()))
+            assertFalse(failure.message!!.contains(ANDROID_ID.toString()))
+            failing.clear()
+            LastCheckinInfo.clear(context)
+            AccountManager.get(context).getAccountsByType("com.google")
+                .forEach { AccountManager.get(context).removeAccountExplicitly(it) }
+
+            failing += "checkin"
+            assertEquals("busy", provider.call("restore", null, restoreExtras()).getString("outcome"))
+            assertEquals("partial", provider.call("status", null, null).getString("state"))
+            failing.clear()
+            assertEquals("applied", provider.call("restore", null, restoreExtras()).getString("outcome"))
+            assertEquals("provisioned", provider.call("status", null, null).getString("state"))
+            assertEquals(ANDROID_ID, LastCheckinInfo.read(context).androidId)
+            assertNull(LastCheckinInfo.restoreMarker(context))
+            LastCheckinInfo.clear(context)
+            AccountManager.get(context).getAccountsByType("com.google")
+                .forEach { AccountManager.get(context).removeAccountExplicitly(it) }
+        }
+    }
+
+    @Test fun aFailedEnableCommitStaysPartialAndARetryFinishes() {
+        val defaults = "${context.packageName}_preferences"
+        val failing = mutableSetOf(defaults)
+        useSettingsThatFail(failing, keepInMemory = true)
+
+        assertEquals("busy", provider.call("restore", null, restoreExtras()).getString("outcome"))
+        assertEquals(ANDROID_ID, LastCheckinInfo.read(context).androidId)
+        assertNotNull(LastCheckinInfo.restoreMarker(context))
+        assertEquals("partial", provider.call("status", null, null).getString("state"))
+
+        failing.clear()
+        assertEquals("applied", provider.call("restore", null, restoreExtras()).getString("outcome"))
+        assertNull(LastCheckinInfo.restoreMarker(context))
+        assertEquals("provisioned", provider.call("status", null, null).getString("state"))
+        assertTrue(org.microg.gms.checkin.CheckinPreferences.isEnabled(context))
+        assertTrue(org.microg.gms.gcm.GcmPrefs.get(context).isEnabled)
+    }
+
+    @Test fun aCheckinFileThatKeepsFailingNeverReadsAsSaved() {
+        val failing = mutableSetOf("checkin")
+        useSettingsThatFail(failing, keepInMemory = true)
+
+        repeat(2) {
+            assertEquals("busy", provider.call("restore", null, restoreExtras()).getString("outcome"))
+            assertEquals("partial", provider.call("status", null, null).getString("state"))
+            assertEquals(0L, LastCheckinInfo.read(context).androidId)
+            assertEquals(0L, LastCheckinInfo.read(context).securityToken)
+            assertNull(LastCheckinInfo.restoreMarker(context))
+        }
+
+        failing.clear()
+        assertEquals("applied", provider.call("restore", null, restoreExtras()).getString("outcome"))
+        assertEquals("provisioned", provider.call("status", null, null).getString("state"))
+        assertEquals(ANDROID_ID, LastCheckinInfo.read(context).androidId)
+    }
+
+    @Test fun aMarkerClearThatKeepsFailingStaysPartialUntilItIsSaved() {
+        var commits = 0
+        var clearFails = true
+        // The identity commit is the first to this file; everything after it fails while clearFails holds.
+        useSettingsThatFail(keepInMemory = true) { name -> name == "checkin" && clearFails && ++commits > 1 }
+
+        repeat(2) {
+            assertEquals("busy", provider.call("restore", null, restoreExtras()).getString("outcome"))
+            assertEquals("partial", provider.call("status", null, null).getString("state"))
+            assertNotNull(LastCheckinInfo.restoreMarker(context))
+            assertEquals(ANDROID_ID, LastCheckinInfo.read(context).androidId)
+        }
+
+        clearFails = false
+        assertEquals("applied", provider.call("restore", null, restoreExtras()).getString("outcome"))
+        assertNull(LastCheckinInfo.restoreMarker(context))
+        assertEquals("provisioned", provider.call("status", null, null).getString("state"))
+    }
+
+    @Test fun anUnsavedCheckinResponseIsNotTheStoredIdentity() {
+        val failing = mutableSetOf("checkin")
+        useSettingsThatFail(failing, keepInMemory = true)
+        val unsaved = LastCheckinInfo(NOW, 555L, 666L, "1-unsaved", "v", "d")
+
+        assertThrows(java.io.IOException::class.java) { FactoryBaseline.storeCheckinResponse(context, 0L, unsaved) }
+
+        val visible = LastCheckinInfo.read(context)
+        assertEquals(0L, visible.androidId)
+        assertEquals(0L, visible.securityToken)
+        assertEquals(0L, visible.lastCheckin)
+        assertEquals(SettingsContract.CheckIn.INITIAL_DIGEST, visible.digest)
+        assertEquals("empty", provider.call("status", null, null).getString("state"))
+
+        failing.clear()
+        assertEquals("applied", provider.call("restore", null, restoreExtras()).getString("outcome"))
+        assertEquals(ANDROID_ID, LastCheckinInfo.read(context).androidId)
+        assertEquals("provisioned", provider.call("status", null, null).getString("state"))
+    }
+
+    @Test fun anUnsavedResponseKeepsThePreviousIdentityVisible() {
+        LastCheckinInfo(NOW - 1, ANDROID_ID, SECURITY_TOKEN, "1-saved", "v", "d").write(context)
+        val failing = mutableSetOf("checkin")
+        // A new provider over the same file: its first read loads what was saved above.
+        useSettingsThatFail(failing, keepInMemory = true)
+        val unsaved = LastCheckinInfo(NOW, ANDROID_ID, 666L, "1-unsaved", "v2", "d2")
+
+        assertThrows(java.io.IOException::class.java) {
+            FactoryBaseline.storeCheckinResponse(context, ANDROID_ID, unsaved)
+        }
+
+        val visible = LastCheckinInfo.read(context)
+        assertEquals(SECURITY_TOKEN, visible.securityToken)
+        assertEquals("1-saved", visible.digest)
+        assertEquals(NOW - 1, visible.lastCheckin)
+        assertEquals("v", visible.versionInfo)
+    }
+
+    @Test fun aReaderNeverSeesACommitThatThenFails() {
+        val inCommit = CountDownLatch(1)
+        val finish = CountDownLatch(1)
+        val first = AtomicBoolean(true)
+        useSettingsThatFail(keepInMemory = true, onFailedCommit = {
+            if (first.compareAndSet(true, false)) {
+                inCommit.countDown()
+                finish.await()
+            }
+        }) { it == "checkin" }
+        val writer = Thread {
+            runCatching { LastCheckinInfo(NOW, ANDROID_ID, SECURITY_TOKEN, "1-unsaved", "v", "d").write(context) }
+        }.apply { start() }
+        inCommit.await()
+
+        val read = FutureTask { LastCheckinInfo.read(context).androidId }
+        val reader = Thread(read).apply { start() }
+        // Without the provider's lock the read returns the unsaved identity here and the thread ends.
+        while (reader.state != Thread.State.BLOCKED && reader.state != Thread.State.TERMINATED) Thread.onSpinWait()
+        finish.countDown()
+
+        assertEquals(0L, read.get())
+        reader.join()
+        writer.join()
+    }
+
+    /** The real SharedPreferencesImpl, whose failed commit stays in memory: no fake can drift from it here. */
+    @Test fun aRealFailedCommitLeavesTheSavedIdentityVisible() {
+        assumeFalse("root ignores directory permissions", System.getProperty("user.name") == "root")
+        LastCheckinInfo(NOW - 1, ANDROID_ID, SECURITY_TOKEN, "1-saved", "v", "d").write(context)
+        val directory = File(context.dataDir, "shared_prefs")
+        assertTrue(directory.setWritable(false))
+        try {
+            assertThrows(IllegalArgumentException::class.java) {
+                LastCheckinInfo(NOW, 555L, 666L, "1-unsaved", "v2", "d2").write(context)
+            }
+            val visible = LastCheckinInfo.read(context)
+            assertEquals(ANDROID_ID, visible.androidId)
+            assertEquals(SECURITY_TOKEN, visible.securityToken)
+            assertEquals("1-saved", visible.digest)
+        } finally {
+            directory.setWritable(true)
+        }
+        LastCheckinInfo(NOW, ANDROID_ID, SECURITY_TOKEN, "1-next", "v", "d").write(context)
+        assertEquals("1-next", LastCheckinInfo.read(context).digest)
+    }
+
+    /**
+     * The enable flags share a file with `apply()` writers, so a failed enable is not rolled back: the marker stays and the
+     * retry commits the same value. The real SharedPreferencesImpl must still write that unchanged value to the disk.
+     */
+    @Test fun aRetriedEnableReachesTheDiskAfterAFailedCommit() {
+        assumeFalse("root ignores directory permissions", System.getProperty("user.name") == "root")
+        LastCheckinInfo(NOW, ANDROID_ID, SECURITY_TOKEN, "1-saved", "v", "d").write(context)
+        val directory = File(context.dataDir, "shared_prefs")
+        // The provider built in setup runs on the test application's context, so its defaults carry that package name.
+        val defaults = File(directory, "${RuntimeEnvironment.getApplication().packageName}_preferences.xml")
+        assertTrue(directory.setWritable(false))
+        try {
+            assertThrows(IllegalArgumentException::class.java) { org.microg.gms.gcm.GcmPrefs.enableDurably(context) }
+            assertThrows(IllegalArgumentException::class.java) {
+                org.microg.gms.checkin.CheckinPreferences.enableDurably(context)
+            }
+        } finally {
+            directory.setWritable(true)
+        }
+        assertFalse(defaults.exists() && defaults.readText().contains(SettingsContract.Gcm.ENABLE_GCM))
+
+        org.microg.gms.gcm.GcmPrefs.enableDurably(context)
+        org.microg.gms.checkin.CheckinPreferences.enableDurably(context)
+
+        val saved = defaults.readText()
+        assertTrue(saved.contains("name=\"${SettingsContract.Gcm.ENABLE_GCM}\" value=\"true\""))
+        assertTrue(saved.contains("name=\"${SettingsContract.CheckIn.ENABLED}\" value=\"true\""))
+    }
+
+    @Test fun restoreAnswersBusyAtOnceWhileAnotherThreadHoldsTheLock() {
+        val taken = CountDownLatch(1)
+        val done = CountDownLatch(1)
+        val holder = Thread {
+            val held = CheckinLock.acquire(FactoryBaseline.lockFile(context))
+            taken.countDown()
+            done.await()
+            held.release()
+        }.apply { start() }
+        taken.await()
+        assertEquals("busy", provider.call("restore", null, restoreExtras()).getString("outcome"))
+        assertEquals(0L, LastCheckinInfo.read(context).androidId)
+        done.countDown()
+        holder.join()
+        assertEquals("applied", provider.call("restore", null, restoreExtras()).getString("outcome"))
+    }
+
+    @Test fun restoreAnswersBusyWhileAnotherProcessHoldsTheLock() {
+        val child = LockChild.hold(FactoryBaseline.lockFile(context))
+        try {
+            assertEquals("busy", provider.call("restore", null, restoreExtras()).getString("outcome"))
+            assertEquals(0L, LastCheckinInfo.read(context).androidId)
+        } finally {
+            child.finish()
+        }
+        assertEquals("applied", provider.call("restore", null, restoreExtras()).getString("outcome"))
+    }
+
+    @Test fun aStaleEmptyIdentityResponseCannotReplaceTheRestoredOne() {
+        assertEquals("applied", provider.call("restore", null, restoreExtras()).getString("outcome"))
+        val stale = LastCheckinInfo(NOW, 555L, 666L, "1-stale", "v", "d")
+        assertFalse(FactoryBaseline.storeCheckinResponse(context, 0L, stale))
+        assertEquals(ANDROID_ID, LastCheckinInfo.read(context).androidId)
+        assertEquals(SECURITY_TOKEN, LastCheckinInfo.read(context).securityToken)
+        assertTrue(EnrollmentSession(context, DEVICE, ANDROID_ID).accepted)
+    }
+
+    @Test fun aResponseWaitingForTheLockSeesTheIdentityTheHolderSaved() {
+        val held = CheckinLock.acquire(FactoryBaseline.lockFile(context))
+        val stale = LastCheckinInfo(NOW, 555L, 666L, "1-stale", "v", "d")
+        val store = FutureTask { FactoryBaseline.storeCheckinResponse(context, 0L, stale) }
+        val thread = Thread(store).apply { start() }
+        while (!CheckinLock.hasWaiters) Thread.onSpinWait()
+
+        LastCheckinInfo(NOW, ANDROID_ID, SECURITY_TOKEN, "1-synthetic", "v", "d").write(context)
+        held.release()
+
+        assertFalse(store.get())
+        thread.join()
+        assertEquals(ANDROID_ID, LastCheckinInfo.read(context).androidId)
+    }
+
+    @Test fun aResponseForTheStoredIdentityIsSaved() {
+        LastCheckinInfo(NOW - 1, ANDROID_ID, SECURITY_TOKEN, "1-old", "v", "d").write(context)
+        val fresh = LastCheckinInfo(NOW, ANDROID_ID, SECURITY_TOKEN, "1-new", "v", "d")
+        assertTrue(FactoryBaseline.storeCheckinResponse(context, ANDROID_ID, fresh))
+        assertEquals("1-new", LastCheckinInfo.read(context).digest)
+    }
+
+    @Test fun aFailedResponseWriteIsAnIOExceptionWithoutValues() {
+        useSettingsThatFail(mutableSetOf("checkin"), keepInMemory = true)
+        val info = LastCheckinInfo(NOW, ANDROID_ID, SECURITY_TOKEN, "1-synthetic", "v", "d")
+        val failure = assertThrows(java.io.IOException::class.java) {
+            FactoryBaseline.storeCheckinResponse(context, 0L, info)
+        }
+        assertFalse(failure.message!!.contains(SECURITY_TOKEN.toString()))
+        assertFalse(failure.message!!.contains(ANDROID_ID.toString()))
     }
 
     @Test fun malformedRestoreIsInvalidAndChangesNothing() {
@@ -532,5 +982,25 @@ class FactoryBaselineProviderTest {
         assertTrue(FactoryBaseline.holdsCheckin(context))
         LastCheckinInfo(NOW, ANDROID_ID, SECURITY_TOKEN, "1-synthetic", "v", "d").write(context)
         assertFalse(FactoryBaseline.holdsCheckin(context))
+    }
+}
+
+/** Fails a commit the way a full disk does; [keepInMemory] is SharedPreferencesImpl's real behaviour on that failure. */
+private class FailingPreferences(
+    private val real: SharedPreferences,
+    private val keepInMemory: Boolean,
+    private val onFailedCommit: () -> Unit = {},
+    private val fails: () -> Boolean,
+) : SharedPreferences by real {
+    override fun edit(): SharedPreferences.Editor = FailingEditor(real.edit())
+
+    private inner class FailingEditor(private val editor: SharedPreferences.Editor) : SharedPreferences.Editor by editor {
+        override fun putBoolean(key: String?, value: Boolean) = apply { editor.putBoolean(key, value) }
+        override fun commit(): Boolean {
+            if (!fails()) return editor.commit()
+            if (keepInMemory) editor.commit()
+            onFailedCommit()
+            return false
+        }
     }
 }

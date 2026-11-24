@@ -69,7 +69,7 @@ class FactoryBaselineProvider : ContentProvider() {
                 FactoryBaseline.restore(host(app), payload)
             }
         } catch (e: Exception) {
-            // The class name only: a failed settings write puts the values it tried to store in its message.
+            // The class name only: nothing from a failed restore belongs in the log.
             Log.w(TAG, "Restore deferred: ${e.javaClass.simpleName}")
             FactoryBaseline.BUSY
         } finally {

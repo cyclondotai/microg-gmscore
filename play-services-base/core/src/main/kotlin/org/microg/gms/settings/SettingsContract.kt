@@ -33,6 +33,9 @@ object SettingsContract {
     const val CROSS_PROFILE_SHARED_PREFERENCES_NAME = "crossProfile"
     const val CROSS_PROFILE_PERMISSION = "uri"
 
+    /** Cyclon: the `update` selection that commits to disk and reports a failed commit as 0 rows (CYC-2935). */
+    const val DURABLE_UPDATE = "cyclon_durable"
+
     fun getAuthority(context: Context): String {
         val metaData = runCatching { context.packageManager.getApplicationInfo(context.packageName, PackageManager.GET_META_DATA).metaData }.getOrNull() ?: Bundle.EMPTY
         val sourcePackage = metaData.getString(META_DATA_KEY_SOURCE_PACKAGE, context.packageName)
@@ -106,6 +109,9 @@ object SettingsContract {
         const val SECURITY_TOKEN = "securityToken"
         const val VERSION_INFO = "versionInfo"
         const val DEVICE_DATA_VERSION_INFO = "deviceDataVersionInfo"
+
+        /** Cyclon: set from a factory-baseline restore's identity write until push and check-in are on (CYC-2935). */
+        const val RESTORE_MARKER = "cyclon_restore_marker"
 
         val PROJECTION = arrayOf(
             ENABLED,
@@ -348,10 +354,18 @@ object SettingsContract {
     }
 
     @JvmStatic
-    fun setSettings(context: Context, uri: Uri, v: ContentValues.() -> Unit) = withoutCallingIdentity {
+    fun setSettings(context: Context, uri: Uri, v: ContentValues.() -> Unit) = update(context, uri, null, v)
+
+    /** Cyclon: [setSettings] that returns once the values are on disk and throws when they could not be saved. */
+    @JvmStatic
+    fun setSettingsDurably(context: Context, uri: Uri, v: ContentValues.() -> Unit) =
+        update(context, uri, DURABLE_UPDATE, v)
+
+    private fun update(context: Context, uri: Uri, selection: String?, v: ContentValues.() -> Unit) = withoutCallingIdentity {
         val values = ContentValues().apply { v.invoke(this) }
-        val affected = context.contentResolver.update(uri, values, null, null)
-        require(affected == 1) { "Update for $uri with $values affected 0 rows"}
+        val affected = context.contentResolver.update(uri, values, selection, null)
+        // Never the values: they can hold the check-in security token.
+        require(affected == 1) { "Update for $uri affected $affected rows" }
     }
 
 }

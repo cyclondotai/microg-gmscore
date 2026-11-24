@@ -13,12 +13,14 @@ import android.os.SystemClock
 import android.util.JsonWriter
 import android.util.Log
 import org.json.JSONObject
-import org.microg.gms.checkin.CheckinManager
+import org.microg.gms.checkin.CheckinLock
 import org.microg.gms.checkin.CheckinPreferences
 import org.microg.gms.checkin.CheckinService
 import org.microg.gms.checkin.LastCheckinInfo
 import org.microg.gms.gcm.GcmPrefs
 import org.microg.gms.settings.SettingsContract
+import java.io.File
+import java.io.IOException
 import java.io.StringWriter
 import java.nio.ByteBuffer
 import java.security.MessageDigest
@@ -94,21 +96,56 @@ object FactoryBaseline {
     internal fun holds(pending: Boolean, elapsedMs: Long, androidId: () -> Long): Boolean =
         pending && elapsedMs < HOLD_WINDOW_MS && androidId() <= 0
 
+    /**
+     * Saves a check-in response unless the identity it was requested for has changed since. The lock is taken only here,
+     * never across the network call, so a restore is not held up by a slow check-in and wins over one in flight: the stale
+     * response is dropped instead of tying the restored receipt to a new Android ID.
+     *
+     * @return false when the response was dropped
+     * @throws IOException when it could not be saved, which callers already handle as a failed check-in
+     */
+    @JvmStatic
+    @Throws(IOException::class)
+    fun storeCheckinResponse(context: Context, requestedFor: Long, info: LastCheckinInfo): Boolean {
+        val held = CheckinLock.acquire(lockFile(context))
+        try {
+            if (LastCheckinInfo.read(context).androidId != requestedFor) return false
+            info.write(context)
+            return true
+        } catch (_: RuntimeException) {
+            throw IOException("Check-in identity not saved")
+        } finally {
+            held.release()
+        }
+    }
+
+    internal fun lockFile(context: Context) = File(context.noBackupFilesDir, CheckinLock.FILE_NAME)
+
     private fun pendingProperty(): String = runCatching {
         Class.forName("android.os.SystemProperties").getMethod("get", String::class.java, String::class.java)
             .invoke(null, MICROG_PENDING, "") as String
     }.getOrDefault("")
 
-    /** `empty`, `partial` (a restore that crashed after adding the account) or `provisioned`. */
-    internal fun state(host: FactoryBaselineHost): String = when {
-        host.checkin().androidId > 0 -> "provisioned"
-        host.googleAccounts().any(host::isDevice) -> "partial"
-        else -> "empty"
+    /**
+     * `empty`, `partial` (a restore that stopped before it finished) or `provisioned`. The identity is read before the
+     * marker: a restore commits the two together and clears the marker last, so an identity followed by no marker can
+     * only be a finished restore, even when a running one commits between these two reads.
+     */
+    internal fun state(host: FactoryBaselineHost): String {
+        val androidId = host.checkin().androidId
+        return when {
+            host.restoreMarker() != null -> "partial"
+            androidId > 0 -> "provisioned"
+            host.googleAccounts().any(host::isDevice) -> "partial"
+            else -> "empty"
+        }
     }
 
     internal fun seal(host: FactoryBaselineHost) {
         val payload = buildPayload(host) ?: return
         try {
+            // Core is still restoring from the baseline it holds; a half-finished restore does not replace it.
+            if (host.restoreMarker() != null) return
             val digest = sha256(payload)
             if (host.sealedDigest() == digest) return
             when (host.corePin()) {
@@ -159,20 +196,45 @@ object FactoryBaseline {
         return encode(baseline).takeIf { parse(it) != null }
     }
 
-    /** Applies a sealed baseline to a wiped microG. The check-in identity is written last. */
+    /**
+     * Applies a sealed baseline to a wiped microG: the account and receipt, then the identity with a marker in one commit,
+     * then push and check-in. The marker stays until both are durably on, so a restore that stops early reads as `partial`
+     * and the next attempt finishes it. Never waits for the lock: Core bounds this call and retries `busy`.
+     */
     internal fun restore(host: FactoryBaselineHost, payload: ByteArray): String {
         val baseline = parse(payload) ?: return INVALID_BASELINE
-        // CheckinManager.checkin holds this lock, so a check-in in flight cannot write a second identity over this one.
-        val outcome = synchronized(CheckinManager::class.java) { applyIdentity(host, baseline) }
-        if (outcome == APPLIED) {
-            host.enableGcm()
-            host.enableCheckin()
+        return try {
+            host.tryCheckinLock { restoreLocked(host, baseline) } ?: BUSY
+        } catch (e: Exception) {
+            // The class name only. Whatever was saved stays, and the next attempt resumes from it.
+            Log.w(TAG, "Restore deferred: ${e.javaClass.simpleName}")
+            BUSY
         }
+    }
+
+    private fun restoreLocked(host: FactoryBaselineHost, baseline: Baseline): String {
+        val stored = host.checkin().androidId
+        val marker = host.restoreMarker()
+        if (stored > 0) {
+            if (marker == null) return TARGET_PROVISIONED
+            // An earlier restore stopped after saving its identity. Finish it whatever this payload holds: the identity
+            // on disk is never replaced, and only the same baseline counts as applied.
+            finishRestore(host)
+            return if (marker == baseline.enrollmentKey && stored == baseline.androidId) APPLIED else TARGET_PROVISIONED
+        }
+        if (marker != null) host.clearRestoreMarker()
+        val outcome = applyIdentity(host, baseline)
+        if (outcome == APPLIED) finishRestore(host)
         return outcome
     }
 
+    private fun finishRestore(host: FactoryBaselineHost) {
+        host.enableGcm()
+        host.enableCheckin()
+        host.clearRestoreMarker()
+    }
+
     private fun applyIdentity(host: FactoryBaselineHost, baseline: Baseline): String {
-        if (host.checkin().androidId > 0) return TARGET_PROVISIONED
         val accounts = host.googleAccounts()
         val devices = accounts.filter(host::isDevice)
         if (devices.any { it.name != baseline.name }) return TARGET_PROVISIONED
@@ -198,7 +260,8 @@ object FactoryBaseline {
                 SettingsContract.CheckIn.INITIAL_DIGEST,
                 baseline.versionInfo,
                 baseline.deviceDataVersionInfo,
-            )
+            ),
+            baseline.enrollmentKey,
         )
         return APPLIED
     }
@@ -340,7 +403,13 @@ internal interface FactoryBaselineHost {
     fun addAccount(account: Account, masterToken: String, userData: Map<String, String>): Boolean
     fun hideFromApps()
     fun restoreEnrollment(key: String): Boolean
-    fun writeCheckin(info: LastCheckinInfo)
+    /** Saves the identity and the restore marker in one durable commit, or throws. */
+    fun writeCheckin(info: LastCheckinInfo, restoreMarker: String)
+    fun restoreMarker(): String?
+    fun clearRestoreMarker()
+    /** Runs [block] holding the cross-process check-in lock, or returns null at once when it is taken. */
+    fun tryCheckinLock(block: () -> String): String?
+    /** Both save the flag durably before returning, or throw. */
     fun enableGcm()
     fun enableCheckin()
 }
@@ -376,10 +445,21 @@ internal class AndroidFactoryBaselineHost(private val context: Context) : Factor
 
     override fun hideFromApps() = DeviceAccount.hideFromApps(context)
     override fun restoreEnrollment(key: String) = EnrollmentSession.restoreAccepted(context, key)
-    override fun writeCheckin(info: LastCheckinInfo) {
-        info.write(context)
+    override fun writeCheckin(info: LastCheckinInfo, restoreMarker: String) {
+        info.write(context, restoreMarker)
     }
 
-    override fun enableGcm() = GcmPrefs.setEnabled(context, true)
-    override fun enableCheckin() = CheckinPreferences.setEnabled(context, true)
+    override fun restoreMarker() = LastCheckinInfo.restoreMarker(context)
+    override fun clearRestoreMarker() = LastCheckinInfo.clearRestoreMarker(context)
+    override fun tryCheckinLock(block: () -> String): String? {
+        val held = CheckinLock.tryAcquire(FactoryBaseline.lockFile(context)) ?: return null
+        try {
+            return block()
+        } finally {
+            held.release()
+        }
+    }
+
+    override fun enableGcm() = GcmPrefs.enableDurably(context)
+    override fun enableCheckin() = CheckinPreferences.enableDurably(context)
 }
