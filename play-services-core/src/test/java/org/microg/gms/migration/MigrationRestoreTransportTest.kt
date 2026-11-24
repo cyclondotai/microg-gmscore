@@ -121,22 +121,44 @@ class MigrationRestoreTransportTest {
         startWrite(batch1, "com.example.two")
         startWrite(batch1, "com.example.three")
         val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
-        // Drop batch2 during staging completely; MigrationBackupTransport.getAvailableRestoreSets() returns null
-        // while delivery still fails (keeping restore retryable) and then recovers publication with batchSeq=2.
+        // Drop batch2 during staging completely; MigrationBackupTransport.getAvailableRestoreSets() still returns
+        // the staged RestoreSet (so Switch tx 6 system restore never aborts), tagging device="D2D:pending" while
+        // publication fails and returning device="D2D" once publication recovers with batchSeq=2 + original timestamp.
+        val store = MigrationArtifactStore(context)
+        store.file("@pm@").writeBytes(byteArrayOf(1))
+        store.file("restore_token_file").writeText("1")
         trusted.failNextBatchStarted = 2
         startWrite(batch2, "com.example.one")
+        store.file("@pm@").writeBytes(byteArrayOf(1))
+        store.file("restore_token_file").writeText("1")
         val transport = org.microg.gms.migration.backup.MigrationBackupTransport(context)
         try {
-            assertNull("unpublished batch must signal retryable transport error", transport.getAvailableRestoreSets())
-            assertNotNull("recovered batch publication proceeds normally", transport.getAvailableRestoreSets())
+            val pendingSets = transport.getAvailableRestoreSets()
+            assertEquals(1, pendingSets.size)
+            assertEquals(1L, pendingSets[0].token)
+            assertEquals("D2D:pending", pendingSets[0].device)
+
+            val recoveredSets = transport.getAvailableRestoreSets()
+            assertEquals(1, recoveredSets.size)
+            assertEquals(1L, recoveredSets[0].token)
+            assertEquals("D2D", recoveredSets[0].device)
         } finally {
             transport.close()
         }
         assertEquals(listOf(1L, 1L, 2L, 2L, 2L), trusted.batchSeqs)
+        assertTrue("batchStarted retries must preserve original staging timestamp", trusted.batchStagedElapsed.all { it >= 0L })
+        assertEquals(trusted.batchStagedElapsed[2], trusted.batchStagedElapsed[3])
+        assertEquals(trusted.batchStagedElapsed[3], trusted.batchStagedElapsed[4])
 
-        // Older companion throwing on unknown method never fails staging and returns false.
+        // Older companion replying Bundle(success=false) for unknown "batchStarted" settles cleanly without
+        // breaking Switch's system restore or looping forever.
+        trusted.success = false
+        assertTrue(MigrationRestoreTransport(context).notifyBatchStarted(98L, 0, 100L))
+        trusted.success = true
+
+        // Companion throwing on unknown method never fails staging and returns false (transient).
         trusted.failure = IllegalArgumentException("unknown")
-        assertFalse(MigrationRestoreTransport(context).notifyBatchStarted(99L))
+        assertFalse(MigrationRestoreTransport(context).notifyBatchStarted(99L, 0, 100L))
     }
 }
 
@@ -158,6 +180,7 @@ internal class RestoreTransportProvider : ContentProvider() {
     var failNextBatchStarted = 0
     val calls = mutableListOf<Pair<String, String?>>()
     val batchSeqs = mutableListOf<Long>()
+    val batchStagedElapsed = mutableListOf<Long>()
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
         calls += method to extras?.getString("lease_id")
         when (method) {
@@ -166,6 +189,7 @@ internal class RestoreTransportProvider : ContentProvider() {
                 val seq = extras?.getLong("batch_seq", -1L) ?: -1L
                 assertEquals(arg?.toLongOrNull() ?: -1L, seq)
                 batchSeqs += seq
+                batchStagedElapsed += extras?.getLong("batch_staged_elapsed", -1L) ?: -1L
                 if (failNextBatchStarted > 0) {
                     failNextBatchStarted--
                     return null

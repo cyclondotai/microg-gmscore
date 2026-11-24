@@ -27,13 +27,13 @@ internal class MigrationBackupTransport(context: Context) : BackupTransport(), C
     override fun dataManagementIntentLabel(): CharSequence? = null
     override fun getTransportFlags() = 2 // FLAG_DEVICE_TO_DEVICE_TRANSFER, not cloud/encrypted backup.
     override fun getCurrentRestoreSet() = restore.token() ?: 0L
-    override fun getAvailableRestoreSets(): Array<RestoreSet>? {
-        if (!org.microg.gms.migration.MigrationRestoreTransport(appContext).ensureBatchNotified()) {
-            // Keep post-install restore retryable until Transfer Phone acknowledges the staged batch.
-            return null
-        }
+    override fun getAvailableRestoreSets(): Array<RestoreSet> {
+        val published = org.microg.gms.migration.MigrationRestoreTransport(appContext).ensureBatchNotified()
+        val deviceTag = if (published) "D2D" else "D2D:pending"
+        // Always return the staged RestoreSet when present so Switch's system restore (tx 6) never fails;
+        // post-install single-package restore treats "D2D:pending" as retryable until publication settles.
         return restore.token()?.let {
-            arrayOf(RestoreSet("Phone transfer", "D2D", it, 2))
+            arrayOf(RestoreSet("Phone transfer", deviceTag, it, 2))
         } ?: emptyArray()
     }
     @Synchronized override fun startRestore(token: Long, packages: Array<PackageInfo>): Int = runCatching {
