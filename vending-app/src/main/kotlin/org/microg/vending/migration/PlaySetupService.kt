@@ -58,7 +58,6 @@ internal class PlaySetupProtocol(open: () -> MigrationInstallQueue,
         if (code == INTERFACE_TRANSACTION) { reply?.writeString(PlaySetupService.DESCRIPTOR); return true }
         check(trusted()) { "Untrusted Play setup caller" }
         data.enforceInterface(PlaySetupService.DESCRIPTOR)
-        val callingPid = Binder.getCallingPid()
         val identity = Binder.clearCallingIdentity()
         try {
             val result = when (code) {
@@ -75,7 +74,7 @@ internal class PlaySetupProtocol(open: () -> MigrationInstallQueue,
                 12 -> {
                     val options = readBundle(data); end(data)
                     val docs = options.getParcelableArray("documents")?.map { it as Bundle }.orEmpty()
-                    queue.recordOptions(options, callingPid)
+                    queue.recordOptions(options)
                     // Only Play application documents can be installed by the Aurora bridge.
                     if (!queue.storeReady()) storeUpdateError() else if (options.getInt("documents_type", 0) !in setOf(0, 3)) Bundle().apply {
                         putBoolean("accepted", false); putBundle("error", Bundle().apply { putString("reason", "unsupported_documents_type"); putString("exception_type", "UnsupportedOperationException") })
@@ -130,7 +129,7 @@ internal class PlaySetupProtocol(open: () -> MigrationInstallQueue,
                     Bundle()
                 }
                 19 -> { readBundle(data); end(data); queue.summary() }
-                17, 18 -> { val options = readBundle(data); end(data); queue.recordOptions(options, callingPid); Bundle() }
+                17, 18 -> { val options = readBundle(data); end(data); queue.recordOptions(options); Bundle() }
                 else -> return false
             }
             reply!!.writeNoException(); reply.writeInt(1); result.writeToParcel(reply, 0)

@@ -76,70 +76,27 @@ class MigrationAppDataRestoreTest {
             else state("downloading")
         }
         val sessionId = queue.beginTransfer()
-        queue.recordOptions(Bundle().apply { putInt("restore_source", 1) }, callingPid = 7777)
-        assertEquals(listOf("registerSession" to sessionId), provider.calls.map { it.method to it.arg })
-        assertEquals("boot=0:gen=0:pid=7777", provider.calls.single().transferId)
+        queue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
         queue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
         queue.dispatch(app, sessionId)
-        assertTrue("must not trigger restorePackage while still downloading", provider.calls.none { it.method == "restorePackage" })
+        assertTrue("must not trigger while still downloading", provider.calls.isEmpty())
 
         installed = true
         val summary = queue.summary(sessionId, reschedule = false)
         assertTrue(summary.getBoolean("all_installed"))
         assertTrue("expected async restorePackage call", provider.called.await(5, TimeUnit.SECONDS))
-        val restoreCalls = provider.calls.filter { it.method == "restorePackage" }
-        assertEquals(1, restoreCalls.size)
-        val call = restoreCalls.single()
+        assertEquals(1, provider.calls.size)
+        val call = provider.calls.single()
         assertEquals("restorePackage", call.method)
         assertEquals(app, call.arg)
         assertEquals(sessionId, call.sessionId)
-        assertEquals("boot=0:gen=0:pid=7777", call.transferId)
-        assertTrue("acknowledged v2 registration must set require_registered", call.requireRegistered)
+        assertTrue("d2d_seen_elapsed_ms must be forwarded", call.d2dSeenElapsedMs >= 0L)
         assertNotEquals("restorePackage must run off the main thread", "main", call.threadName)
 
         // Repeated summary polls do not re-trigger restorePackage for the same installed app.
         queue.summary(sessionId, reschedule = false)
         queue.summary(sessionId, reschedule = false)
-        assertEquals(1, provider.calls.count { it.method == "restorePackage" })
-    }
-
-    @Test fun failedRegistrationRetriesInsteadOfFallingBackToLegacyRestore() {
-        val provider = FakeRestoreTransportProvider(
-            response = Bundle().apply { putBoolean("ok", true); putString("status", "restored") },
-            registerFailureCount = 2,
-        )
-        installRestoreProvider(provider)
-
-        var installed = false
-        val queue = MigrationInstallQueue(context) { operation, _ ->
-            if (operation == 2) state("queued")
-            else if (installed) state("installed", installed = true, version = 12)
-            else state("downloading")
-        }
-        val sessionId = queue.beginTransfer()
-        // Initial registration during op 12 fails transiently (failure #1) — must NOT commit registration.
-        queue.recordOptions(Bundle().apply { putInt("restore_source", 1) }, callingPid = 8888)
-        queue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
-        queue.dispatch(app, sessionId)
-        assertEquals(1, provider.calls.count { it.method == "registerSession" })
-
-        // First processPendingAppDataRestores retries registerSession (failure #2) and returns retryable error
-        // without EVER calling restorePackage on the legacy path.
-        installed = true
-        queue.save(app, state("installed", installed = true, version = 12), id = sessionId)
-        // Wait for async trigger from save() to hit failure #2 (no restorePackage called).
-        val deadline = System.currentTimeMillis() + 3000
-        while (provider.calls.count { it.method == "registerSession" } < 2 && System.currentTimeMillis() < deadline) {
-            Thread.sleep(10)
-        }
-        assertEquals(2, provider.calls.count { it.method == "registerSession" })
-        assertTrue("failed registration must never call restorePackage", provider.calls.none { it.method == "restorePackage" })
-
-        // Third attempt succeeds registration and immediately invokes v2 restorePackage with require_registered=true.
-        assertTrue(queue.processPendingAppDataRestores())
-        val restoreCall = provider.calls.single { it.method == "restorePackage" }
-        assertTrue(restoreCall.requireRegistered)
-        assertEquals("boot=0:gen=0:pid=8888", restoreCall.transferId)
+        assertEquals(1, provider.calls.size)
     }
 
     @Test fun busyRestoreWhileSwitchHoldsLeaseDoesNotExhaustAttemptsAndRetriesUntilRestored() {
@@ -353,15 +310,13 @@ class MigrationAppDataRestoreTest {
         val method: String,
         val arg: String?,
         val sessionId: String?,
-        val transferId: String?,
-        val requireRegistered: Boolean,
+        val d2dSeenElapsedMs: Long,
         val threadName: String,
     )
 
     private class FakeRestoreTransportProvider(
         private val response: Bundle? = Bundle().apply { putBoolean("ok", true); putString("status", "restored") },
         private val failure: RuntimeException? = null,
-        private var registerFailureCount: Int = 0,
     ) : ContentProvider() {
         val calls = CopyOnWriteArrayList<Call>()
         val called = CountDownLatch(1)
@@ -371,15 +326,10 @@ class MigrationAppDataRestoreTest {
                 method = method,
                 arg = arg,
                 sessionId = extras?.getString("sessionId"),
-                transferId = extras?.getString(MigrationAppDataRestore.EXTRA_TRANSFER_ID),
-                requireRegistered = extras?.getBoolean(MigrationAppDataRestore.EXTRA_REQUIRE_REGISTERED, false) ?: false,
+                d2dSeenElapsedMs = extras?.getLong("d2d_seen_elapsed_ms", -1L) ?: -1L,
                 threadName = Thread.currentThread().name,
             )
-            if (method == MigrationAppDataRestore.METHOD_REGISTER_SESSION && registerFailureCount > 0) {
-                registerFailureCount--
-                throw IllegalStateException("transient registration failure")
-            }
-            if (method == MigrationAppDataRestore.METHOD_RESTORE_PACKAGE) called.countDown()
+            called.countDown()
             failure?.let { throw it }
             return response?.let(::Bundle)
         }

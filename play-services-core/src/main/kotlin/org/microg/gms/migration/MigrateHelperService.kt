@@ -37,7 +37,7 @@ class MigrateHelperService : Service() {
             require(data.createByteArray()?.contentEquals(byteArrayOf(8, 1)) == true) { "Unsupported migrate-helper version" }
             val callback = requireNotNull(data.readStrongBinder())
             data.requireEnd()
-            val helper = EmptyMigrateHelper(Binder.getCallingUid(), this@MigrateHelperService, Binder.getCallingPid())
+            val helper = EmptyMigrateHelper(Binder.getCallingUid(), this@MigrateHelperService)
             sendCallback(callback, BROKER_CALLBACK, 1) {
                 writeInt(1) // nullable Parcelable containing a protobuf byte array
                 writeByteArray(byteArrayOf(8, 1)) // field 1: broker protocol version 1
@@ -56,11 +56,7 @@ class MigrateHelperService : Service() {
     }
 }
 
-internal class EmptyMigrateHelper(
-    uid: Int,
-    private val context: Context? = null,
-    private val callingPid: Int = Binder.getCallingPid(),
-) : MigrationBinder(HELPER, uid) {
+internal class EmptyMigrateHelper(uid: Int, private val context: Context? = null) : MigrationBinder(HELPER, uid) {
     private val store by lazy { context?.let { MigrationArtifactStore(it) } }
     @Volatile private var stagingStarted = false
     private data class Write(val file: ParcelFileDescriptor, val completed: CompletableFuture<Unit>, val id: String = java.util.UUID.randomUUID().toString())
@@ -93,10 +89,7 @@ internal class EmptyMigrateHelper(
         if (!stagingStarted) {
             requireNotNull(store).startBatch()
             stagingStarted = true
-            context?.let {
-                val transferId = MigrationRestoreTransport.currentTransferId(it, callingPid)
-                MigrationRestoreTransport(it).notifyBatchStarted(transferId)
-            }
+            context?.let { MigrationRestoreTransport(it).notifyBatchStarted() }
         }
     }
     private val io get() = MigrationHelperIo.executor

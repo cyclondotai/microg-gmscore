@@ -103,8 +103,8 @@ class MigrationRestoreTransportTest {
                 req.writeInt(1)
                 pfd.writeToParcel(req, android.os.Parcelable.PARCELABLE_WRITE_RETURN_VALUE)
                 req.writeStrongBinder(cb)
-                assertTrue(helper.transact(3, req, reply, 0))
-                reply.readException()
+                // Switch invokes ID2dMigrateHelper transactions one-way (FLAG_ONEWAY, where callingPid == 0 on device).
+                assertTrue(helper.transact(3, req, null, android.os.IBinder.FLAG_ONEWAY))
             } finally {
                 req.recycle()
                 reply.recycle()
@@ -113,16 +113,12 @@ class MigrationRestoreTransportTest {
             assertEquals(1, result)
         }
 
-        val batch1 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context, callingPid = 4101)
+        val batch1 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
         startWrite(batch1, "com.example.one")
         startWrite(batch1, "com.example.two")
-        val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context, callingPid = 4202)
+        val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
         startWrite(batch2, "com.example.one")
         assertEquals(listOf("batchStarted" to null, "batchStarted" to null), trusted.calls)
-        assertEquals(
-            listOf("boot=0:gen=0:pid=4101", "boot=0:gen=0:pid=4202"),
-            trusted.transferIds,
-        )
 
         // Older companion throwing on unknown method never fails staging.
         trusted.failure = IllegalArgumentException("unknown")
@@ -146,10 +142,8 @@ internal class RestoreTransportProvider : ContentProvider() {
     var nullResponse = false
     var failure: RuntimeException? = null
     val calls = mutableListOf<Pair<String, String?>>()
-    val transferIds = mutableListOf<String?>()
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
         calls += method to extras?.getString("lease_id")
-        if (method == "batchStarted") transferIds += extras?.getString("transfer_id")
         if (method == "scan_volume") assertEquals("external_primary", arg) else assertNull(arg)
         failure?.let { throw it }
         return if (nullResponse) null else Bundle().apply {
