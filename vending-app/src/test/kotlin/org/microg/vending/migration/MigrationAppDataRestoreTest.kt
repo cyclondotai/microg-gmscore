@@ -97,6 +97,87 @@ class MigrationAppDataRestoreTest {
         assertEquals(1, provider.calls.size)
     }
 
+    @Test fun busyRestoreWhileSwitchHoldsLeaseRetriesOnLaterRoundAndSucceeds() {
+        val statuses = ArrayDeque(listOf(
+            MigrationAppDataRestore.Result(ok = false, status = "busy"),
+            MigrationAppDataRestore.Result(ok = true, status = "restored"),
+        ))
+        val calls = mutableListOf<Pair<String, String>>()
+        var installed = false
+        val queue = MigrationInstallQueue(context) { operation, _ ->
+            if (operation == 2) state("queued")
+            else if (installed) state("installed", installed = true, version = 12)
+            else state("downloading")
+        }.apply {
+            appDataRestore = { pkg, sid ->
+                calls += pkg to sid
+                statuses.removeFirst()
+            }
+        }
+        val sessionId = queue.beginTransfer()
+        queue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
+        queue.dispatch(app, sessionId)
+
+        installed = true
+        queue.summary(sessionId, reschedule = false)
+        assertEquals(listOf(app to sessionId), calls)
+        assertEquals(setOf(app), queue.pendingAppDataRestores(sessionId))
+
+        // Next round retries after Switch releases the lease and clears pending on restored.
+        assertTrue(queue.dispatchRound())
+        assertEquals(listOf(app to sessionId, app to sessionId), calls)
+        assertTrue(queue.pendingAppDataRestores(sessionId).isEmpty())
+    }
+
+    @Test fun iosTransfersAndPreexistingAppsNeverTriggerAppDataRestore() {
+        val calls = mutableListOf<String>()
+        // 1. iOS cable transfer (restore_source=5) never triggers Android app-data restore.
+        var installed = false
+        val iosQueue = MigrationInstallQueue(context) { operation, _ ->
+            if (operation == 2) state("queued")
+            else if (installed) state("installed", installed = true, version = 12)
+            else state("downloading")
+        }.apply { appDataRestore = { pkg, _ -> calls += pkg; MigrationAppDataRestore.Result(true, "restored") } }
+        val iosSession = iosQueue.beginTransfer()
+        iosQueue.recordOptions(Bundle().apply { putInt("restore_source", 5) })
+        iosQueue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
+        iosQueue.dispatch(app, iosSession)
+        installed = true
+        iosQueue.summary(iosSession, reschedule = false)
+        assertTrue("iOS transfer must not call restorePackage", calls.isEmpty())
+
+        // 2. App already installed on the phone before dispatch never triggers restorePackage.
+        val preexistingQueue = MigrationInstallQueue(context) { _, _ ->
+            state("installed", installed = true, version = 12)
+        }.apply { appDataRestore = { pkg, _ -> calls += pkg; MigrationAppDataRestore.Result(true, "restored") } }
+        val a2aSession = preexistingQueue.beginTransfer()
+        preexistingQueue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
+        preexistingQueue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
+        preexistingQueue.dispatch(app, a2aSession)
+        preexistingQueue.summary(a2aSession, reschedule = false)
+        assertTrue("preexisting app must not overwrite owner's live data", calls.isEmpty())
+
+        // 3. Stale transfer's pending restore is dropped when a newer transfer begins.
+        var newerInstalled = false
+        val staleQueue = MigrationInstallQueue(context) { operation, _ ->
+            if (operation == 2) state("queued")
+            else if (newerInstalled) state("installed", installed = true, version = 12)
+            else state("downloading")
+        }.apply { appDataRestore = { pkg, _ -> calls += pkg; MigrationAppDataRestore.Result(false, "busy") } }
+        val firstSession = staleQueue.beginTransfer()
+        staleQueue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
+        staleQueue.dispatch(app, firstSession)
+        newerInstalled = true
+        staleQueue.summary(firstSession, reschedule = false)
+        assertEquals(setOf(app), staleQueue.pendingAppDataRestores(firstSession))
+        val secondSession = staleQueue.beginTransfer()
+        assertNotEquals(firstSession, secondSession)
+        calls.clear()
+        assertTrue(staleQueue.processPendingAppDataRestores())
+        assertTrue("stale session restore must not consult new session's staging dir", calls.isEmpty())
+        assertTrue(staleQueue.pendingAppDataRestores(firstSession).isEmpty())
+    }
+
     @Test fun absentOrUntrustedProviderIsGracefulNoOpWithoutFailingInstall() {
         // Provider not registered at all -> graceful unsupported no-op.
         val missingResult = MigrationAppDataRestore.restorePackage(context, app, "session-1")

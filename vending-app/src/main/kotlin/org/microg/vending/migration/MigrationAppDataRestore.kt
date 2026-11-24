@@ -29,12 +29,22 @@ internal object MigrationAppDataRestore {
         Thread(runnable, "migration-app-data-restore").apply { isDaemon = true }
     }
 
-    fun triggerAsync(context: Context, packageName: String, sessionId: String? = null) {
+    fun triggerAsync(
+        context: Context,
+        packageName: String,
+        sessionId: String? = null,
+        onResult: ((Result) -> Unit)? = null,
+    ) {
         val appContext = context.applicationContext ?: context
-        if (resolveTrustedAuthority(appContext) == null) return
+        if (resolveTrustedAuthority(appContext) == null) {
+            onResult?.invoke(Result(ok = false, status = "unsupported"))
+            return
+        }
         executor.execute {
-            runCatching { restorePackage(appContext, packageName, sessionId) }
+            val result = runCatching { restorePackage(appContext, packageName, sessionId) }
                 .onFailure { Log.w(TAG, "Post-install app-data restore failed for $packageName", it) }
+                .getOrElse { Result(ok = false, status = "error") }
+            onResult?.invoke(result)
         }
     }
 

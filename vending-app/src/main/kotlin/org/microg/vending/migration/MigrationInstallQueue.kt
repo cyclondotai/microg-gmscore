@@ -22,7 +22,9 @@ internal class MigrationInstallQueue(private val context: Context,
     /** Tests: the options each faked [storeCall] request would carry to Aurora. */
     internal var sentOptions: ((Int, Bundle?) -> Unit)? = null
     /** Tests: optional override for post-install app-data restore dispatch. */
-    internal var appDataRestore: ((String, String) -> Unit)? = null
+    internal var appDataRestore: ((String, String) -> MigrationAppDataRestore.Result)? = null
+    /** Cached Aurora capabilities (op 7) for the current dispatch round so failures don't re-bind in a tight loop. */
+    @Volatile private var roundCapabilities: Bundle? = null
     private val prefs = context.getSharedPreferences("migration-installs", Context.MODE_PRIVATE)
     /** Play answered 429 since the job last cleared this; stop the round and wait before asking again. */
     @Volatile var throttled = false
@@ -76,22 +78,46 @@ internal class MigrationInstallQueue(private val context: Context,
      * setup.transfer.handoff.prioritize). Requested packages move to the front of the priority order so
      * pending and already-queued (non-downloading) apps run next right after any active download.
      */
-    fun prioritize(run: String, packages: List<String>): Bundle = synchronized(LOCK) {
-        val id = prefs.getString("handoff_session", null)
-        if (prefs.getString("handoff_run", null) != run || id == null) return Bundle().apply {
-            putBoolean("supported", true); putBoolean("accepted", false); putInt("prioritized", 0)
-        }
+    fun prioritize(run: String, packages: List<String>): Bundle {
         val wanted = packages.filter { PACKAGE.matches(it) }.distinct().take(MAX_PRIORITY)
-        val wantedSet = wanted.toSet()
-        val ordered = (wanted + priorityOrder(id).filterNot { it in wantedSet }).take(MAX_PRIORITY_TOTAL)
-        val edit = prefs.edit()
-            .putString("$id:priority_order", ordered.joinToString(","))
-            .putStringSet("$id:priority", ordered.toSet())
-        if (wanted.isNotEmpty()) edit.putBoolean("$id:priority_dirty", true)
-        check(edit.commit())
-        val open = wanted.count { isPending(id, it) || isQueuedNotActive(id, it) }
-        if (open > 0) schedule()
-        Bundle().apply { putBoolean("supported", true); putBoolean("accepted", true); putInt("prioritized", open) }
+        val hasQueued = synchronized(LOCK) {
+            val id = prefs.getString("handoff_session", null)
+            prefs.getString("handoff_run", null) == run && id != null && wanted.any { isQueuedNotActive(id, it) }
+        }
+        // Check Aurora's prioritize_downloads capability outside LOCK only when already-queued apps need store reorder.
+        val storeSupportsPrioritize = if (hasQueued) {
+            val caps = control(7, Bundle())
+            if (caps.getString("error") != "store_unavailable") {
+                val supported = caps.getBoolean("prioritize_downloads")
+                synchronized(LOCK) { prefs.edit().putBoolean("store_prioritize_supported", supported).apply() }
+                supported
+            } else {
+                prefs.getBoolean("store_prioritize_supported", false)
+            }
+        } else {
+            prefs.getBoolean("store_prioritize_supported", false)
+        }
+        return synchronized(LOCK) {
+            val id = prefs.getString("handoff_session", null)
+            if (prefs.getString("handoff_run", null) != run || id == null) return@synchronized Bundle().apply {
+                putBoolean("supported", true); putBoolean("accepted", false); putInt("prioritized", 0)
+            }
+            val wantedSet = wanted.toSet()
+            val ordered = (wanted + priorityOrder(id).filterNot { it in wantedSet }).take(MAX_PRIORITY_TOTAL)
+            val edit = prefs.edit()
+                .putString("$id:priority_order", ordered.joinToString(","))
+                .putStringSet("$id:priority", ordered.toSet())
+            if (wanted.isNotEmpty()) edit.putBoolean("$id:priority_dirty", true)
+            check(edit.commit())
+            val open = wanted.count { isPending(id, it) || (storeSupportsPrioritize && isQueuedNotActive(id, it)) }
+            if (open > 0) schedule()
+            Bundle().apply {
+                putBoolean("supported", true)
+                putBoolean("accepted", true)
+                putInt("prioritized", open)
+                putBoolean("store_prioritize_supported", storeSupportsPrioritize)
+            }
+        }
     }
     init {
         // PlaySetupService opens the queue on the main thread, which must never wait for an install in flight.
@@ -329,6 +355,69 @@ internal class MigrationInstallQueue(private val context: Context,
     /** Membership in the stored set without copying its ~300 entries; the set SharedPreferences returns is never changed. */
     private fun isPending(id: String, name: String) = prefs.getStringSet("$id:pending", null)?.contains(name) == true
     private fun isSelected(id: String, name: String) = prefs.getStringSet("$id:packages", null)?.contains(name) == true
+    fun isIosTransfer(id: String = currentSessionId().orEmpty()): Boolean =
+        prefs.getString("$id:option:restore_source", null)?.toIntOrNull() in IOS_RESTORE_SOURCES
+
+    fun pendingAppDataRestores(id: String = currentSessionId().orEmpty()): Set<String> =
+        prefs.getStringSet("$id:app_data_restore_pending", emptySet()).orEmpty().toSet()
+
+    internal fun recordAppDataRestoreResult(id: String, name: String, result: MigrationAppDataRestore.Result) {
+        synchronized(LOCK) {
+            val current = pendingAppDataRestores(id)
+            val terminal = result.status in APP_DATA_RESTORE_TERMINAL
+            val staleSession = id != currentSessionId()
+            val attempts = prefs.getInt("$id:$name:app_data_restore_attempts", 0) + 1
+            val edit = prefs.edit().putInt("$id:$name:app_data_restore_attempts", attempts)
+            if (terminal || staleSession || attempts >= MAX_APP_DATA_RESTORE_ATTEMPTS) {
+                edit.putStringSet("$id:app_data_restore_pending", current - name)
+                    .putBoolean("$id:$name:app_data_restore_done", true)
+            }
+            check(edit.commit())
+        }
+    }
+
+    /** Retries pending Android-to-Android post-install app-data restores for the current session only. */
+    fun processPendingAppDataRestores(cancelled: () -> Boolean = { false }): Boolean {
+        val currentId = currentSessionId() ?: return true
+        // Drop stale pending restores from older transfers so they never read a newer transfer's staging directory.
+        synchronized(LOCK) {
+            for (oldId in sessions()) {
+                if (oldId != currentId && pendingAppDataRestores(oldId).isNotEmpty()) {
+                    check(prefs.edit().remove("$oldId:app_data_restore_pending").commit())
+                }
+            }
+        }
+        if (isIosTransfer(currentId)) {
+            synchronized(LOCK) {
+                if (pendingAppDataRestores(currentId).isNotEmpty()) {
+                    check(prefs.edit().remove("$currentId:app_data_restore_pending").commit())
+                }
+            }
+            return true
+        }
+        val names = synchronized(LOCK) { pendingAppDataRestores(currentId).sorted() }
+        var settled = true
+        for (name in names) {
+            if (cancelled()) return false
+            val restoreKey = key(currentId, name)
+            if (!RESTORE_IN_FLIGHT.add(restoreKey)) {
+                settled = false
+                continue
+            }
+            val result = try {
+                appDataRestore?.invoke(name, currentId)
+                    ?: MigrationAppDataRestore.restorePackage(context, name, currentId)
+            } finally {
+                RESTORE_IN_FLIGHT.remove(restoreKey)
+            }
+            recordAppDataRestoreResult(currentId, name, result)
+            if (result.status !in APP_DATA_RESTORE_TERMINAL && name in pendingAppDataRestores(currentId)) {
+                settled = false
+            }
+        }
+        return settled
+    }
+
     fun save(name: String, result: Bundle, dispatched: Boolean = false, id: String = session()) {
         var triggerRestore = false
         synchronized(LOCK) {
@@ -341,11 +430,24 @@ internal class MigrationInstallQueue(private val context: Context,
             edit.putBoolean("$id:$name:terminal", result.getBoolean("terminal"))
             edit.putLong("$id:$name:installedVersion", result.getLong("installed_version_code"))
             val nowInstalled = result.getBoolean("installed") && result.getLong("installed_version_code") >= expectedVersion(id, name)
-            if (nowInstalled) {
+            if (!nowInstalled) {
+                if (!result.getBoolean("installed") && !result.getBoolean("package_present")) {
+                    edit.putBoolean("$id:$name:observed_not_installed", true)
+                }
+            } else {
                 edit.putBoolean("$id:$name:ever_installed", true)
-                if (!prefs.getBoolean("$id:$name:app_data_restore_requested", false)) {
-                    edit.putBoolean("$id:$name:app_data_restore_requested", true)
-                    triggerRestore = true
+                val installedByThisTransfer = prefs.getBoolean("$id:$name:install_dispatched", false) ||
+                    prefs.getBoolean("$id:$name:observed_not_installed", false)
+                val preexisting = prefs.getBoolean("$id:$name:preexisting", false)
+                if (installedByThisTransfer && !preexisting && !isIosTransfer(id) &&
+                    !prefs.getBoolean("$id:$name:app_data_restore_done", false)
+                ) {
+                    edit.putStringSet("$id:app_data_restore_pending", pendingAppDataRestores(id) + name)
+                    if (id == currentSessionId() && RESTORE_IN_FLIGHT.add(key(id, name))) {
+                        triggerRestore = true
+                    }
+                } else if (!installedByThisTransfer) {
+                    edit.putBoolean("$id:$name:preexisting", true)
                 }
             }
             if (dispatched) edit.putStringSet("$id:pending", pending(id) - name).putBoolean("$id:$name:uncertain", false)
@@ -356,7 +458,24 @@ internal class MigrationInstallQueue(private val context: Context,
             if (row(id, name) != before) bump(id, name)
         }
         if (triggerRestore) {
-            appDataRestore?.invoke(name, id) ?: MigrationAppDataRestore.triggerAsync(context, name, id)
+            val restoreKey = key(id, name)
+            val override = appDataRestore
+            if (override != null) {
+                val res = try {
+                    override.invoke(name, id)
+                } finally {
+                    RESTORE_IN_FLIGHT.remove(restoreKey)
+                }
+                recordAppDataRestoreResult(id, name, res)
+            } else {
+                MigrationAppDataRestore.triggerAsync(context, name, id) { res ->
+                    RESTORE_IN_FLIGHT.remove(restoreKey)
+                    recordAppDataRestoreResult(id, name, res)
+                    if (res.status !in APP_DATA_RESTORE_TERMINAL && name in pendingAppDataRestores(id)) {
+                        runCatching { schedule() }
+                    }
+                }
+            }
         }
     }
     /** What [save] writes for one app, to tell a change from the same receipt saved again. */
@@ -592,6 +711,16 @@ internal class MigrationInstallQueue(private val context: Context,
             putString("cyclon_hold_state", if (getBoolean("complete")) "complete" else "installing")
         }
     }
+    /** Cached Aurora capabilities for this dispatch round so an unavailable store is not re-bound per app. */
+    private fun storeCapabilities(): Bundle = roundCapabilities ?: control(7, Bundle()).also { caps ->
+        roundCapabilities = caps
+        if (caps.getString("error") != "store_unavailable") {
+            synchronized(LOCK) {
+                prefs.edit().putBoolean("store_prioritize_supported", caps.getBoolean("prioritize_downloads")).apply()
+            }
+        }
+    }
+
     /** Forwards a session's ordered priority list to Aurora when it advertises `prioritize_downloads`. */
     private fun syncStorePriority(id: String) {
         val ordered = synchronized(LOCK) {
@@ -602,7 +731,7 @@ internal class MigrationInstallQueue(private val context: Context,
             synchronized(LOCK) { check(prefs.edit().putBoolean("$id:priority_dirty", false).commit()) }
             return
         }
-        val capabilities = control(7, Bundle())
+        val capabilities = storeCapabilities()
         if (capabilities.getString("error") == "store_unavailable") return
         if (capabilities.getBoolean("prioritize_downloads")) {
             val reply = control(8, options(id).apply { putStringArrayList("packages", ArrayList(ordered)) })
@@ -621,6 +750,7 @@ internal class MigrationInstallQueue(private val context: Context,
     fun dispatchRound(cancelled: () -> Boolean = { false }, clock: () -> Long = { System.currentTimeMillis() }): Boolean {
         throttled = false
         allAccounts = null
+        roundCapabilities = null
         var settled = true
         var unfrozen: String? = null
         var checkedAt = clock()
@@ -649,6 +779,7 @@ internal class MigrationInstallQueue(private val context: Context,
                 else if (clock() - checkedAt >= SUMMARY_EVERY_MS) { summary(id, reschedule = false); checkedAt = clock() }
                 entry = next()
             }
+            if (!processPendingAppDataRestores(cancelled)) settled = false
             return settled
         } finally {
             // A stop or 429 can end the round mid-session; the next round may start with another session.
@@ -721,8 +852,15 @@ internal class MigrationInstallQueue(private val context: Context,
         } else if (needsEnqueue(name, current, id) || (ownerRetry && current.getString("status") == "awaiting_install")) {
             // Consume this single owner approval atomically before IPC. A lost reply must
             // return to review; the captured ownerRetry value applies only to this request.
-            check(prefs.edit().putBoolean("$id:$name:uncertain", true)
-                .putBoolean("$id:$name:owner_retry", false).commit())
+            val edit = prefs.edit().putBoolean("$id:$name:uncertain", true)
+                .putBoolean("$id:$name:owner_retry", false)
+            if ((current.getBoolean("installed") || current.getBoolean("package_present")) &&
+                !prefs.getBoolean("$id:$name:install_dispatched", false) &&
+                !prefs.getBoolean("$id:$name:observed_not_installed", false)
+            ) {
+                edit.putBoolean("$id:$name:preexisting", true)
+            }
+            check(edit.commit())
             val ownerAccount = prefs.getBoolean("$id:$name:owner_account", false)
             val priorityRank = priorityOrder(id).indexOf(name)
             return Request(options(id).apply {
@@ -738,6 +876,14 @@ internal class MigrationInstallQueue(private val context: Context,
                 }
             }, ownerRetry, ownerAccount, retryGen = prefs.getInt("$id:$name:retry_gen", 0))
         } else current
+        // App was already installed on the phone before FakeStore ever requested an install: mark preexisting so we
+        // never overwrite the owner's live app data with an older staged backup on a repeat transfer.
+        if (satisfies(name, result, id) &&
+            !prefs.getBoolean("$id:$name:install_dispatched", false) &&
+            !prefs.getBoolean("$id:$name:observed_not_installed", false)
+        ) {
+            check(prefs.edit().putBoolean("$id:$name:preexisting", true).commit())
+        }
         return finished(record(name, id, result, requestedInstall = false, ownerRetry = ownerRetry))
     }
     /** The bookkeeping after Aurora's answer to an install request ([dispatch]). */
@@ -793,6 +939,9 @@ internal class MigrationInstallQueue(private val context: Context,
             result = ownerReview(result, "selected_version_unavailable")
         }
         val retainTarget = olderAttempt(name, result, id) && result.getString("status") in ACTIVE
+        if (requestedInstall && !retainTarget) {
+            check(prefs.edit().putBoolean("$id:$name:install_dispatched", true).commit())
+        }
         save(name, result, dispatched = !retainTarget, id = id)
         if (retainTarget) check(prefs.edit().putBoolean("$id:$name:acknowledged", true).putBoolean("$id:$name:uncertain", false).commit())
         changed(id)
@@ -852,6 +1001,12 @@ internal class MigrationInstallQueue(private val context: Context,
         internal val LOCK = Any()
         /** Apps whose install request is with Aurora now ("session:package"); in-process, like the job and the service. */
         private val IN_FLIGHT = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        /** Apps whose post-install app-data restore RPC is currently in flight ("session:package"). */
+        private val RESTORE_IN_FLIGHT = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        /** Switch ejj.java:138-142 restore_source codes for iOS cable (5) and iOS Wi-Fi (6) transfers. */
+        private val IOS_RESTORE_SOURCES = setOf(5, 6)
+        private val APP_DATA_RESTORE_TERMINAL = setOf("restored", "no_data", "unsupported")
+        private const val MAX_APP_DATA_RESTORE_ATTEMPTS = 20
         /** Per app, how often its records changed in this process: a status asked of Aurora before a change is stale. */
         private val REVISIONS = java.util.concurrent.ConcurrentHashMap<String, Long>()
         private fun key(id: String, name: String) = "$id:$name"
@@ -915,6 +1070,8 @@ class MigrationInstallJob : JobService() {
                         }
                     }
                     MigrationSetupReceivers.publish(queue, states)
+                    if (!queue.processPendingAppDataRestores(cancelled = { cancelled.get() })) retry = true
+                    if (queue.pendingAppDataRestores().isNotEmpty()) retry = true
                     if (retry && !cancelled.get()) Thread.sleep(if (queue.throttled) 30_000 else 2000)
                 } while (retry && !cancelled.get() && System.nanoTime() < deadline)
             } catch (_: Exception) { retry = true }

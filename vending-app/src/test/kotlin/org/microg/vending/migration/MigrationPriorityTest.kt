@@ -241,4 +241,24 @@ class MigrationPriorityTest {
         queue.dispatchRound()
         assertEquals(listOf(listOf("b.queued.app", "c.pending.app", "a.active.app")), storePriorities)
     }
+
+    /** CYC-2643: when Aurora does not advertise prioritize_downloads (op 8), prioritize counts only pending apps. */
+    @Test fun prioritizeCountsOnlyPendingAppsWhenStoreLacksBinderPrioritizeOp() {
+        val queue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, _ ->
+                if (operation == 7) Bundle().apply { putBoolean("prioritize_downloads", false) } else Bundle()
+            },
+            storeCall = { _, name -> state(name, "queued") },
+        )
+        queue.beginHandoff(run, resumeOnly = false)
+        queue.select(listOf("b.queued.app", "c.pending.app").map(::doc))
+        val id = queue.currentSessionId()!!
+        queue.save("b.queued.app", state("b.queued.app", "queued"), dispatched = true, id = id)
+
+        val reply = queue.prioritize(run, listOf("b.queued.app", "c.pending.app"))
+        assertTrue(reply.getBoolean("accepted"))
+        assertFalse(reply.getBoolean("store_prioritize_supported"))
+        assertEquals(1, reply.getInt("prioritized"))
+    }
 }

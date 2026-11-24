@@ -64,6 +64,7 @@ class SwitchFlagsTest {
         SwitchFlags.TREAT_APPS_AS_NOT_COPIED_WITHOUT_GOOGLE_ACCOUNT to "false",
         SwitchFlags.IOS_ENABLE_DOWNLOADS_CABLE_D2D to "true",
         SwitchFlags.BACKUP_ENABLE_DOCUMENTS_FLAVOR_D2D to "true",
+        SwitchFlags.IOS_ENABLE_CLOCK_CALLER_IDENTITY_INTENT_EXTRA to "true",
     )
 
     private val uri get() = Uri.parse("content://com.google.android.gms.phenotype/$namespace")
@@ -131,7 +132,6 @@ class SwitchFlagsTest {
 
         // Forbidden / intentionally disabled flags must not be enabled.
         for (forbidden in listOf(
-            "Ios__enable_clock_caller_identity_intent_extra",
             "Ios__enable_cable_edited_photos",
             "Ios__enable_live_photo_cable_d2d",
             "Ios__enable_live_photo_wifi_d2d",

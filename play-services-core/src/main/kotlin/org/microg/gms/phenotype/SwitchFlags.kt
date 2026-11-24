@@ -49,9 +49,10 @@ object SwitchFlags {
     const val TREAT_APPS_AS_NOT_COPIED_WITHOUT_GOOGLE_ACCOUNT =
         "OsMigration__treat_apps_as_not_copied_without_google_account"
 
-    // Approved non-media file transfer flags
+    // Approved non-media file transfer flags & clock bridge caller identity
     const val IOS_ENABLE_DOWNLOADS_CABLE_D2D = "Ios__enable_downloads_cable_d2d"
     const val BACKUP_ENABLE_DOCUMENTS_FLAVOR_D2D = "D2d__backup_enable_documents_flavor_in_d2d_migrate"
+    const val IOS_ENABLE_CLOCK_CALLER_IDENTITY_INTENT_EXTRA = "Ios__enable_clock_caller_identity_intent_extra"
 
     // Cyclon platform signing certificates (DER base64 -> lowercase hex) for Voice Memos reader auth.
     // Switch 1140078 AppDataReaderService.java:136 passes ion.signatures(2) directly to
@@ -249,10 +250,10 @@ object SwitchFlags {
     // chosen unless Ios__filter_ios_whatsapp_when_no_account is false; rfb.java:42 defaults
     // OsMigration__treat_apps_as_not_copied_without_google_account to true.
     //
-    // Do NOT enable Ios__enable_clock_caller_identity_intent_extra (must remain false so
-    // ai.cyclon.migration catches clock-app:// alarm intents), edited/live/burst photo flags,
-    // photo folders, unified contact cable, Google Messages-only flags, or obsolete encrypted
-    // message attachment flag.
+    // Do NOT enable edited/live/burst photo flags, photo folders, unified contact cable,
+    // Google Messages-only flags, or obsolete encrypted message attachment flag.
+    // Ios__enable_clock_caller_identity_intent_extra is enabled so Switch targets Cyclon's
+    // com.google.android.deskclock alarm bridge and attaches CALLER_IDENTITY for authentication.
     private fun values(namespace: String?): Map<String, Any>? =
         if (namespace == NAMESPACE) linkedMapOf(
             RESTORE_TO_GOOGLE to true,
@@ -283,6 +284,7 @@ object SwitchFlags {
             TREAT_APPS_AS_NOT_COPIED_WITHOUT_GOOGLE_ACCOUNT to false,
             IOS_ENABLE_DOWNLOADS_CABLE_D2D to true,
             BACKUP_ENABLE_DOCUMENTS_FLAVOR_D2D to true,
+            IOS_ENABLE_CLOCK_CALLER_IDENTITY_INTENT_EXTRA to true,
         ) else null
 
     @JvmStatic fun rows(namespace: String?): Map<String, String>? =
