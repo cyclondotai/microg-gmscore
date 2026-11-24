@@ -33,6 +33,7 @@ internal object MigrationAppDataRestore {
         context: Context,
         packageName: String,
         sessionId: String? = null,
+        shouldRun: () -> Boolean = { true },
         onResult: ((Result) -> Unit)? = null,
     ) {
         val appContext = context.applicationContext ?: context
@@ -41,6 +42,10 @@ internal object MigrationAppDataRestore {
             return
         }
         executor.execute {
+            if (!shouldRun()) {
+                onResult?.invoke(Result(ok = false, status = "stale_session"))
+                return@execute
+            }
             val result = runCatching { restorePackage(appContext, packageName, sessionId) }
                 .onFailure { Log.w(TAG, "Post-install app-data restore failed for $packageName", it) }
                 .getOrElse { Result(ok = false, status = "error") }

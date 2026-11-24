@@ -358,14 +358,22 @@ internal class MigrationInstallQueue(private val context: Context,
     fun isIosTransfer(id: String = currentSessionId().orEmpty()): Boolean =
         prefs.getString("$id:option:restore_source", null)?.toIntOrNull() in IOS_RESTORE_SOURCES
 
+    /** Only Android-to-Android local D2D transfers (cable=1, Wi-Fi=2, ejj.java:138-159) stage data in MigrationBackupTransport. */
+    fun isAndroidD2dTransfer(id: String = currentSessionId().orEmpty()): Boolean =
+        prefs.getString("$id:option:restore_source", null)?.toIntOrNull() in ANDROID_D2D_RESTORE_SOURCES
+
     fun pendingAppDataRestores(id: String = currentSessionId().orEmpty()): Set<String> =
         prefs.getStringSet("$id:app_data_restore_pending", emptySet()).orEmpty().toSet()
 
     internal fun recordAppDataRestoreResult(id: String, name: String, result: MigrationAppDataRestore.Result) {
         synchronized(LOCK) {
             val current = pendingAppDataRestores(id)
+            val staleSession = id != currentSessionId() || !isAndroidD2dTransfer(id)
+            if (result.status == "busy" && !staleSession) {
+                // Switch still owns the backup transport lease during the copy: keep pending without burning attempts.
+                return
+            }
             val terminal = result.status in APP_DATA_RESTORE_TERMINAL
-            val staleSession = id != currentSessionId()
             val attempts = prefs.getInt("$id:$name:app_data_restore_attempts", 0) + 1
             val edit = prefs.edit().putInt("$id:$name:app_data_restore_attempts", attempts)
             if (terminal || staleSession || attempts >= MAX_APP_DATA_RESTORE_ATTEMPTS) {
@@ -387,7 +395,7 @@ internal class MigrationInstallQueue(private val context: Context,
                 }
             }
         }
-        if (isIosTransfer(currentId)) {
+        if (!isAndroidD2dTransfer(currentId)) {
             synchronized(LOCK) {
                 if (pendingAppDataRestores(currentId).isNotEmpty()) {
                     check(prefs.edit().remove("$currentId:app_data_restore_pending").commit())
@@ -399,14 +407,19 @@ internal class MigrationInstallQueue(private val context: Context,
         var settled = true
         for (name in names) {
             if (cancelled()) return false
+            if (currentSessionId() != currentId || !isAndroidD2dTransfer(currentId)) return true
             val restoreKey = key(currentId, name)
             if (!RESTORE_IN_FLIGHT.add(restoreKey)) {
                 settled = false
                 continue
             }
             val result = try {
-                appDataRestore?.invoke(name, currentId)
-                    ?: MigrationAppDataRestore.restorePackage(context, name, currentId)
+                if (currentSessionId() != currentId || !isAndroidD2dTransfer(currentId)) {
+                    MigrationAppDataRestore.Result(ok = false, status = "stale_session")
+                } else {
+                    appDataRestore?.invoke(name, currentId)
+                        ?: MigrationAppDataRestore.restorePackage(context, name, currentId)
+                }
             } finally {
                 RESTORE_IN_FLIGHT.remove(restoreKey)
             }
@@ -431,7 +444,9 @@ internal class MigrationInstallQueue(private val context: Context,
             edit.putLong("$id:$name:installedVersion", result.getLong("installed_version_code"))
             val nowInstalled = result.getBoolean("installed") && result.getLong("installed_version_code") >= expectedVersion(id, name)
             if (!nowInstalled) {
-                if (!result.getBoolean("installed") && !result.getBoolean("package_present")) {
+                val transientReadFailure = result.getString("error") == "store_unavailable" ||
+                    result.getString("status").isNullOrEmpty() || result.getString("status") == "unknown"
+                if (!result.getBoolean("installed") && !result.getBoolean("package_present") && !transientReadFailure) {
                     edit.putBoolean("$id:$name:observed_not_installed", true)
                 }
             } else {
@@ -439,7 +454,7 @@ internal class MigrationInstallQueue(private val context: Context,
                 val installedByThisTransfer = prefs.getBoolean("$id:$name:install_dispatched", false) ||
                     prefs.getBoolean("$id:$name:observed_not_installed", false)
                 val preexisting = prefs.getBoolean("$id:$name:preexisting", false)
-                if (installedByThisTransfer && !preexisting && !isIosTransfer(id) &&
+                if (installedByThisTransfer && !preexisting && isAndroidD2dTransfer(id) &&
                     !prefs.getBoolean("$id:$name:app_data_restore_done", false)
                 ) {
                     edit.putStringSet("$id:app_data_restore_pending", pendingAppDataRestores(id) + name)
@@ -462,13 +477,22 @@ internal class MigrationInstallQueue(private val context: Context,
             val override = appDataRestore
             if (override != null) {
                 val res = try {
-                    override.invoke(name, id)
+                    if (currentSessionId() != id || !isAndroidD2dTransfer(id)) {
+                        MigrationAppDataRestore.Result(ok = false, status = "stale_session")
+                    } else {
+                        override.invoke(name, id)
+                    }
                 } finally {
                     RESTORE_IN_FLIGHT.remove(restoreKey)
                 }
                 recordAppDataRestoreResult(id, name, res)
             } else {
-                MigrationAppDataRestore.triggerAsync(context, name, id) { res ->
+                MigrationAppDataRestore.triggerAsync(
+                    context = context,
+                    packageName = name,
+                    sessionId = id,
+                    shouldRun = { currentSessionId() == id && isAndroidD2dTransfer(id) },
+                ) { res ->
                     RESTORE_IN_FLIGHT.remove(restoreKey)
                     recordAppDataRestoreResult(id, name, res)
                     if (res.status !in APP_DATA_RESTORE_TERMINAL && name in pendingAppDataRestores(id)) {
@@ -747,7 +771,11 @@ internal class MigrationInstallQueue(private val context: Context,
      * refusals of the anonymous session once more for the Google account (11-17 founders-02: eight refused apps would
      * otherwise wait for the end of a 287-app pass).
      */
-    fun dispatchRound(cancelled: () -> Boolean = { false }, clock: () -> Long = { System.currentTimeMillis() }): Boolean {
+    fun dispatchRound(
+        cancelled: () -> Boolean = { false },
+        clock: () -> Long = { System.currentTimeMillis() },
+        processRestores: Boolean = true,
+    ): Boolean {
         throttled = false
         allAccounts = null
         roundCapabilities = null
@@ -779,7 +807,7 @@ internal class MigrationInstallQueue(private val context: Context,
                 else if (clock() - checkedAt >= SUMMARY_EVERY_MS) { summary(id, reschedule = false); checkedAt = clock() }
                 entry = next()
             }
-            if (!processPendingAppDataRestores(cancelled)) settled = false
+            if (processRestores && !processPendingAppDataRestores(cancelled)) settled = false
             return settled
         } finally {
             // A stop or 429 can end the round mid-session; the next round may start with another session.
@@ -1003,9 +1031,11 @@ internal class MigrationInstallQueue(private val context: Context,
         private val IN_FLIGHT = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
         /** Apps whose post-install app-data restore RPC is currently in flight ("session:package"). */
         private val RESTORE_IN_FLIGHT = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        /** Switch ejj.java:138-159 restore_source codes for local Android-to-Android cable (1) and Wi-Fi (2) D2D transfers. */
+        private val ANDROID_D2D_RESTORE_SOURCES = setOf(1, 2)
         /** Switch ejj.java:138-142 restore_source codes for iOS cable (5) and iOS Wi-Fi (6) transfers. */
         private val IOS_RESTORE_SOURCES = setOf(5, 6)
-        private val APP_DATA_RESTORE_TERMINAL = setOf("restored", "no_data", "unsupported")
+        private val APP_DATA_RESTORE_TERMINAL = setOf("restored", "no_data", "unsupported", "stale_session")
         private const val MAX_APP_DATA_RESTORE_ATTEMPTS = 20
         /** Per app, how often its records changed in this process: a status asked of Aurora before a change is stale. */
         private val REVISIONS = java.util.concurrent.ConcurrentHashMap<String, Long>()
@@ -1051,7 +1081,7 @@ class MigrationInstallJob : JobService() {
                 val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MINUTES.toNanos(8)
                 do {
                     retry = false
-                    if (!queue.dispatchRound(cancelled = { cancelled.get() })) retry = true
+                    if (!queue.dispatchRound(cancelled = { cancelled.get() }, processRestores = false)) retry = true
                     if (cancelled.get()) return@execute
                     val states = mutableMapOf<String, Bundle>()
                     for (id in queue.sessions()) {
