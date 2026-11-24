@@ -17,6 +17,7 @@ import java.io.File
  * allowBackup/data-extraction rules, versions and restore-agent results.
  * This is not a Google cloud backup transport and never accepts backup writes. */
 internal class MigrationBackupTransport(context: Context) : BackupTransport(), Closeable {
+    private val appContext = context.applicationContext ?: context
     private val restore = StagedRestoreSet(File(context.noBackupFilesDir, "migration-staging"))
     override fun name() = "com.google.android.gms/.backup.BackupTransportService"
     override fun transportDirName() = "cyclonMigrationRestore"
@@ -26,9 +27,12 @@ internal class MigrationBackupTransport(context: Context) : BackupTransport(), C
     override fun dataManagementIntentLabel(): CharSequence? = null
     override fun getTransportFlags() = 2 // FLAG_DEVICE_TO_DEVICE_TRANSFER, not cloud/encrypted backup.
     override fun getCurrentRestoreSet() = restore.token() ?: 0L
-    override fun getAvailableRestoreSets(): Array<RestoreSet> = restore.token()?.let {
-        arrayOf(RestoreSet("Phone transfer", "D2D", it, 2))
-    } ?: emptyArray()
+    override fun getAvailableRestoreSets(): Array<RestoreSet> {
+        org.microg.gms.migration.MigrationRestoreTransport(appContext).ensureBatchNotified()
+        return restore.token()?.let {
+            arrayOf(RestoreSet("Phone transfer", "D2D", it, 2))
+        } ?: emptyArray()
+    }
     @Synchronized override fun startRestore(token: Long, packages: Array<PackageInfo>): Int = runCatching {
         val requested = packages.map { pkg ->
             val app = pkg.applicationInfo

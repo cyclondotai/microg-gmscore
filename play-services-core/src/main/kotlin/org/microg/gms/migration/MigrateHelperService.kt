@@ -74,6 +74,7 @@ internal class EmptyMigrateHelper(uid: Int, private val context: Context? = null
         }
     }
     @Synchronized private fun finishWrite(name: String, remoteSuccess: Boolean) {
+        ensureBatchNotified()
         val write = requireNotNull(writes.remove(name)) { "No migration write to complete" }
         try {
             check(remoteSuccess) { "Peer reported migration failure" }
@@ -89,8 +90,13 @@ internal class EmptyMigrateHelper(uid: Int, private val context: Context? = null
         if (!stagingStarted) {
             requireNotNull(store).startBatch()
             stagingStarted = true
-            context?.let { MigrationRestoreTransport(it).notifyBatchStarted() }
+            context?.let { MigrationRestoreTransport(it).publishNewBatch(java.util.UUID.randomUUID().toString()) }
+        } else {
+            ensureBatchNotified()
         }
+    }
+    private fun ensureBatchNotified() {
+        context?.let { MigrationRestoreTransport(it).ensureBatchNotified() }
     }
     private val io get() = MigrationHelperIo.executor
     private fun complete(callback: IBinder, action: () -> Unit) {
@@ -118,6 +124,7 @@ internal class EmptyMigrateHelper(uid: Int, private val context: Context? = null
                 val callback = requireNotNull(data.readStrongBinder()); data.requireEnd()
                 io.execute {
                     runCatching {
+                        ensureBatchNotified()
                         MigrationSystemRestore(requireNotNull(context)).start { success ->
                             runCatching { sendCallback(callback, VOID_CALLBACK, if (success) 1 else 2) }
                         }

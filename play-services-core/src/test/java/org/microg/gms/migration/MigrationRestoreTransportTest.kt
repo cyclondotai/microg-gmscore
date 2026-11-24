@@ -114,15 +114,23 @@ class MigrationRestoreTransportTest {
         }
 
         val batch1 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
+        // Drop the first batchStarted notification (simulating transient delivery failure): the next write
+        // retries with the exact same batchId and stops once acknowledged.
+        trusted.failNextBatchStarted = 1
         startWrite(batch1, "com.example.one")
         startWrite(batch1, "com.example.two")
+        startWrite(batch1, "com.example.three")
         val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
         startWrite(batch2, "com.example.one")
-        assertEquals(listOf("batchStarted" to null, "batchStarted" to null), trusted.calls)
+        assertEquals(listOf("batchStarted" to null, "batchStarted" to null, "batchStarted" to null), trusted.calls)
+        assertEquals(3, trusted.batchIds.size)
+        assertNotNull(trusted.batchIds[0])
+        assertEquals("retry must reuse the same batchId for idempotency", trusted.batchIds[0], trusted.batchIds[1])
+        assertNotEquals("new batch must emit a distinct batchId", trusted.batchIds[1], trusted.batchIds[2])
 
-        // Older companion throwing on unknown method never fails staging.
+        // Older companion throwing on unknown method never fails staging and returns false.
         trusted.failure = IllegalArgumentException("unknown")
-        MigrationRestoreTransport(context).notifyBatchStarted()
+        assertFalse(MigrationRestoreTransport(context).notifyBatchStarted("batch-old"))
     }
 }
 
@@ -141,10 +149,22 @@ internal class RestoreTransportProvider : ContentProvider() {
     var success = true
     var nullResponse = false
     var failure: RuntimeException? = null
+    var failNextBatchStarted = 0
     val calls = mutableListOf<Pair<String, String?>>()
+    val batchIds = mutableListOf<String?>()
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
         calls += method to extras?.getString("lease_id")
-        if (method == "scan_volume") assertEquals("external_primary", arg) else assertNull(arg)
+        when (method) {
+            "scan_volume" -> assertEquals("external_primary", arg)
+            "batchStarted" -> {
+                batchIds += arg
+                if (failNextBatchStarted > 0) {
+                    failNextBatchStarted--
+                    return null
+                }
+            }
+            else -> assertNull(arg)
+        }
         failure?.let { throw it }
         return if (nullResponse) null else Bundle().apply {
             putBoolean("success", success)
