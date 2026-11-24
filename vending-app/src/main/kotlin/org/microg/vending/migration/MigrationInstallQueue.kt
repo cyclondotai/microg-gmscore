@@ -506,29 +506,43 @@ internal class MigrationInstallQueue(private val context: Context,
             }
             return true
         }
-        val names = synchronized(LOCK) { pendingAppDataRestores(currentId).sorted() }
+        val names = synchronized(LOCK) {
+            val rank = priorityOrder(currentId).withIndex().associate { (i, pkg) -> pkg to i }
+            pendingAppDataRestores(currentId).sortedWith(compareBy({ rank[it] ?: Int.MAX_VALUE }, { it }))
+        }
         val d2dBoot = prefs.getInt("$currentId:d2d_seen_boot_count", -1)
         val d2dElapsed = prefs.getLong("$currentId:d2d_seen_elapsed_ms", -1L)
         var settled = true
         for (name in names) {
             if (cancelled()) return false
-            if (currentSessionId() != currentId || !isAppDataRestoreEligible(currentId)) return true
             val restoreKey = key(currentId, name)
-            if (!RESTORE_IN_FLIGHT.add(restoreKey)) {
-                settled = false
-                continue
+            val claimed = synchronized(LOCK) {
+                if (currentSessionId() != currentId || !isAppDataRestoreEligible(currentId)) return true
+                if (name !in pendingAppDataRestores(currentId) ||
+                    prefs.getBoolean("$currentId:$name:app_data_restore_done", false)
+                ) {
+                    return@synchronized false
+                }
+                if (!RESTORE_IN_FLIGHT.add(restoreKey)) {
+                    settled = false
+                    return@synchronized false
+                }
+                true
             }
+            if (!claimed) continue
             val result = try {
-                if (currentSessionId() != currentId || !isAppDataRestoreEligible(currentId)) {
+                val res = if (currentSessionId() != currentId || !isAppDataRestoreEligible(currentId)) {
                     MigrationAppDataRestore.Result(ok = false, status = "stale_session")
                 } else {
                     appDataRestore?.invoke(name, currentId)
                         ?: MigrationAppDataRestore.restorePackage(context, name, currentId, d2dBoot, d2dElapsed)
                 }
+                // Commit settlement before releasing RESTORE_IN_FLIGHT so no concurrent caller can start a duplicate restore.
+                recordAppDataRestoreResult(currentId, name, res, nowMs = clock())
+                res
             } finally {
                 RESTORE_IN_FLIGHT.remove(restoreKey)
             }
-            recordAppDataRestoreResult(currentId, name, result, nowMs = clock())
             if (result.status !in APP_DATA_RESTORE_TERMINAL && name in pendingAppDataRestores(currentId)) {
                 settled = false
             }
@@ -581,37 +595,46 @@ internal class MigrationInstallQueue(private val context: Context,
             val restoreKey = key(id, name)
             val override = appDataRestore
             if (override != null) {
-                val res = try {
-                    if (currentSessionId() != id || !isAppDataRestoreEligible(id)) {
+                try {
+                    val res = if (currentSessionId() != id || !isAppDataRestoreEligible(id)) {
                         MigrationAppDataRestore.Result(ok = false, status = "stale_session")
                     } else {
                         override.invoke(name, id)
                     }
+                    recordAppDataRestoreResult(id, name, res)
                 } finally {
                     RESTORE_IN_FLIGHT.remove(restoreKey)
                 }
-                recordAppDataRestoreResult(id, name, res)
             } else {
                 val d2dBoot = prefs.getInt("$id:d2d_seen_boot_count", -1)
                 val d2dElapsed = prefs.getLong("$id:d2d_seen_elapsed_ms", -1L)
-                MigrationAppDataRestore.triggerAsync(
-                    context = context,
-                    packageName = name,
-                    sessionId = id,
-                    d2dSeenBootCount = d2dBoot,
-                    d2dSeenElapsedMs = d2dElapsed,
-                    shouldRun = { currentSessionId() == id && isAppDataRestoreEligible(id) },
-                ) { res ->
-                    RESTORE_IN_FLIGHT.remove(restoreKey)
-                    recordAppDataRestoreResult(id, name, res)
-                    // Never call schedule() while MigrationInstallJob is already running (JobScheduler stops and
-                    // restarts an active job on re-schedule, burning expedited quota during A2A copies).
-                    if (!MigrationInstallJob.isRunning() &&
-                        res.status !in APP_DATA_RESTORE_TERMINAL &&
-                        name in pendingAppDataRestores(id)
-                    ) {
-                        runCatching { schedule() }
+                var dispatchedAsync = false
+                try {
+                    MigrationAppDataRestore.triggerAsync(
+                        context = context,
+                        packageName = name,
+                        sessionId = id,
+                        d2dSeenBootCount = d2dBoot,
+                        d2dSeenElapsedMs = d2dElapsed,
+                        shouldRun = { currentSessionId() == id && isAppDataRestoreEligible(id) },
+                    ) { res ->
+                        try {
+                            recordAppDataRestoreResult(id, name, res)
+                        } finally {
+                            RESTORE_IN_FLIGHT.remove(restoreKey)
+                        }
+                        // Never call schedule() while MigrationInstallJob is already running (JobScheduler stops and
+                        // restarts an active job on re-schedule, burning expedited quota during A2A copies).
+                        if (!MigrationInstallJob.isRunning() &&
+                            res.status !in APP_DATA_RESTORE_TERMINAL &&
+                            name in pendingAppDataRestores(id)
+                        ) {
+                            runCatching { schedule() }
+                        }
                     }
+                    dispatchedAsync = true
+                } finally {
+                    if (!dispatchedAsync) RESTORE_IN_FLIGHT.remove(restoreKey)
                 }
             }
         }

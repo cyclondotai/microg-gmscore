@@ -45,7 +45,8 @@ internal object MigrationAppDataRestore {
             return
         }
         executor.execute {
-            if (!shouldRun()) {
+            val runAllowed = runCatching { shouldRun() }.getOrDefault(false)
+            if (!runAllowed) {
                 onResult?.invoke(Result(ok = false, status = "stale_session"))
                 return@execute
             }

@@ -410,6 +410,49 @@ class MigrationAppDataRestoreTest {
         assertEquals(listOf("installed"), queue.handoff(run2).getStringArrayList("statuses"))
     }
 
+    @Test fun concurrentRestoreCannotRunDuplicateAfterSettlementCommits() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val invocations = java.util.concurrent.atomic.AtomicInteger(0)
+        var installed = false
+        val queue = MigrationInstallQueue(context) { operation, name ->
+            Bundle().apply {
+                putString("package_name", name)
+                putString("status", if (operation == 2) "queued" else if (installed) "installed" else "downloading")
+                putBoolean("installed", installed)
+                putLong("installed_version_code", if (installed) 12 else 0)
+                putLong("version_code", 12)
+            }
+        }.apply {
+            appDataRestore = { _, _ ->
+                if (invocations.incrementAndGet() == 1) {
+                    entered.countDown()
+                    assertTrue(release.await(5, TimeUnit.SECONDS))
+                }
+                MigrationAppDataRestore.Result(ok = true, status = "restored")
+            }
+        }
+        val sessionId = queue.beginTransfer()
+        queue.recordOptions(Bundle().apply { putInt("restore_source", 1) })
+        queue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
+        queue.dispatch(app, sessionId)
+        installed = true
+
+        val first = Thread { queue.summary(sessionId, reschedule = false) }.apply { start() }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+
+        // While the first restore is in flight and across its settlement commit, concurrent retries must never run a duplicate.
+        val racer = Thread {
+            repeat(50) { queue.processPendingAppDataRestores() }
+        }.apply { start() }
+        release.countDown()
+        first.join(5_000)
+        racer.join(5_000)
+
+        assertEquals(1, invocations.get())
+        assertTrue(queue.pendingAppDataRestores(sessionId).isEmpty())
+    }
+
     private data class Call(
         val method: String,
         val arg: String?,
