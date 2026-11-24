@@ -27,8 +27,11 @@ internal class MigrationBackupTransport(context: Context) : BackupTransport(), C
     override fun dataManagementIntentLabel(): CharSequence? = null
     override fun getTransportFlags() = 2 // FLAG_DEVICE_TO_DEVICE_TRANSFER, not cloud/encrypted backup.
     override fun getCurrentRestoreSet() = restore.token() ?: 0L
-    override fun getAvailableRestoreSets(): Array<RestoreSet> {
-        org.microg.gms.migration.MigrationRestoreTransport(appContext).ensureBatchNotified()
+    override fun getAvailableRestoreSets(): Array<RestoreSet>? {
+        if (!org.microg.gms.migration.MigrationRestoreTransport(appContext).ensureBatchNotified()) {
+            // Keep post-install restore retryable until Transfer Phone acknowledges the staged batch.
+            return null
+        }
         return restore.token()?.let {
             arrayOf(RestoreSet("Phone transfer", "D2D", it, 2))
         } ?: emptyArray()

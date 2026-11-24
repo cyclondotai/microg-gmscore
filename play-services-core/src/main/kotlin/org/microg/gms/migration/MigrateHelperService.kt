@@ -90,7 +90,7 @@ internal class EmptyMigrateHelper(uid: Int, private val context: Context? = null
         if (!stagingStarted) {
             requireNotNull(store).startBatch()
             stagingStarted = true
-            context?.let { MigrationRestoreTransport(it).publishNewBatch(java.util.UUID.randomUUID().toString()) }
+            context?.let { MigrationRestoreTransport(it).publishNewBatch() }
         } else {
             ensureBatchNotified()
         }

@@ -115,22 +115,28 @@ class MigrationRestoreTransportTest {
 
         val batch1 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
         // Drop the first batchStarted notification (simulating transient delivery failure): the next write
-        // retries with the exact same batchId and stops once acknowledged.
+        // retries with the exact same monotonic batchSeq (1) and stops once acknowledged.
         trusted.failNextBatchStarted = 1
         startWrite(batch1, "com.example.one")
         startWrite(batch1, "com.example.two")
         startWrite(batch1, "com.example.three")
         val batch2 = EmptyMigrateHelper(android.os.Binder.getCallingUid(), context)
+        // Drop batch2 during staging completely; MigrationBackupTransport.getAvailableRestoreSets() returns null
+        // while delivery still fails (keeping restore retryable) and then recovers publication with batchSeq=2.
+        trusted.failNextBatchStarted = 2
         startWrite(batch2, "com.example.one")
-        assertEquals(listOf("batchStarted" to null, "batchStarted" to null, "batchStarted" to null), trusted.calls)
-        assertEquals(3, trusted.batchIds.size)
-        assertNotNull(trusted.batchIds[0])
-        assertEquals("retry must reuse the same batchId for idempotency", trusted.batchIds[0], trusted.batchIds[1])
-        assertNotEquals("new batch must emit a distinct batchId", trusted.batchIds[1], trusted.batchIds[2])
+        val transport = org.microg.gms.migration.backup.MigrationBackupTransport(context)
+        try {
+            assertNull("unpublished batch must signal retryable transport error", transport.getAvailableRestoreSets())
+            assertNotNull("recovered batch publication proceeds normally", transport.getAvailableRestoreSets())
+        } finally {
+            transport.close()
+        }
+        assertEquals(listOf(1L, 1L, 2L, 2L, 2L), trusted.batchSeqs)
 
         // Older companion throwing on unknown method never fails staging and returns false.
         trusted.failure = IllegalArgumentException("unknown")
-        assertFalse(MigrationRestoreTransport(context).notifyBatchStarted("batch-old"))
+        assertFalse(MigrationRestoreTransport(context).notifyBatchStarted(99L))
     }
 }
 
@@ -151,13 +157,15 @@ internal class RestoreTransportProvider : ContentProvider() {
     var failure: RuntimeException? = null
     var failNextBatchStarted = 0
     val calls = mutableListOf<Pair<String, String?>>()
-    val batchIds = mutableListOf<String?>()
+    val batchSeqs = mutableListOf<Long>()
     override fun call(method: String, arg: String?, extras: Bundle?): Bundle? {
         calls += method to extras?.getString("lease_id")
         when (method) {
             "scan_volume" -> assertEquals("external_primary", arg)
             "batchStarted" -> {
-                batchIds += arg
+                val seq = extras?.getLong("batch_seq", -1L) ?: -1L
+                assertEquals(arg?.toLongOrNull() ?: -1L, seq)
+                batchSeqs += seq
                 if (failNextBatchStarted > 0) {
                     failNextBatchStarted--
                     return null
