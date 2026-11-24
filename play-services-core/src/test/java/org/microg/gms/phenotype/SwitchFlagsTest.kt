@@ -16,6 +16,7 @@ import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.util.Base64
 
 @RunWith(RobolectricTestRunner::class)
 @Config(manifest = Config.NONE, sdk = [35])
@@ -24,7 +25,16 @@ class SwitchFlagsTest {
     private val namespace = "com.google.android.apps.pixelmigrate"
     private val flagName = "D2d__enable_contacts_restore_to_google_account"
     private val limitName = "backup_ios_app_matching_service_request_apps_limit"
-    private val expectedRows = mapOf(flagName to "true", limitName to "1000")
+    private val iosAppFilesName = "IosAppFilesD2d__enable_ios_app_files_d2d"
+    private val iosAppAllowlistName = "IosAppFilesD2d__app_allowlist"
+    private val filterNoAccountName = "Ios__filter_ios_whatsapp_when_no_account"
+    private val expectedRows = mapOf(
+        flagName to "true",
+        limitName to "1000",
+        iosAppFilesName to "true",
+        iosAppAllowlistName to SwitchFlags.IOS_WHATSAPP_ALLOWLIST_BASE64,
+        filterNoAccountName to "false",
+    )
     private val uri get() = Uri.parse("content://com.google.android.gms.phenotype/$namespace")
 
     private fun rows(provider: ConfigurationProvider, uri: Uri = this.uri): Map<String, String> =
@@ -48,8 +58,33 @@ class SwitchFlagsTest {
             }
         })
 
-    @Test fun directProviderReadEnablesTheGoogleDestinationPathAndRaisesTheAppMatchingLimit() {
+    @Test fun directProviderReadEnablesTheGoogleDestinationPathAppLimitAndWhatsappTransfer() {
         assertEquals(expectedRows, rows(provider))
+        val decoded = android.util.Base64.decode(expectedRows.getValue(iosAppAllowlistName), 3)
+        assertArrayEquals(Base64.getDecoder().decode(SwitchFlags.IOS_WHATSAPP_ALLOWLIST_BASE64), decoded)
+        // Parse outer imf { entries(1): ime { android_package(1), bundle_id(2), group_container(3), flavor(4) } }
+        assertEquals(0x0a, decoded[0].toInt() and 0xff)
+        val entryLen = decoded[1].toInt() and 0xff
+        assertEquals(decoded.size - 2, entryLen)
+        val fields = linkedMapOf<Int, Any>()
+        var i = 2
+        while (i < decoded.size) {
+            val tag = decoded[i++].toInt() and 0xff
+            val fieldNum = tag ushr 3
+            when (tag and 0x7) {
+                0 -> fields[fieldNum] = decoded[i++].toInt() and 0xff
+                2 -> {
+                    val len = decoded[i++].toInt() and 0xff
+                    fields[fieldNum] = String(decoded, i, len, Charsets.UTF_8)
+                    i += len
+                }
+                else -> fail("Unexpected wire type for tag $tag")
+            }
+        }
+        assertEquals("com.whatsapp", fields[1])
+        assertEquals("net.whatsapp.WhatsApp", fields[2])
+        assertEquals("group.net.whatsapp.WhatsApp.shared", fields[3])
+        assertEquals(9, fields[4])
     }
 
     @Test fun foreignAndMalformedNamespacesDoNotReceiveContactFlags() {
@@ -68,6 +103,7 @@ class SwitchFlagsTest {
     @Test fun snapshotAndCommittedServiceReadsAgreeWithTheProviderOnTypedValues() {
         val service = PhenotypeServiceImpl("com.google.android.apps.restore")
         val expected = rows(provider)
+        val expectedAllowlist = Base64.getDecoder().decode(SwitchFlags.IOS_WHATSAPP_ALLOWLIST_BASE64)
         listOf(false, true).forEach { committed ->
             var actual: Configurations? = null
             val callback = callback(if (committed) 10 else 4) { data ->
@@ -86,19 +122,26 @@ class SwitchFlagsTest {
             assertTrue(flags.getValue(flagName).bool)
             assertEquals(Flag.DATA_TYPE_LONG, flags.getValue(limitName).dataType)
             assertEquals(1000L, flags.getValue(limitName).long)
-            assertEquals(expected, flags.mapValues { (_, flag) ->
-                if (flag.dataType == Flag.DATA_TYPE_LONG) flag.long.toString() else flag.bool.toString() })
+            assertEquals(Flag.DATA_TYPE_BOOL, flags.getValue(iosAppFilesName).dataType)
+            assertTrue(flags.getValue(iosAppFilesName).bool)
+            assertEquals(Flag.DATA_TYPE_BYTES, flags.getValue(iosAppAllowlistName).dataType)
+            assertArrayEquals(expectedAllowlist, flags.getValue(iosAppAllowlistName).bytes)
+            assertEquals(Flag.DATA_TYPE_BOOL, flags.getValue(filterNoAccountName).dataType)
+            assertFalse(flags.getValue(filterNoAccountName).bool)
         }
     }
 
-    @Test fun individualFlagReadDoesNotEnableTheDefaultAccountFlagOrForeignNamespace() {
+    @Test fun individualFlagReadMatchesOnlyTheSwitchNamespaceAndFlags() {
         val service = PhenotypeServiceImpl("com.google.android.apps.restore")
-        listOf(namespace to flagName, namespace to "D2d__enable_contacts_restore_to_default_account",
-            "foreign.package" to flagName).forEach { (requestedNamespace, requestedFlag) ->
+        listOf(
+            Triple(namespace, flagName, true),
+            Triple(namespace, "other_flag", false),
+            Triple("foreign.package", flagName, false),
+        ).forEach { (requestedNamespace, requestedFlag, present) ->
             var called = false
             service.getFlag(callback(9) { data ->
                 called = true
-                if (requestedNamespace == namespace && requestedFlag == flagName) {
+                if (present) {
                     assertEquals(1, data.readInt())
                     val flag = Flag.CREATOR.createFromParcel(data)
                     assertEquals(flagName, flag.name)
@@ -120,17 +163,28 @@ class SwitchFlagsTest {
         assertEquals(expectedRows, rows(provider))
     }
 
-    @Test fun individualFlagReadReturnsTheRaisedAppMatchingLimit() {
+    @Test fun individualFlagReadReturnsTheRaisedAppMatchingLimitAndWhatsappAllowlist() {
         val service = PhenotypeServiceImpl("com.google.android.apps.restore")
-        var called = false
+        var limitCalled = false
         service.getFlag(callback(9) { data ->
-            called = true
+            limitCalled = true
             assertEquals(1, data.readInt())
             val flag = Flag.CREATOR.createFromParcel(data)
             assertEquals(limitName, flag.name)
             assertEquals(Flag.DATA_TYPE_LONG, flag.dataType)
             assertEquals(1000L, flag.long)
         }, namespace, limitName, Flag.DATA_TYPE_LONG)
-        assertTrue(called)
+        assertTrue(limitCalled)
+
+        var allowlistCalled = false
+        service.getFlag(callback(9) { data ->
+            allowlistCalled = true
+            assertEquals(1, data.readInt())
+            val flag = Flag.CREATOR.createFromParcel(data)
+            assertEquals(iosAppAllowlistName, flag.name)
+            assertEquals(Flag.DATA_TYPE_BYTES, flag.dataType)
+            assertArrayEquals(Base64.getDecoder().decode(SwitchFlags.IOS_WHATSAPP_ALLOWLIST_BASE64), flag.bytes)
+        }, namespace, iosAppAllowlistName, Flag.DATA_TYPE_BYTES)
+        assertTrue(allowlistCalled)
     }
 }
