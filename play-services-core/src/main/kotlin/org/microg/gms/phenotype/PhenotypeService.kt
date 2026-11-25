@@ -21,6 +21,8 @@ import org.microg.gms.common.PackageUtils
 import org.microg.gms.utils.warnOnTransactionIssues
 
 private const val TAG = "PhenotypeService"
+internal const val GBOARD_PACKAGE = "com.google.android.inputmethod.latin"
+internal const val GBOARD_PHENOTYPE_PACKAGE = "$GBOARD_PACKAGE#$GBOARD_PACKAGE"
 
 class PhenotypeService : BaseService(TAG, GmsService.PHENOTYPE) {
     override fun handleServiceRequest(callback: IGmsCallbacks, request: GetServiceRequest?, service: GmsService?) {
@@ -99,7 +101,7 @@ private val CONFIGURATION_OPTIONS = mapOf(
         Flag("45644218", true, 0),
         Flag("45691184", true, 0)
     ),
-    PhenotypeUpdateReceiver.GBOARD_PHENOTYPE_PACKAGE to arrayOf(
+    GBOARD_PHENOTYPE_PACKAGE to arrayOf(
         // Enable Gboard's DeviceIntelligenceExtension so Gboard creates inline autofill
         // suggestion requests (password managers in the suggestion strip, CYC-3212).
         Flag("enable_device_intelligence", true, 0),
@@ -231,18 +233,22 @@ class PhenotypeServiceImpl(val packageName: String?, private val context: Contex
         })))
     }
 
-    override fun getConfigurationSnapshotWithToken(callbacks: IPhenotypeCallbacks, packageName: String?, user: String?, p3: String?) {
-        Log.d(TAG, "getConfigurationSnapshotWithToken($packageName, $user, $p3)")
+    private fun configurationsFor(packageName: String?): Configurations {
         val resolvedFlags = localFolsomFlags(packageName) ?: CONFIGURATION_OPTIONS[packageName]
-        if (resolvedFlags != null) {
-            callbacks.onConfiguration(Status.SUCCESS, configurationsResult(arrayOf(Configuration().apply {
+        return if (resolvedFlags != null) {
+            configurationsResult(arrayOf(Configuration().apply {
                 id = 0
                 flags = resolvedFlags
                 removeNames = emptyArray()
-            })))
+            }))
         } else {
-            callbacks.onConfiguration(Status.SUCCESS, configurationsResult())
+            configurationsResult()
         }
+    }
+
+    override fun getConfigurationSnapshotWithToken(callbacks: IPhenotypeCallbacks, packageName: String?, user: String?, p3: String?) {
+        Log.d(TAG, "getConfigurationSnapshotWithToken($packageName, $user, $p3)")
+        callbacks.onConfiguration(Status.SUCCESS, configurationsFor(packageName))
     }
 
     override fun syncAfterOperation(callbacks: IPhenotypeCallbacks, packageName: String?, version: Long) {
@@ -252,7 +258,7 @@ class PhenotypeServiceImpl(val packageName: String?, private val context: Contex
 
     override fun registerSync(callbacks: IPhenotypeCallbacks, packageName: String?, version: Int, p3: Array<out String>?, p4: ByteArray?, p5: String?, p6: String?) {
         Log.d(TAG, "registerSync($packageName, $version, $p3, $p4, $p5, $p6)")
-        callbacks.onConfiguration(Status.SUCCESS, configurationsResult())
+        callbacks.onConfiguration(Status.SUCCESS, configurationsFor(packageName))
     }
 
     override fun setFlagOverrides(callbacks: IPhenotypeCallbacks, packageName: String?, user: String?, flagName: String?, flagType: Int, flagDataType: Int, flagValue: String?) {
@@ -302,7 +308,8 @@ class PhenotypeServiceImpl(val packageName: String?, private val context: Contex
     }
 
     override fun setRuntimeProperties(callbacks: IStatusCallback?, p1: String?, p2: ByteArray?) {
-        Log.d(TAG, "Not yet implemented: setRuntimeProperties")
+        Log.d(TAG, "setRuntimeProperties($p1)")
+        callbacks?.onResult(Status.SUCCESS)
     }
 
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean =
