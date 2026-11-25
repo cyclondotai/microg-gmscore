@@ -37,6 +37,7 @@ import javax.xml.parsers.DocumentBuilderFactory
 class GboardPhenotypeFlagsTest {
     private val serviceDescriptor = "com.google.android.gms.phenotype.internal.IPhenotypeService"
     private val callbacksDescriptor = "com.google.android.gms.phenotype.internal.IPhenotypeCallbacks"
+    private val statusCallbackDescriptor = "com.google.android.gms.common.api.internal.IStatusCallback"
     private val gboardPackage = "com.google.android.inputmethod.latin"
     private val gboardNamespace = "com.google.android.inputmethod.latin#com.google.android.inputmethod.latin"
     private val updateAction = "com.google.android.gms.phenotype.UPDATE"
@@ -177,11 +178,20 @@ class GboardPhenotypeFlagsTest {
     fun setRuntimePropertiesCompletesCallbackWithSuccessAndSynchronousReplyHeader() {
         val binder = PhenotypeServiceImpl(gboardPackage).asBinder()
         var statusCode: Int? = null
-        val callback = object : IStatusCallback.Stub() {
-            override fun onResult(status: Status) {
-                statusCode = status.statusCode
+        // Plain Binder (not IStatusCallback.Stub) forces IStatusCallback.Stub.Proxy so the test
+        // exercises the outgoing Binder transaction, descriptor, tx code, flags, and parcel layout.
+        val callback = IStatusCallback.Stub.asInterface(object : Binder() {
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                data.enforceInterface(statusCallbackDescriptor)
+                assertEquals(IBinder.FIRST_CALL_TRANSACTION, code)
+                assertEquals(0, flags)
+                assertEquals(1, data.readInt())
+                statusCode = Status.CREATOR.createFromParcel(data).statusCode
+                assertEquals(0, data.dataAvail())
+                reply?.writeNoException()
+                return true
             }
-        }
+        })
         transactSync(binder, txSetRuntimeProperties) { data ->
             data.writeStrongInterface(callback)
             data.writeString(gboardNamespace)
