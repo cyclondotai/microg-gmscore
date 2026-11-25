@@ -24,9 +24,11 @@ private const val TAG = "PhenotypeUpdateReceiver"
  * `com.google.android.gms.permission.PHENOTYPE_UPDATE_BROADCAST`, which microG intentionally does
  * not declare (a cold Gboard process fetches flags on `ON_CREATE` at startup anyway).
  *
- * Sends one immediate broadcast plus a single bounded follow-up after [FOLLOW_UP_DELAY_MS] so an
- * already in-flight Gboard fetch (`PhenotypeModule` coalesces concurrent triggers) reading the
- * prior APK's snapshot cannot swallow the only invalidation.
+ * On `MY_PACKAGE_REPLACED`, sends one immediate broadcast plus a single best-effort follow-up
+ * after [FOLLOW_UP_DELAY_MS] via `goAsync()` to recover if Gboard's `PhenotypeModule` was already
+ * running a fetch against the prior APK and coalesced the immediate trigger. On `BOOT_COMPLETED`,
+ * sends only the immediate broadcast with no `goAsync()` hold so Android's ordered boot broadcast
+ * is not delayed for downstream receivers.
  */
 class PhenotypeUpdateReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
@@ -34,10 +36,16 @@ class PhenotypeUpdateReceiver : BroadcastReceiver() {
         if (action !in TRIGGER_ACTIONS) return
         val appContext = context.applicationContext ?: context
         sendGboardUpdate(appContext, action)
+        if (action == Intent.ACTION_MY_PACKAGE_REPLACED) {
+            scheduleFollowUp(appContext, action)
+        }
+    }
+
+    private fun scheduleFollowUp(context: Context, action: String) {
         val pendingResult = goAsync()
         val posted = Handler(Looper.getMainLooper()).postDelayed({
             try {
-                sendGboardUpdate(appContext, "$action/follow-up")
+                sendGboardUpdate(context, "$action/follow-up")
             } finally {
                 pendingResult?.finish()
             }

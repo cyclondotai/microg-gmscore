@@ -6,6 +6,7 @@
 package org.microg.gms.phenotype
 
 import android.content.Context
+import android.os.IBinder
 import android.os.Parcel
 import android.util.Log
 import com.google.android.gms.common.api.Status
@@ -313,5 +314,12 @@ class PhenotypeServiceImpl(val packageName: String?, private val context: Contex
     }
 
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean =
-        warnOnTransactionIssues(code, reply, flags, TAG) { super.onTransact(code, data, reply, flags) }
+        warnOnTransactionIssues(code, reply, flags, TAG) {
+            super.onTransact(code, data, reply, flags).also { handled ->
+                if (handled && code in IBinder.FIRST_CALL_TRANSACTION..IBinder.LAST_CALL_TRANSACTION
+                    && (flags and IBinder.FLAG_ONEWAY) == 0 && reply != null && reply.dataSize() == 0) {
+                    reply.writeNoException()
+                }
+            }
+        }
 }
