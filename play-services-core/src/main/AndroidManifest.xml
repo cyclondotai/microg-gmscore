@@ -1303,6 +1303,14 @@
             </intent-filter>
         </service>
 
+        <receiver
+            android:name="org.microg.gms.phenotype.PhenotypeUpdateReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <!-- Help -->
 
         <service

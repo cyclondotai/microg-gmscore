@@ -99,7 +99,10 @@ private val CONFIGURATION_OPTIONS = mapOf(
         Flag("45644218", true, 0),
         Flag("45691184", true, 0)
     ),
-    "com.google.android.inputmethod.latin#com.google.android.inputmethod.latin" to arrayOf(
+    PhenotypeUpdateReceiver.GBOARD_PHENOTYPE_PACKAGE to arrayOf(
+        // Enable Gboard's DeviceIntelligenceExtension so Gboard creates inline autofill
+        // suggestion requests (password managers in the suggestion strip, CYC-3212).
+        Flag("enable_device_intelligence", true, 0),
         // Enable Gboard supports voice input in other languages
         Flag("enable_voice_in_chinese", true, 0),
         Flag("enable_voice_in_japanese", true, 0),
