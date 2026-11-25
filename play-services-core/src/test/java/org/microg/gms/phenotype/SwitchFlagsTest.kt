@@ -226,19 +226,22 @@ class SwitchFlagsTest {
         }
     }
 
-    @Test fun snapshotAndCommittedServiceReadsAgreeWithTheProviderOnTypedValues() {
+    @Test fun snapshotCommittedAndRegisterSyncServiceReadsAgreeWithTheProviderOnTypedValues() {
         val service = PhenotypeServiceImpl("com.google.android.apps.restore")
         val expected = rows(provider)
         val expectedAllowlist = Base64.getDecoder().decode(SwitchFlags.IOS_APP_ALLOWLIST_BASE64)
         val expectedVoiceMemos = Base64.getDecoder().decode(SwitchFlags.IOS_VOICE_MEMOS_READER_ALLOWLIST_BASE64)
-        listOf(false, true).forEach { committed ->
+        listOf("snapshot", "committed", "registerSync").forEach { mode ->
             var actual: Configurations? = null
-            val callback = callback(if (committed) 10 else 4) { data ->
+            val callback = callback(if (mode == "committed") 10 else 4) { data ->
                 assertEquals(1, data.readInt())
                 actual = Configurations.CREATOR.createFromParcel(data)
             }
-            if (committed) service.getCommitedConfiguration(callback, namespace)
-            else service.getConfigurationSnapshot(callback, namespace, null)
+            when (mode) {
+                "committed" -> service.getCommitedConfiguration(callback, namespace)
+                "registerSync" -> service.registerSync(callback, namespace, 1, emptyArray(), ByteArray(0), null, null)
+                else -> service.getConfigurationSnapshot(callback, namespace, null)
+            }
             val configuration = requireNotNull(actual).field4.single()
             assertEquals(0, configuration.id)
             assertTrue(configuration.removeNames.isEmpty())
