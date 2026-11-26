@@ -34,7 +34,6 @@ class PasswordAgentFillActivity : PasswordOwnerActivity() {
     private var failed by mutableStateOf(false)
     private var request: PasswordAgentFillRequest? = null
     private val ownerReady = AtomicBoolean(false)
-    private val deviceAuthenticated = AtomicBoolean(false)
     private val resumed = AtomicBoolean(false)
     private val focused = AtomicBoolean(false)
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,7 +65,6 @@ class PasswordAgentFillActivity : PasswordOwnerActivity() {
     }
     override fun onOwnerAuthenticated() {
         ownerReady.set(true)
-        deviceAuthenticated.set(hasSecureScreenLock)
         val selected = request ?: return
         lifecycleScope.launch {
             try {
@@ -81,8 +79,7 @@ class PasswordAgentFillActivity : PasswordOwnerActivity() {
                             .take(100).mapNotNull { entry -> withEntry(vault, entry.id) { current ->
                                 if (current.realm != entry.data.realm || current.username != entry.data.username) return@withEntry null
                                 val state = AgentSignInAccess(this@PasswordAgentFillActivity).get(AgentSignInAccess.vaultKey(stableId), entry.id)
-                                if (state.level == AgentSignInAccess.Level.NEVER || state.requireDeviceAuthentication && !deviceAuthenticated.get()) null
-                                else Choice(account, NativePasswordSelection(account?.name, stableId, entry.id), current.username, state.incarnation)
+                                Choice(account, NativePasswordSelection(account?.name, stableId, entry.id), current.username, state.incarnation)
                             } }
                     }.getOrDefault(emptyList()) }.take(200)
                 }
@@ -110,8 +107,7 @@ class PasswordAgentFillActivity : PasswordOwnerActivity() {
                     withEntry(vault, choice.selection.entryId) { current ->
                         if (current.realm != entry.data.realm || current.username != choice.username || current.blocked) throw SecurityException()
                         AgentSignInAccess(this@PasswordAgentFillActivity).redeem(AgentSignInAccess.vaultKey(stableId),
-                            choice.selection.entryId, choice.incarnation, once = true,
-                            deviceAuthenticated = deviceAuthenticated.get() && hasSecureScreenLock) {
+                            choice.selection.entryId, choice.incarnation) {
                             if (!ownerReady.get() || !resumed.get() || !focused.get()) throw SecurityException()
                             requireOwner()
                             if (!choice.selection.matches(choice.account?.name, stableUserId(choice.account))) throw SecurityException()
@@ -142,7 +138,7 @@ class PasswordAgentFillActivity : PasswordOwnerActivity() {
     }
     private fun cancel() { request?.let { PasswordAgentFillRequests.cancel(it.handle) }; request = null; finish() }
     override fun onOwnerAuthenticationFailed() = cancel()
-    override fun onOwnerLocked() { ownerReady.set(false); deviceAuthenticated.set(false); choices = emptyList() }
+    override fun onOwnerLocked() { ownerReady.set(false); choices = emptyList() }
     override fun onDestroy() {
         request?.let { PasswordAgentFillRequests.cancel(it.handle) }
         request = null

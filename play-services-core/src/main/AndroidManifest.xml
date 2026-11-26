@@ -781,8 +781,6 @@
             android:exported="true" />
         <activity android:name="org.microg.gms.passwords.PasswordAgentFillActivity"
             android:exported="false" android:excludeFromRecents="true" />
-        <activity android:name="org.microg.gms.passwords.PasswordAgentAuthenticationActivity"
-            android:exported="false" android:excludeFromRecents="true" />
         <activity android:name="org.microg.gms.passwords.PasswordSharingActivity"
             android:exported="false" android:process=":ui" />
         <activity android:name="org.microg.gms.passwords.PasswordWifiSyncActivity"

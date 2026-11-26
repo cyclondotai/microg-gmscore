@@ -11,25 +11,18 @@ import java.util.UUID
 import java.security.MessageDigest
 
 /**
- * Whether the phone's assistant may sign in with a saved login (CYC-779). Local to this phone and never synced: a
- * login's access is the owner's choice for this device's assistant, not account data.
+ * Per-login lifetime incarnation and last-used record for Cyclon's agent sign-in path (CYC-779, CYC-3345).
  *
- * Always is the default since CYC-2136 (2026-11-14): Cyclon signs in with a saved login without Core's sheet unless the
- * owner chose Ask or Never for it. Until then Ask was the default and was stored for every login that was ever listed,
- * so the file cannot tell it from an owner's own choice: a file from before ([DEFAULT_ALWAYS] not set) has its Ask
- * entries read as Always, once. A login with "Require device authentication" stays Ask, as that setting demands.
+ * Since CYC-3345 (Thomas, 2026-11-26), Ask, Never and Require device authentication are removed from the agent sign-in
+ * path and the Passwords app: every matching saved login is treated as Always, including entries persisted with Ask,
+ * Never or requireDeviceAuthentication by earlier builds. Incarnations stay so a deleted or replaced login cannot be
+ * redeemed through an old opaque reference.
  *
  * Keys are hashes of (vault, entry tag), so the file names no site or username. Values are not secrets; only this app
- * writes them. No file yet means every login is at the default. A file that is there but cannot be read may have held
- * a Never or an authentication requirement, so it falls back to Ask, not to Always: the file started in its place is
- * marked ([UNREADABLE]) and a login without an entry in it is Ask until the owner chooses for it.
+ * writes them.
  */
 class AgentSignInAccess(context: Context, private val now: () -> Long = System::currentTimeMillis) {
-    enum class Level(val wire: String) {
-        ASK("ask"), ALWAYS("always"), NEVER("never");
-        companion object { fun of(wire: String?): Level? = values().firstOrNull { it.wire == wire } }
-    }
-    class State(val level: Level, val lastUsed: Long?, val incarnation: String, val requireDeviceAuthentication: Boolean = false)
+    class State(val lastUsed: Long?, val incarnation: String)
 
     private val directory = context.applicationContext.noBackupFilesDir
     private val file = AtomicFile(File(directory, FILE))
@@ -43,9 +36,8 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
     fun get(vault: String, tag: String): State = locked {
         val all = read()
         val key = key(vault, tag)
-        val entry = all.optJSONObject(key)
-            ?: JSONObject().put("level", (if (all.optBoolean(UNREADABLE)) Level.ASK else Level.ALWAYS).wire)
-        if (!entry.has("incarnation")) {
+        val entry = all.optJSONObject(key) ?: JSONObject()
+        if (entry.optString("incarnation").isEmpty()) {
             entry.put("incarnation", UUID.randomUUID().toString())
             entry.put("store", hash(if (vault == "local") "local-passwords-v1" else vault))
             all.put(key, entry); write(all)
@@ -53,50 +45,20 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
         state(entry)
     }
 
-    /** Called while the vault's entry lock is held. Revocations serialize with the private handover. */
-    internal fun <T> redeem(vault: String, tag: String, incarnation: String, once: Boolean, deviceAuthenticated: Boolean = false, action: () -> T): T = locked {
+    /** Called while the vault's entry lock is held. Incarnation checks serialize with the private handover. */
+    internal fun <T> redeem(vault: String, tag: String, incarnation: String, action: () -> T): T = locked {
         val all = read()
         val entry = all.optJSONObject(key(vault, tag)) ?: throw SecurityException()
         val state = state(entry)
-        if (state.incarnation != incarnation || state.level == Level.NEVER || state.level != Level.ALWAYS && !once ||
-            state.requireDeviceAuthentication && !deviceAuthenticated) throw SecurityException()
+        if (state.incarnation != incarnation) throw SecurityException()
         val result = action()
         entry.put("lastUsed", now())
         write(all)
         result
     }
 
-    private fun state(entry: JSONObject): State {
-        val required = entry.optBoolean("requireDeviceAuthentication", false)
-        val level = Level.of(entry.optString("level")) ?: Level.ASK
-        return State(if (required && level == Level.ALWAYS) Level.ASK else level,
-            entry.optLong("lastUsed", 0).takeIf { it > 0 }, entry.optString("incarnation"), required)
-    }
-
-    fun setCurrent(vault: String, tag: String, incarnation: String, level: Level) = locked {
-        val all = read()
-        val entry = all.optJSONObject(key(vault, tag)) ?: throw SecurityException()
-        val current = state(entry)
-        if (current.incarnation != incarnation || current.requireDeviceAuthentication && level == Level.ALWAYS) throw SecurityException()
-        entry.put("level", level.wire)
-        write(all)
-    }
-
-    /** Owner settings only. Core's set_access cannot remove the authentication requirement. */
-    fun setOwnerPolicy(vault: String, tag: String, incarnation: String, level: Level, requireDeviceAuthentication: Boolean) = locked {
-        val all = read()
-        val entry = all.optJSONObject(key(vault, tag)) ?: throw SecurityException()
-        val current = state(entry)
-        if (current.incarnation != incarnation) throw SecurityException()
-        if (current.requireDeviceAuthentication != requireDeviceAuthentication) {
-            // Invalidate prompts and pending authentication in both directions. An old ref
-            // must never become a more permissive capability after settings change.
-            entry.put("incarnation", UUID.randomUUID().toString())
-        }
-        entry.put("requireDeviceAuthentication", requireDeviceAuthentication)
-        entry.put("level", if (requireDeviceAuthentication && level == Level.ALWAYS) Level.ASK.wire else level.wire)
-        write(all)
-    }
+    private fun state(entry: JSONObject): State =
+        State(entry.optLong("lastUsed", 0).takeIf { it > 0 }, entry.optString("incarnation"))
 
     /**
      * Called before the encrypted vault commit while its lock is held. Tags identify a login's
@@ -133,7 +95,7 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
         }
     }
 
-    /** Drop choices as soon as an entry leaves the visible vault, including sync tombstones. */
+    /** Drop records as soon as an entry leaves the visible vault, including sync tombstones. */
     fun retain(vault: String, tags: Set<String>) = locked {
         retainUnlocked(vaultPrefix(vault), tags.map { key(vault, it) }.toSet())
     }
@@ -157,24 +119,8 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
     }
 
     private fun read(): JSONObject {
-        val unreadable = { JSONObject().put(DEFAULT_ALWAYS, true).put(UNREADABLE, true) }
-        // "No file yet" only when nothing is stored: Android also throws FileNotFoundException for a file that is there
-        // but cannot be opened (permission denied), and that one may hold a Never. The .bak is AtomicFile's older
-        // way to keep the committed copy during a write.
-        val stored = File(directory, FILE).exists() || File(directory, "$FILE.bak").exists()
-        val bytes = try { file.readFully() }
-            catch (_: Exception) { return if (stored) unreadable() else JSONObject().put(DEFAULT_ALWAYS, true) }
-        val all = runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }.getOrElse { return unreadable() }
-        if (!all.optBoolean(DEFAULT_ALWAYS)) {
-            // A file from when Ask was the default. Whoever writes next stores this with its change.
-            all.keys().asSequence().toList().forEach { key ->
-                val entry = all.optJSONObject(key) ?: return@forEach
-                if (entry.optString("level") == Level.ASK.wire && !entry.optBoolean("requireDeviceAuthentication", false))
-                    entry.put("level", Level.ALWAYS.wire)
-            }
-            all.put(DEFAULT_ALWAYS, true)
-        }
-        return all
+        val bytes = try { file.readFully() } catch (_: Exception) { return JSONObject() }
+        return runCatching { JSONObject(String(bytes, Charsets.UTF_8)) }.getOrElse { JSONObject() }
     }
 
     private fun write(value: JSONObject) {
@@ -186,12 +132,7 @@ class AgentSignInAccess(context: Context, private val now: () -> Long = System::
     companion object {
         private val LOCK = Any()
         private const val FILE = "agent-signin-access-v1.json"
-        // Two marks of the file itself. Neither can be a login's key: those are hashes with a colon.
-        /** Written by this version: Always is the default, so an Ask in the file is the owner's own choice. */
-        private const val DEFAULT_ALWAYS = "defaultAlways"
-        /** The file was started after one that could not be read: a login without an entry in it is Ask. */
-        private const val UNREADABLE = "previousUnreadable"
-        /** The vault key used in [get]/[set]: "local" for the on-device vault, "google:<user id>" for an account's. */
+        /** The vault key used in [get]/[redeem]: "local" for the on-device vault, "google:<user id>" for an account's. */
         fun vaultKey(googleUserId: String?) = if (googleUserId == null) "local" else "google:$googleUserId"
         private fun vaultPrefix(vault: String) = hash("vault:$vault").take(16) + ":"
         private fun key(vault: String, tag: String) = vaultPrefix(vault) + hash("entry:$vault|$tag")

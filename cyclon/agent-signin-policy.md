@@ -1,39 +1,20 @@
-# Per-login device authentication
+# Agent sign-in policy (CYC-779, CYC-3345)
 
-The owner controls two local properties of a saved login: Ask / Allow sign-in /
-Never, and **Require device authentication**. Allow sign-in is the default since
-CYC-2136 (2026-11-14), so Cyclon signs in without Core's sheet unless the owner
-chose Ask or Never for that login. Ask was the default until then and was stored
-for every login ever listed; such a file has its Ask entries read as Allow, once.
-A file that cannot be read falls back to Ask. Requiring authentication disables
-Allow sign-in (an existing Allow becomes Ask), preserves Never, and needs a
-configured Android screen lock. Removing the requirement does not restore an old
-Allow grant; the owner can explicitly choose a new access level. Both transitions
-rotate the incarnation so a waiting request cannot inherit a different policy.
+Since CYC-3345 (Thomas, 2026-11-26), per-login Ask / Never access and **Require device
+authentication** are removed from the agent sign-in path and the Passwords app. Any saved
+login matching the authenticated app (package, UID and single signing certificate,
+including the app's own embedded web page) or browser-verified HTTPS origin (Jelly /
+Google-signed Chrome) is treated as Always, including entries persisted with Ask, Never or
+`requireDeviceAuthentication` by earlier builds.
 
-Allow sign-in itself does not need a screen lock. On a phone with one, choosing it
-in Settings is confirmed with the lock first. On a phone without one, Settings and
-Cyclon's sign-in card both warn that anyone holding the phone can then have Cyclon
-sign in with that login (CYC-1633).
+Core receives only account metadata (`ref`, `username`, `account`, `access="always"`,
+`require_authentication=false`) and redeems over the Core-UID-only
+`PasswordAgentFillProvider`. `AgentSignInAccess` keeps per-login incarnations and
+`lastUsed` timestamps so deleting or replacing a login or vault invalidates stale opaque
+references.
 
-Core receives only account metadata, including `require_authentication`. For a
-strict login it asks the native broker to redeem and opens the returned Services
-PendingIntent. The broker keeps the selected entry and one-use request in memory;
-the Intent contains only a handle. `PasswordAgentAuthenticationActivity` displays
-the actual package or HTTPS origin and username in a fresh system biometric or device-credential
-challenge. Its native foreground/focus proof is checked again under the vault and
-grant locks immediately before the private ResultReceiver handover. An unlocked
-phone, a caller-provided boolean, restored activity state, or a stale reference is
-not authentication. Cancellation, expiry and process death invalidate the request.
-
-The legacy agent picker enforces the same Never and authentication rules. This
-does not change owner-initiated Android Autofill, which has its own authentication
-and origin checks. Grants and authentication requirements are not uploaded to
-Google. Test or device evidence is reported separately from this protocol.
-
-This policy authorizes password use only. It does not implement the additional
-confirmation gates for payments, bookings, sending messages or security changes.
-Matching Core/controller builds now have a separate authenticated local Chrome
-path bound to a main-frame document and one-use field object. Its host/component
-and device acceptance are tracked separately. The native whole-UID privacy fence
-remains in place after delivery; generic post-login continuation remains open.
+The password crosses only the private `ResultReceiver` Binder to Core native code and
+never reaches the agent, model, traces or logs. This does not change owner-initiated
+Android Autofill, which keeps its own origin checks. Matching Core/controller builds
+retain the native privacy fence and realm binding so a login is filled only into the app
+or site it was saved for.

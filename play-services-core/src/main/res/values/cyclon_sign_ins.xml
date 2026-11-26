@@ -3,7 +3,7 @@
      SPDX-License-Identifier: Apache-2.0 -->
 <resources>
     <string name="cyclon_sign_ins_title">Sign-ins for Cyclon</string>
-    <string name="cyclon_sign_ins_intro">Cyclon can sign in to apps and sites for you with your saved logins. It never sees your passwords. For each login, choose whether Cyclon asks you first, always may, or never may.</string>
+    <string name="cyclon_sign_ins_intro">Cyclon can sign in to apps and sites for you with your saved logins. It never sees your passwords.</string>
 
     <string name="cyclon_sign_ins_setup">Set up passwords</string>
     <string name="cyclon_sign_ins_setup_account">Sign in to Google</string>
@@ -17,11 +17,10 @@
     <string name="cyclon_sign_ins_add">Add a password</string>
     <string name="cyclon_sign_ins_import">Import</string>
 
-    <string name="cyclon_sign_ins_logins">What Cyclon may use</string>
-    <string name="cyclon_sign_ins_locked">Unlock to see your saved logins and choose what Cyclon may use.</string>
+    <string name="cyclon_sign_ins_logins">Saved logins</string>
+    <string name="cyclon_sign_ins_locked">Unlock to see your saved logins.</string>
     <string name="cyclon_sign_ins_none">No saved logins yet. Once you save one, it shows here.</string>
     <string name="cyclon_sign_ins_last_used">used %1$s</string>
-    <string name="cyclon_sign_ins_this_phone">These choices stay on this phone. On a new phone, Cyclon asks again for every login.</string>
 
     <string name="cyclon_sign_ins_settings">Password settings</string>
     <string name="cyclon_sign_ins_all_passwords">All saved passwords</string>
