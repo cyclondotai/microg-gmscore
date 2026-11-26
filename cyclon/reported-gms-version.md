@@ -19,32 +19,70 @@ bind that API instead of an older path. If microG does not implement the newer A
 a feature that works today stops working. So the version only rises as far as the
 APIs microG serves.
 
-## Current choice: 25.41.32 (2026-10-25)
+## Current choice: 26.45.31 (2026-11-25, CYC-3296)
 
-`tools/scan-gms-min-versions.py APK` lists every Play services client in an APK with
-its minimum version. Ten current Google apps (Switch 1140078, Maps, Gmail, Photos,
-YouTube, Google app, Meet, Gboard, Gemini, Authenticator; pulled from a founders
-phone) need more than 25.24 for only three APIs:
+Chrome 158 asked for a Play services update. Google's own apps are built against the
+current Play services client libraries, and their library constant
+`GOOGLE_PLAY_SERVICES_VERSION_CODE` is the minimum for a plain
+`isGooglePlayServicesAvailable(context)` check: Chrome 158's is 26.43.80 (264380000,
+also its manifest `com.google.android.gms.version`). Other apps keep `12451000` as the
+default minimum and use the newer constant only to check their own manifest. The
+reported version is 26.45.31, the Play services release (264531035) we decompiled to
+check the APIs below; `cyclon/tests` asserts the Chrome floor.
 
-| API | Service | Minimum | Clients |
+What changes for apps between 25.41.32 and 26.45.31 (Chrome, Gmail, YouTube, YouTube Music,
+Meet, Maps, Photos, Drive, Calendar, Contacts, Keep, Messages, Wallet, Google app,
+Gemini, Gboard and Authenticator from Google Play on 2026-11-25; `scan-gms-min-versions.py`
+plus a scan for version constants):
+
+| Gate | API | Who | microG |
 |---|---|---|---|
-| Notification telemetry | 449 | 25.36 | all ten |
-| Throttling telemetry | 483 | 25.36 | all ten |
-| Cloud Messaging | `cloudmessaging.service.START` | 26.12 | Maps, Photos, Gmail, Meet, Google app, YouTube |
+| 26.12 | Cloud Messaging service 457 (`cloudmessaging.service.START`, `ICloudMessagingService`: register = 1, unregister = 2; features `register` 1 and `unregister` 1) | Firebase Messaging in all scanned apps except Gboard, Gemini and Authenticator | `CloudMessagingService.kt` |
+| 26.19.30 | Credential manager transactions 4 and 5 (screen lock before filling passwords; features `credential_manager_first_party_get_biometric_reauth`/`_set_`) | Chrome | `CredentialManagerService.kt` |
+| 26.19 | Timeline backup file: semantic location history 314 transactions 14/15, callback 11, feature `odlh_backup_file` | Maps, in device-to-device transfers | `SemanticLocationHistoryService.kt`, `OdlhStorageManager.mergeSegmentsFrom` |
+| 25.45 | ServiceEntitlement 359 (TS.43 temporary token, transaction 7) | Google Messages RCS provisioning on carriers whose RCS config enables TS.43 | Not served: on such a carrier RCS setup retries (CYC-3310). Google Messages isn't on our phones |
+| 26.14 | People feature `default_contacts_account_api` 3 | Contacts' default account | Not advertised; Contacts falls back to its own setting |
+| 26.18 | Unified backup 229 (`backup.unified.service.START`) | Messages' debug menu | Not served; fails quietly |
+| 26.41 | OS media backup 439 (`OS_MEDIA_BACKUP_SERVICE`) | Photos' backup settings | Not served; Photos uses its defaults (below 26.41 it could post the update notification) |
 
-Switch also enables its `post_setup_pair` D2D feature from 25.41, which
-`SwitchSupportService` advertises. At 25.24 every Google app posted the update
-notification as soon as it reported notification telemetry.
+Drive and Calendar (26.45.30), Gemini (26.44.10), Gboard (26.42.80) and Authenticator
+(26.38.80) carry newer library constants too, but use them only for the manifest check
+and a few re-checks inside the library; 26.45.31 passes all of them. A missing service
+fails quietly (`API_UNAVAILABLE`); a served service without a feature an app asks for
+posts "Update Google Play services" after two minutes of retries, so a feature is only
+advertised with its transactions.
 
-So the reported version is 25.41.32, and services 449 and 483 accept and discard
-their reports (`ClientTelemetryService.kt`). It stays below 26.12 because microG has no
-Cloud Messaging service: above it those apps would leave the GCM path microG
-implements. `cyclon/tests` asserts that ceiling.
+### Cloud Messaging
+
+Firebase Messaging registers through service 457 only when the app's manifest sets
+`firebase_messaging_installation_id_enabled=true` **and** Play services is 26.12 or newer;
+otherwise it keeps the `com.google.android.c2dm.intent.REGISTER` path. None of the apps
+above sets the flag (2026-11-25), so their push does not change with this version.
+CYC-763's 26.12 ceiling assumed they would switch.
+
+The service takes a `RegisterRequest` (1 sender ID, 2 GMP app ID, 3 API key,
+4 Firebase installation ID, 5 installation auth token, 6 app version code, 7 SDK
+version) and answers `IRegisterCallback` (one-way 1: status, token, metadata).
+Play services turns it into a gRPC call to `fcmregistrations.googleapis.com`
+(`google.firebase.fcm.registration.v1.android.AndroidRegistration/RegisterAppInstance`,
+`play-services-core-proto/.../fcm_android_registration.proto`) with `X-Goog-Api-Key`,
+`X-Goog-Firebase-Installations-Auth` and `X-Aid-Login: androidId:securityToken`, and
+deletes with `RegistrationApi/DeleteRegistration`
+(`projects/{project}/registrations/{installation ID}`). The returned token ends with
+the installation ID, which the client library checks. Messages for it arrive on the
+same MCS connection, so the app is recorded in `GcmDatabase` like a legacy registration.
+Checked live on 2026-11-25 with Cyclon's push project: register and delete answered
+`grpc-status 0` (no `X-Android-Package` needed although that key is Android-restricted).
 
 ## Raising it again
 
-1. Scan current versions of the Google apps customers use and note every API above
-   the version you want.
+1. Scan current versions of the Google apps customers use (all split APKs) and note
+   every API above the version you want. `scan-gms-min-versions.py` finds client
+   minimums; also look for version constants compared with the installed Play services
+   version (`>= 2NNNN0000`) and for each app's `GOOGLE_PLAY_SERVICES_VERSION_CODE`. An app
+   whose constant is its default minimum (Chrome) asks for an update as soon as it is
+   built against a newer client library, so expect to raise the version again every few
+   months.
 2. Make sure microG serves each of those APIs, or that apps fall back cleanly.
 3. Set `reportedGmsVersion` and a fresh `gmsVersionCode`/`vendingVersionCode`
    allocation; it must stay above every shipped APK.
