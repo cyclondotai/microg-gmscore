@@ -4,12 +4,11 @@ package com.google.android.gms.credential.manager
 
 import org.junit.Assert.*
 import org.junit.Test
-import org.microg.gms.passwords.AgentSignInAccess
 
-/** Sign-ins for Cyclon (CYC-1594): what the page says in each state. */
+/** Sign-ins for Cyclon (CYC-1594, CYC-3345): what the page says in each state. */
 class SignInsTest {
     private val none = SignIns.Setup(account = false, autofill = false, passwords = false)
-    private val login = SignIns.Login("a", "Amazon", "owner@example.com", null, AgentSignInAccess.Level.ALWAYS, null)
+    private val login = SignIns.Login("a", "Amazon", "owner@example.com", null, null)
 
     @Test fun setupShowsOnlyWhileAStepIsUndone() {
         assertFalse(none.any)
@@ -19,11 +18,11 @@ class SignInsTest {
         assertTrue(none.copy(sync = true).any)
     }
 
-    @Test fun aLoginSaysItsUsernameChoiceAndLastUse() {
-        assertEquals("owner@example.com · Always allow · used Oct 26, 2026", SignIns.details("owner@example.com", "Always allow", "used Oct 26, 2026"))
-        assertEquals("owner · Ask each time", SignIns.details("owner", "Ask each time", null))
-        // A login saved without a username shows only Cyclon's choice.
-        assertEquals("Never", SignIns.details("", "Never", null))
+    @Test fun aLoginSaysItsUsernameAndLastUse() {
+        assertEquals("owner@example.com · used Oct 26, 2026", SignIns.details("owner@example.com", "used Oct 26, 2026"))
+        assertEquals("owner", SignIns.details("owner", null))
+        assertEquals("used Oct 26, 2026", SignIns.details("", "used Oct 26, 2026"))
+        assertNull(SignIns.details("", null))
     }
 
     @Test fun noLoginsIsSaidOnceAndNotWhileReading() {
@@ -44,16 +43,5 @@ class SignInsTest {
         assertTrue(SignIns.showsLogins(none, SignIns.Logins.Locked, busy = false))
         assertTrue(SignIns.showsLogins(none, SignIns.Logins.Choosing, busy = false))
         assertTrue(SignIns.showsLogins(none.copy(passwords = true), SignIns.Logins.Shown(listOf(login)), busy = false))
-    }
-
-    @Test fun thisPhoneNoteOnlyWhereThereAreChoices() {
-        assertTrue(SignIns.saysThisPhone(SignIns.Logins.Locked))
-        assertTrue(SignIns.saysThisPhone(SignIns.Logins.Choosing))
-        assertTrue(SignIns.saysThisPhone(SignIns.Logins.Shown(listOf(login))))
-        assertFalse(SignIns.saysThisPhone(SignIns.Logins.Shown(emptyList())))
-    }
-
-    @Test fun eachChoiceHasItsWords() {
-        assertEquals(AgentSignInAccess.Level.values().size, AgentSignInAccess.Level.values().map(SignIns::levelLabel).toSet().size)
     }
 }

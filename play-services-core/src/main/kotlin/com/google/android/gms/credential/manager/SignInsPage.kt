@@ -13,14 +13,12 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.google.android.gms.R
 import org.microg.gms.cyclon.*
-import org.microg.gms.passwords.AgentSignInAccess
 import java.text.DateFormat
 import java.util.Date
 
 /**
- * Sign-ins for Cyclon (CYC-1594): which saved logins Cyclon may sign in with, reached from Home's AI settings and by
- * voice. Setup first, only the steps still undone; then every login with its choice; then the general password
- * settings. Words only: [PasswordManagerActivity] owns the vault, the lock and the choice dialog.
+ * Sign-ins for Cyclon (CYC-1594, CYC-3345): saved logins Cyclon can sign in with, reached from Home's AI settings
+ * and by voice. Setup first, only the steps still undone; then saved logins; then the general password settings.
  */
 internal object SignIns {
     /** The extra and value that open [PasswordManagerActivity] on this page; older versions ignore it and show Passwords. */
@@ -32,8 +30,7 @@ internal object SignIns {
         val any get() = account || autofill || passwords || sync
     }
 
-    class Login(val id: String, val title: String, val username: String, val packageName: String?,
-                val level: AgentSignInAccess.Level, val lastUsed: Long?)
+    class Login(val id: String, val title: String, val username: String, val packageName: String?, val lastUsed: Long?)
 
     sealed interface Logins {
         /** The vault is locked: the owner unlocks it to see the list. */
@@ -43,8 +40,9 @@ internal object SignIns {
         class Shown(val logins: List<Login>) : Logins
     }
 
-    /** A login's line under its name: its username when it has one, Cyclon's choice, and when Cyclon last used it. */
-    fun details(username: String, level: String, lastUsed: String?) = listOfNotNull(username.ifEmpty { null }, level, lastUsed).joinToString(" · ")
+    /** A login's line under its name: its username when it has one, and when Cyclon last used it. */
+    fun details(username: String, lastUsed: String?): String? =
+        listOfNotNull(username.ifEmpty { null }, lastUsed).joinToString(" · ").ifEmpty { null }
 
     /** "No saved logins yet" only where the setup step does not already say so, and not while reading. */
     fun saysNone(setup: Setup, logins: Logins, busy: Boolean) =
@@ -53,15 +51,6 @@ internal object SignIns {
     /** The logins' section, unless it would be empty: no logins, and the setup step says so. */
     fun showsLogins(setup: Setup, logins: Logins, busy: Boolean) =
         logins !is Logins.Shown || logins.logins.isNotEmpty() || saysNone(setup, logins, busy)
-
-    /** That the choices stay on this phone, wherever there are (or may be) logins to choose for. */
-    fun saysThisPhone(logins: Logins) = logins !is Logins.Shown || logins.logins.isNotEmpty()
-
-    fun levelLabel(level: AgentSignInAccess.Level) = when (level) {
-        AgentSignInAccess.Level.ASK -> R.string.passwords_assistant_ask
-        AgentSignInAccess.Level.ALWAYS -> R.string.passwords_assistant_always
-        AgentSignInAccess.Level.NEVER -> R.string.passwords_assistant_never
-    }
 }
 
 internal class SignInsActions(
@@ -113,8 +102,7 @@ internal fun SignInsPage(
             if (SignIns.saysNone(setup, logins, busy)) CyclonNote(stringResource(R.string.cyclon_sign_ins_none), inset = CyclonTextInset)
             if (logins.logins.isNotEmpty()) CyclonGroup {
                 logins.logins.forEach { login ->
-                    val level = stringResource(SignIns.levelLabel(login.level))
-                    val summary = SignIns.details(login.username, level,
+                    val summary = SignIns.details(login.username,
                         login.lastUsed?.let { stringResource(R.string.cyclon_sign_ins_last_used, DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(it))) })
                     CyclonRow(login.title, summary, onClick = { actions.login(login.id) }, enabled = !busy,
                         leading = { CyclonMonogram(login.title, login.packageName) }, trailing = { CyclonChevron() })
@@ -122,8 +110,6 @@ internal fun SignInsPage(
             }
         }
     }
-    if (SignIns.saysThisPhone(logins))
-        CyclonNote(stringResource(R.string.cyclon_sign_ins_this_phone), inset = CyclonTextInset)
 
     CyclonSectionLabel(stringResource(R.string.cyclon_sign_ins_settings))
     CyclonGroup {

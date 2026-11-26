@@ -67,7 +67,6 @@ class PasswordManagerActivity : PasswordOwnerActivity() {
     private var autofillOn by mutableStateOf<Boolean?>(null)
     /** This device's storage was picked only because there was no Google account; one added later takes over. */
     private var deviceForLackOfAccount = false
-    private var accessEditing by mutableStateOf<PasswordView?>(null)
     private var editing by mutableStateOf<PasswordView?>(null)
     private var editorOpen by mutableStateOf(false)
     private var deleting by mutableStateOf<PasswordView?>(null)
@@ -142,44 +141,10 @@ class PasswordManagerActivity : PasswordOwnerActivity() {
             LaunchedEffect(showSettings, showCheckup, detailId, signIns) { scroll.scrollTo(0) }
             Column(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).verticalScroll(scroll).padding(bottom = 32.dp)) {
                 val detail = entries.singleOrNull { it.id == detailId && !it.data.blocked }
-                if (signIns) SignInsMain()
-                else if (unlocked && !showSettings && !showCheckup && detail != null) DetailPage(detail) else MainPage()
+                if (unlocked && (signIns || (!showSettings && !showCheckup)) && detail != null) DetailPage(detail)
+                else if (signIns) SignInsMain()
+                else MainPage()
             }
-            accessEditing?.takeIf { unlocked }?.let { entry -> assistantAccess[entry.id]?.let { state ->
-                SignInAccessDialog(entry, state.level, state.requireDeviceAuthentication, hasSecureScreenLock, busy,
-                    onDismiss = { accessEditing = null },
-                    onSetScreenLock = {
-                        requireOwner()
-                        runCatching { startActivity(Intent(android.provider.Settings.ACTION_SECURITY_SETTINGS)) }
-                            .onFailure { message = R.string.passwords_access_failed }
-                    }, onSave = { level, requireAuthentication ->
-                        requireOwner()
-                        if (requireAuthentication && !state.requireDeviceAuthentication && !hasSecureScreenLock)
-                            throw VaultLockedException()
-                        val account = selected
-                        val identity = ownerOperations.identity(account)
-                        accessEditing = null
-                        val save = { perform {
-                                if (!ownerOperations.identity(account).same(identity)) throw VaultLockedException()
-                                val repo = repository(account)
-                                fun set(current: PasswordData) {
-                                    if (current.realm != entry.data.realm || current.username != entry.data.username || current.blocked) throw VaultLockedException()
-                                    if (!ownerOperations.identity(account).same(identity)) throw VaultLockedException()
-                                    AgentSignInAccess(this@PasswordManagerActivity).setOwnerPolicy(
-                                        AgentSignInAccess.vaultKey(identity.userId), entry.id, state.incarnation, level, requireAuthentication)
-                                }
-                                when (repo) {
-                                    is PasswordRepository -> repo.withAgentEntry(entry.id, ::set)
-                                    is DevicePasswordVault -> repo.withAgentEntry(entry.id, ::set)
-                                    else -> throw VaultLockedException()
-                                }
-                        } }
-                        // Always skips asking, so with a screen lock it is confirmed with the lock first. Without a
-                        // lock there is nothing to confirm: the dialog has warned that anyone with the phone can use it.
-                        if (level != AgentSignInAccess.Level.ALWAYS || !hasSecureScreenLock) save()
-                        else { afterAuthentication = { if (hasSecureScreenLock) save() }; reconfirmOwner() }
-                    })
-            } }
             if (editorOpen && unlocked) PasswordEditor(editing, onDismiss = { editorOpen = false; editing = null }) { data ->
                 val original = editing
                 editorOpen = false; editing = null
@@ -319,16 +284,16 @@ class PasswordManagerActivity : PasswordOwnerActivity() {
         } } }
     }
 
-    /** Sign-ins for Cyclon: setup still to do, each login's choice for Cyclon, and the way to the rest of Passwords. */
+    /** Sign-ins for Cyclon: setup still to do, saved logins, and the way to the rest of Passwords. */
     @Composable
     private fun SignInsMain() {
         val saved = entries.filter { !it.data.blocked }
         val logins = when {
             !unlocked -> SignIns.Logins.Locked
             !storageChosen -> SignIns.Logins.Choosing
-            else -> SignIns.Logins.Shown(saved.mapNotNull { entry -> assistantAccess[entry.id]?.let { access ->
-                SignIns.Login(entry.id, loginTitle(entry), entry.data.username, loginPackage(entry), access.level, access.lastUsed)
-            } })
+            else -> SignIns.Logins.Shown(saved.map { entry ->
+                SignIns.Login(entry.id, loginTitle(entry), entry.data.username, loginPackage(entry), assistantAccess[entry.id]?.lastUsed)
+            })
         }
         // No saved passwords is known only once unlocked, with the vault read and syncing.
         val setup = SignIns.Setup(account = !hasGoogleAccount, autofill = autofillOn == false,
@@ -344,7 +309,7 @@ class PasswordManagerActivity : PasswordOwnerActivity() {
                 addPassword = { editing = null; editorOpen = true },
                 import = { signIns = false; showSettings = true; showCheckup = false; detailId = null },
                 unlock = ::authenticateOwner,
-                login = { id -> accessEditing = entries.singleOrNull { it.id == id && !it.data.blocked } },
+                login = { id -> showSettings = false; showCheckup = false; detailId = id },
                 allPasswords = { signIns = false; showSettings = false; showCheckup = false; detailId = null },
                 passwordSettings = { openOrSay(Intent(this, SyncPasswordsActivity::class.java)) },
             ), status = { StatusBlock() }, storage = { StoragePicker() })
@@ -523,7 +488,7 @@ class PasswordManagerActivity : PasswordOwnerActivity() {
                 .onFailure { message = R.string.passwords_sync_failed } })
     }
 
-    /** Sync, recovery and the account's pages, backups, then never-saved websites: Assistant access's sections. */
+    /** Sync, recovery and the account's pages, backups, then never-saved websites. */
     @Composable
     private fun SettingsTab() {
         val account = selected
@@ -653,11 +618,10 @@ class PasswordManagerActivity : PasswordOwnerActivity() {
         }
     }
 
-    /** One saved login: what it signs in to, its username, its actions and whether Cyclon may use it. Never the password. */
+    /** One saved login: what it signs in to, its username and its actions. Never the password. */
     @OptIn(ExperimentalLayoutApi::class)
     @Composable
     private fun DetailPage(entry: PasswordView) {
-        val access = assistantAccess[entry.id]
         CyclonTopBar(loginTitle(entry), stringResource(R.string.passwords_back_to_passwords), { detailId = null },
             leading = { CyclonMonogram(loginTitle(entry), loginPackage(entry), 32.dp) })
         StatusBlock()
@@ -671,18 +635,6 @@ class PasswordManagerActivity : PasswordOwnerActivity() {
             CyclonInkButton(stringResource(R.string.passwords_edit), enabled = !busy) { editing = entry; editorOpen = true }
             CyclonSecondaryButton(stringResource(R.string.passwords_move), enabled = !busy) { moving = entry }
             CyclonTextAction(stringResource(R.string.passwords_delete), enabled = !busy) { deleting = entry }
-        }
-        if (access != null) {
-            CyclonSectionLabel(stringResource(R.string.passwords_assistant_access))
-            val details = listOfNotNull(
-                stringResource(R.string.passwords_assistant_authentication_summary).takeIf { access.requireDeviceAuthentication },
-                access.lastUsed?.let { used -> stringResource(R.string.passwords_assistant_last_used,
-                    java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(used))) })
-            CyclonGroup {
-                CyclonRow(stringResource(R.string.passwords_assistant_access_status, stringResource(accessLabel(access.level))),
-                    details.joinToString("\n").ifEmpty { null }, onClick = { accessEditing = entry }, enabled = !busy,
-                    trailing = { CyclonChevron() })
-            }
         }
     }
 
@@ -742,7 +694,7 @@ class PasswordManagerActivity : PasswordOwnerActivity() {
     override fun onOwnerLocked() {
         // The page stays: the screen lock's own prompt stops this activity too, and unlocking from All saved passwords
         // must land there, not back on Sign-ins.
-        unlocked = false; entries = emptyList(); assistantAccess = emptyMap(); accessEditing = null; editing = null; deleting = null; editorOpen = false; passphrase = ""
+        unlocked = false; entries = emptyList(); assistantAccess = emptyMap(); editing = null; deleting = null; editorOpen = false; passphrase = ""
         query = ""; showSettings = false; detailId = null; blockedSiteOpen = false; storageOpen = false
         pendingChanges = emptyList(); transfers = emptyList(); resolving = null; moving = null
         resetOpen = false; archiveImport = null; droppingTransfer = null
@@ -842,12 +794,6 @@ class PasswordManagerActivity : PasswordOwnerActivity() {
     override fun onDestroy() { clearExport(); afterAuthentication = null; super.onDestroy() }
 }
 
-private fun accessLabel(level: AgentSignInAccess.Level) = when (level) {
-    AgentSignInAccess.Level.ASK -> R.string.passwords_assistant_ask
-    AgentSignInAccess.Level.ALWAYS -> R.string.passwords_assistant_always
-    AgentSignInAccess.Level.NEVER -> R.string.passwords_assistant_never
-}
-
 private fun loginTarget(entry: PasswordView): String =
     if (entry.data.realm.startsWith("android://")) entry.data.realm.substringAfter('@').trimEnd('/')
     else entry.data.realm
@@ -875,65 +821,6 @@ private fun DetailField(label: String, value: String) {
 private fun DialogBody(text: String, modifier: Modifier = Modifier, scrolls: Boolean = false) {
     Text(text, (if (scrolls) modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()) else modifier),
         style = MaterialTheme.typography.bodyMedium, color = Cyclon.palette.ink)
-}
-
-@Composable
-private fun SignInAccessDialog(entry: PasswordView, current: AgentSignInAccess.Level, currentRequireAuthentication: Boolean,
-                               hasSecureScreenLock: Boolean, busy: Boolean, onDismiss: () -> Unit,
-                               onSetScreenLock: () -> Unit, onSave: (AgentSignInAccess.Level, Boolean) -> Unit) {
-    var selected by remember(entry.id, current) { mutableStateOf(current) }
-    var requireAuthentication by remember(entry.id, currentRequireAuthentication) { mutableStateOf(currentRequireAuthentication) }
-    val p = Cyclon.palette
-    AlertDialog(containerColor = Cyclon.page.dialog, onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.passwords_assistant_access)) },
-        text = {
-            PasswordDialogProtection()
-            Column(Modifier.heightIn(max = 440.dp).verticalScroll(rememberScrollState())) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    CyclonMonogram(loginTitle(entry), loginPackage(entry), 32.dp)
-                    Column(Modifier.weight(1f)) {
-                        Text(loginTitle(entry), style = MaterialTheme.typography.titleMedium, color = p.ink)
-                        Text(entry.data.username.ifEmpty { stringResource(R.string.passwords_assistant_saved_login) },
-                            style = MaterialTheme.typography.bodyMedium, color = p.muted)
-                    }
-                }
-                Text(stringResource(R.string.passwords_assistant_access_description), Modifier.padding(top = 12.dp, bottom = 4.dp),
-                    style = MaterialTheme.typography.bodySmall, color = p.muted)
-                Column(Modifier.selectableGroup()) {
-                    AgentSignInAccess.Level.values().forEach { level ->
-                        val always = level == AgentSignInAccess.Level.ALWAYS
-                        val choiceEnabled = !busy && !(requireAuthentication && always)
-                        CyclonChoiceRow(stringResource(accessLabel(level)), stringResource(when (level) {
-                            AgentSignInAccess.Level.ASK -> R.string.passwords_assistant_ask_description
-                            AgentSignInAccess.Level.ALWAYS -> R.string.passwords_assistant_always_description
-                            AgentSignInAccess.Level.NEVER -> R.string.passwords_assistant_never_description
-                        }), selected == level, enabled = choiceEnabled, inset = 0.dp) { selected = level }
-                    }
-                }
-                if (!hasSecureScreenLock && selected == AgentSignInAccess.Level.ALWAYS) Text(
-                    stringResource(R.string.passwords_assistant_always_no_lock),
-                    Modifier.padding(vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = p.ink)
-                CyclonHairline()
-                CyclonSwitchRow(stringResource(R.string.passwords_assistant_require_authentication),
-                    stringResource(R.string.passwords_assistant_require_authentication_description), requireAuthentication,
-                    onChange = { enabled ->
-                        requireAuthentication = enabled
-                        if (enabled && selected == AgentSignInAccess.Level.ALWAYS) selected = AgentSignInAccess.Level.ASK
-                    }, enabled = !busy && (hasSecureScreenLock || requireAuthentication), inset = 0.dp, divider = false)
-                if (!hasSecureScreenLock) {
-                    Text(stringResource(R.string.passwords_assistant_screen_lock_required), style = MaterialTheme.typography.bodySmall, color = p.ink)
-                    CyclonTextAction(stringResource(R.string.passwords_assistant_set_screen_lock), Modifier.offset(x = (-16).dp),
-                        enabled = !busy, onClick = onSetScreenLock)
-                }
-                Text(stringResource(R.string.passwords_assistant_revoke_description), Modifier.padding(top = 8.dp),
-                    style = MaterialTheme.typography.bodySmall, color = p.muted)
-            }
-        },
-        confirmButton = { CyclonTextAction(stringResource(R.string.passwords_save),
-            enabled = !busy && (selected != current || requireAuthentication != currentRequireAuthentication)) {
-            onSave(selected, requireAuthentication)
-        } },
-        dismissButton = { CyclonTextAction(stringResource(android.R.string.cancel), onClick = onDismiss) })
 }
 
 @Composable

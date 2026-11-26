@@ -4,7 +4,6 @@ package org.microg.gms.passwords
 import org.microg.gms.cyclon.DeviceAccount
 import android.accounts.Account
 import android.accounts.AccountManager
-import android.app.KeyguardManager
 import android.content.Context
 import android.os.Bundle
 import android.os.SystemClock
@@ -30,66 +29,40 @@ internal class AgentSignInBroker(private val context: Context) {
                 candidates(PasswordAgentFillTarget.from(context, input ?: throw SecurityException()))
             }
             "set_access" -> {
+                // Rolling-upgrade compatibility with older Core builds: validate the reference and return success
+                // without storing Ask/Never (CYC-3345: every matching saved login is Always).
                 val choice = choice(ref)
-                val level = AgentSignInAccess.Level.of(input?.getString("level")) ?: throw SecurityException()
-                withChoice(choice) {
-                    requireStorageOpen()
-                    access.setCurrent(choice.vaultKey, choice.tag, choice.incarnation, level)
-                }
+                withChoice(choice) { requireStorageOpen() }
                 Bundle.EMPTY
             }
             "redeem" -> {
                 val choice = choice(ref)
                 val extras = input ?: throw SecurityException()
                 val approval = extras.getString("approval")
-                if (approval !in setOf("once", "always")) throw SecurityException()
+                if (approval != null && approval !in setOf("once", "always")) throw SecurityException()
                 val request = PasswordAgentFillRequest.from(context, extras)
                 val vault = vault(choice)
                 val before = vault.list().singleOrNull { it.id == choice.tag } ?: throw SecurityException()
                 if (!PasswordAffiliationMatcher(context, vault).canFill(before.data, request.realm)) throw SecurityException()
-                // Capture only metadata in a pending authentication request, never a PasswordView.
                 val realm = before.data.realm
                 val username = before.data.username
-                val grant = withChoice(choice, vault) {
-                    val state = access.get(choice.vaultKey, choice.tag)
-                    if (state.level == AgentSignInAccess.Level.NEVER) throw SecurityException()
-                    state
-                }
-                val requiresAuthentication = grant.requireDeviceAuthentication
-                if (requiresAuthentication && !(context.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager).isDeviceSecure) {
-                    throw SecurityException()
-                }
                 claimHandle(request.handle, request.deadline)
                 PasswordAgentFillRequests.put(request)
-                if (requiresAuthentication) {
-                    try {
-                        val authentication = PasswordAgentAuthenticationRequests.prepare(context, request, username) { authenticated ->
-                            deliver(choice, request, realm, username, once = true, authenticated = authenticated)
-                        }
-                        Bundle().apply { putParcelable("authentication", authentication) }
-                    } catch (failure: Exception) {
-                        PasswordAgentFillRequests.cancel(request.handle)
-                        throw failure
-                    }
-                } else {
-                    try { deliver(choice, request, realm, username, approval == "once") }
-                    finally { PasswordAgentFillRequests.cancel(request.handle) }
-                    Bundle.EMPTY
-                }
+                try { deliver(choice, request, realm, username) }
+                finally { PasswordAgentFillRequests.cancel(request.handle) }
+                Bundle.EMPTY
             }
             else -> throw SecurityException()
         }
     }
 
-    private fun deliver(choice: Choice, request: PasswordAgentFillRequest, realm: String, username: String,
-        once: Boolean, authenticated: (() -> Boolean)? = null) {
+    private fun deliver(choice: Choice, request: PasswordAgentFillRequest, realm: String, username: String) {
         withChoice(choice) { current ->
             // The earlier affiliation proof covers exactly this entry's current realm.
             if (current.realm != realm || current.username != username || current.blocked || current.password.isEmpty()) throw SecurityException()
-            access.redeem(choice.vaultKey, choice.tag, choice.incarnation, once, deviceAuthenticated = authenticated?.invoke() == true) {
+            access.redeem(choice.vaultKey, choice.tag, choice.incarnation) {
                 requireStorageOpen()
-                // Authentication is native request-local state, rechecked immediately before handover.
-                if (authenticated != null && !authenticated() || !request.valid(context)) throw SecurityException()
+                if (!request.valid(context)) throw SecurityException()
                 request.deliver(context, current.password.toCharArray())
             }
         }
@@ -120,8 +93,9 @@ internal class AgentSignInBroker(private val context: Context) {
                         rows.add(Bundle().apply {
                             putString("ref", ref); putString("username", current.username)
                             putString("account", account?.name ?: context.getString(com.google.android.gms.R.string.passwords_on_device))
-                            putString("access", state.level.wire)
-                            putBoolean("require_authentication", state.requireDeviceAuthentication)
+                            // Wire compatibility: every saved login is Always with no device-auth prompt (CYC-3345).
+                            putString("access", "always")
+                            putBoolean("require_authentication", false)
                             state.lastUsed?.let { putLong("last_used", it) }
                         })
                     }
