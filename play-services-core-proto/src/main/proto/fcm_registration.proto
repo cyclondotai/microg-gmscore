@@ -1,0 +1,23 @@
+// SPDX-FileCopyrightText: 2026 Cyclon
+// SPDX-License-Identifier: Apache-2.0
+//
+// Deletes a registration made with google.firebase.fcm.registration.v1.android.AndroidRegistration.
+
+syntax = "proto2";
+
+package google.firebase.fcm.registration.v1;
+
+option java_package = "org.microg.gms.gcm.registration";
+
+service RegistrationApi {
+  rpc DeleteRegistration(DeleteRegistrationRequest) returns (DeleteRegistrationResponse);
+}
+
+message DeleteRegistrationRequest {
+  // projects/{project ID}/registrations/{Firebase installation ID}
+  optional string name = 1;
+}
+
+// google.protobuf.Empty on the wire.
+message DeleteRegistrationResponse {
+}

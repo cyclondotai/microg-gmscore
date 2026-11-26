@@ -5,6 +5,7 @@
 
 package org.microg.gms.credential
 
+import android.app.KeyguardManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
@@ -17,6 +18,7 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.Feature
+import com.google.android.gms.common.api.ApiMetadata
 import com.google.android.gms.common.api.Status
 import com.google.android.gms.common.api.internal.IStatusCallback
 import com.google.android.gms.common.internal.ConnectionInfo
@@ -24,6 +26,7 @@ import com.google.android.gms.common.internal.GetServiceRequest
 import com.google.android.gms.common.internal.IGmsCallbacks
 import com.google.android.gms.credential.manager.EXTRA_KEY_ACCOUNT_NAME
 import com.google.android.gms.credential.manager.PASSWORD_MANAGER_CLASS_NAME
+import com.google.android.gms.credential.manager.common.IBooleanCallback
 import com.google.android.gms.credential.manager.common.IPendingIntentCallback
 import com.google.android.gms.credential.manager.common.ISettingsCallback
 import com.google.android.gms.credential.manager.firstparty.internal.ICredentialManagerService
@@ -50,6 +53,9 @@ class CredentialManagerService : BaseService(TAG, GmsService.CREDENTIAL_MANAGER)
                 Feature("credential_manager_first_party_api", 1),
                 Feature("password_checkup_first_party_api", 1),
                 Feature("user_service_security", 1),
+                // Chrome on Play services 26.19.30+ reads and writes "use screen lock before filling passwords" here.
+                Feature("credential_manager_first_party_get_biometric_reauth", 1),
+                Feature("credential_manager_first_party_set_biometric_reauth", 1),
             )
         })
     }
@@ -98,5 +104,41 @@ private class CredentialManagerServiceImpl(private val context: Context, overrid
         }
     }
 
+    override fun isBiometricReauthBeforeAutofillingRequired(callback: IBooleanCallback?, apiMetadata: ApiMetadata?) {
+        lifecycleScope.launchWhenStarted {
+            val required = ReauthBeforeAutofilling.isRequired(context)
+            Log.d(TAG, "isBiometricReauthBeforeAutofillingRequired: $required")
+            runCatching { callback?.onBoolean(Status.SUCCESS, required, ApiMetadata.DEFAULT) }.onFailure { Log.w(TAG, it) }
+        }
+    }
+
+    override fun setIsReauthBeforeAutofillingRequired(callback: IStatusCallback?, required: Boolean, apiMetadata: ApiMetadata?) {
+        lifecycleScope.launchWhenStarted {
+            val status = if (ReauthBeforeAutofilling.setRequired(context, required)) Status.SUCCESS
+            else Status(8, "Failed to save 'reauth before autofilling' in storage.")
+            Log.d(TAG, "setIsReauthBeforeAutofillingRequired($required): ${status.statusCode}")
+            runCatching { callback?.onResult(status) }.onFailure { Log.w(TAG, it) }
+        }
+    }
+
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean = warnOnTransactionIssues(code, reply, flags, TAG) { super.onTransact(code, data, reply, flags) }
+}
+/**
+ * The device-wide "use screen lock before filling passwords" choice Chrome shows in its password settings. As in
+ * Play services, it is off until the owner turns it on, and it only applies while the phone has a screen lock.
+ */
+internal object ReauthBeforeAutofilling {
+    private const val PREFERENCES = "credential_manager"
+    private const val KEY_REQUIRED = "reauth_before_autofilling"
+
+    fun isRequired(context: Context): Boolean =
+        isRequired(context.getSystemService(KeyguardManager::class.java)?.isDeviceSecure == true, stored(context))
+
+    fun isRequired(deviceSecure: Boolean, stored: Boolean): Boolean = deviceSecure && stored
+
+    fun setRequired(context: Context, required: Boolean): Boolean =
+        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).edit().putBoolean(KEY_REQUIRED, required).commit()
+
+    private fun stored(context: Context): Boolean =
+        context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE).getBoolean(KEY_REQUIRED, false)
 }

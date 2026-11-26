@@ -1,0 +1,44 @@
+// SPDX-FileCopyrightText: 2026 Cyclon
+// SPDX-License-Identifier: Apache-2.0
+//
+// Firebase Cloud Messaging registration by Firebase installation, as Play services 26.12+ performs it for
+// apps that call Cloud Messaging service 457 (fcmregistrations.googleapis.com). Field names are ours; the field
+// numbers and types are the wire contract.
+
+syntax = "proto2";
+
+package google.firebase.fcm.registration.v1.android;
+
+option java_package = "org.microg.gms.gcm.registration";
+
+service AndroidRegistration {
+  rpc RegisterAppInstance(RegisterAppInstanceRequest) returns (RegisterAppInstanceResponse);
+}
+
+message RegisterAppInstanceRequest {
+  // projects/{sender ID}/installations/{Firebase installation ID}
+  optional string name = 1;
+  optional string package_name = 2;
+  // The Android user the app runs as (0 for the main user).
+  optional int64 android_user_id = 3;
+  optional int32 app_version_code = 4;
+  // Firebase Messaging library version, for example fcm-25.1.2_1p.
+  optional string sdk_version = 5;
+  // The Play services version code that registers.
+  optional int64 gms_version_code = 6;
+  optional int64 os_sdk_int = 7;
+  // Play services always sends CLIENT_PLAY_SERVICES.
+  optional RegisteringClient client = 8;
+  optional string gmp_app_id = 9;
+  optional int64 target_sdk_version = 10;
+}
+
+enum RegisteringClient {
+  CLIENT_UNSPECIFIED = 0;
+  CLIENT_PLAY_SERVICES = 1;
+}
+
+message RegisterAppInstanceResponse {
+  // The FCM registration token for the app instance.
+  optional string token = 1;
+}
