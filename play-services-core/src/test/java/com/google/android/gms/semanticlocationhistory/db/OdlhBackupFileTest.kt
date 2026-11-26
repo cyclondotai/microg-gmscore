@@ -2,9 +2,30 @@
  * SPDX-License-Identifier: Apache-2.0 */
 package com.google.android.gms.semanticlocationhistory.db
 
+import android.accounts.Account
 import android.content.ContentValues
 import android.database.sqlite.SQLiteDatabase
+import android.os.Binder
+import android.os.Parcel
 import android.os.ParcelFileDescriptor
+import com.google.android.gms.common.api.ApiMetadata
+import com.google.android.gms.common.api.CommonStatusCodes
+import com.google.android.gms.common.api.Status
+import com.google.android.gms.common.api.internal.IStatusCallback
+import com.google.android.gms.common.data.DataHolder
+import com.google.android.gms.semanticlocation.SemanticLocationState
+import com.google.android.gms.semanticlocationhistory.ExperimentVisitsResponse
+import com.google.android.gms.semanticlocationhistory.InferredPlace
+import com.google.android.gms.semanticlocationhistory.LocationHistorySegment
+import com.google.android.gms.semanticlocationhistory.LocationHistorySegmentRequest
+import com.google.android.gms.semanticlocationhistory.LocationHistorySettings
+import com.google.android.gms.semanticlocationhistory.OdlhBackupSummary
+import com.google.android.gms.semanticlocationhistory.RequestCredentials
+import com.google.android.gms.semanticlocationhistory.SemanticLocationEditInputs
+import com.google.android.gms.semanticlocationhistory.UserLocationProfile
+import com.google.android.gms.semanticlocationhistory.backupFileRefusal
+import com.google.android.gms.semanticlocationhistory.internal.ISemanticLocationHistoryCallbacks
+import com.google.android.gms.semanticlocationhistory.internal.ISemanticLocationHistoryService
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -96,5 +117,85 @@ class OdlhBackupFileTest {
         SQLiteDatabase.openDatabase(copy.path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
             db.rawQuery("SELECT count(*) FROM semantic_segment_table", null).use { c -> assertTrue(c.moveToNext()); assertEquals(1, c.getInt(0)) }
         }
+    }
+
+    @Test
+    fun backupFileTransactionsAndCallbackMatchPlayServicesWireLayout() {
+        var exportedFor: String? = null
+        var restoredFor: Pair<String?, Boolean>? = null
+        val service = object : ISemanticLocationHistoryService.Stub() {
+            override fun getSegments(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, request: LocationHistorySegmentRequest?, apiMetadata: ApiMetadata?) = Unit
+            override fun getInferredHome(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) = Unit
+            override fun getInferredWork(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) = Unit
+            override fun editSegments(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, list: MutableList<LocationHistorySegment>?, apiMetadata: ApiMetadata?) = Unit
+            override fun deleteHistory(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, startTime: Long, endTime: Long, apiMetadata: ApiMetadata?) = Unit
+            override fun onDemandBackup(callback: IStatusCallback?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) = Unit
+            override fun onDemandRestore(callback: IStatusCallback?, requestCredentials: RequestCredentials?, list: MutableList<*>?, apiMetadata: ApiMetadata?) = Unit
+            override fun getBackupSummary(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) = Unit
+            override fun deleteBackups(callback: IStatusCallback?, requestCredentials: RequestCredentials?, list: MutableList<*>?, apiMetadata: ApiMetadata?) = Unit
+            override fun getUserLocationProfile(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) = Unit
+            override fun getLocationHistorySettings(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) = Unit
+            override fun getExperimentVisits(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) = Unit
+            override fun editCsl(callback: IStatusCallback?, requestCredentials: RequestCredentials?, editInputs: SemanticLocationEditInputs?, state: SemanticLocationState?, apiMetadata: ApiMetadata?) = Unit
+            override fun getBackupFile(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) { exportedFor = requestCredentials?.packageName }
+            override fun restoreBackupFile(callback: IStatusCallback?, requestCredentials: RequestCredentials?, file: ParcelFileDescriptor?, apiMetadata: ApiMetadata?) { restoredFor = requestCredentials?.packageName to (file != null); file?.close() }
+        }
+        val creds = RequestCredentials(Account("a@example.com", "com.google"), "backup", "com.google.android.apps.maps")
+        val serviceDescriptor = "com.google.android.gms.semanticlocationhistory.internal.ISemanticLocationHistoryService"
+        fun transact(code: Int, writeExtra: Parcel.() -> Unit = {}) {
+            val data = Parcel.obtain(); val reply = Parcel.obtain()
+            try {
+                data.writeInterfaceToken(serviceDescriptor)
+                data.writeStrongBinder(Binder())
+                data.writeInt(1); creds.writeToParcel(data, 0)
+                data.writeExtra()
+                data.writeInt(1); ApiMetadata.DEFAULT.writeToParcel(data, 0)
+                data.setDataPosition(0)
+                service.transact(code, data, reply, 0)
+            } finally { data.recycle(); reply.recycle() }
+        }
+        transact(14)
+        assertEquals("com.google.android.apps.maps", exportedFor)
+        val tmp = File.createTempFile("odlh-wire-", ".db", context.cacheDir)
+        ParcelFileDescriptor.open(tmp, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
+            transact(15) { writeInt(1); pfd.writeToParcel(this, 0) }
+        }
+        tmp.delete()
+        assertEquals("com.google.android.apps.maps" to true, restoredFor)
+
+        var callbackStatus: Int? = null
+        val callback = object : ISemanticLocationHistoryCallbacks.Stub() {
+            override fun onSegmentListResponse(status: Status?, segments: MutableList<LocationHistorySegment>?, apiMetadata: ApiMetadata?) = Unit
+            override fun onGetSegmentsResponse(dataHolder: DataHolder?, apiMetadata: ApiMetadata?) = Unit
+            override fun onGetInferredHomeResponse(status: Status?, inferredPlace: InferredPlace?, apiMetadata: ApiMetadata?) = Unit
+            override fun onGetInferredWorkResponse(status: Status?, inferredPlace: InferredPlace?, apiMetadata: ApiMetadata?) = Unit
+            override fun onEditSegmentsResponse(status: Status?, apiMetadata: ApiMetadata?) = Unit
+            override fun onDeleteHistoryResponse(status: Status?, apiMetadata: ApiMetadata?) = Unit
+            override fun onGetUserLocationProfileResponse(status: Status?, userLocationProfile: UserLocationProfile?, apiMetadata: ApiMetadata?) = Unit
+            override fun onGetBackupSummaryResponse(status: Status?, summaries: MutableList<OdlhBackupSummary>?, apiMetadata: ApiMetadata?) = Unit
+            override fun onLocationHistorySettings(status: Status?, locationHistorySettings: LocationHistorySettings?, apiMetadata: ApiMetadata?) = Unit
+            override fun onGetExperimentVisitsResponse(status: Status?, response: ExperimentVisitsResponse?, apiMetadata: ApiMetadata?) = Unit
+            override fun onBackupFile(status: Status?, file: ParcelFileDescriptor?, apiMetadata: ApiMetadata?) { callbackStatus = status?.statusCode; file?.close() }
+        }
+        val cbData = Parcel.obtain(); val cbReply = Parcel.obtain()
+        try {
+            cbData.writeInterfaceToken("com.google.android.gms.semanticlocationhistory.internal.ISemanticLocationHistoryCallbacks")
+            cbData.writeInt(1); Status.SUCCESS.writeToParcel(cbData, 0)
+            cbData.writeInt(0) // null ParcelFileDescriptor
+            cbData.writeInt(1); ApiMetadata.DEFAULT.writeToParcel(cbData, 0)
+            cbData.setDataPosition(0)
+            callback.transact(11, cbData, cbReply, Binder.FLAG_ONEWAY)
+        } finally { cbData.recycle(); cbReply.recycle() }
+        assertEquals(0, callbackStatus)
+    }
+
+    @Test
+    fun backupFileRequiresTimelineEnabledAndMapsCaller() {
+        val mapsCreds = RequestCredentials(Account("a@example.com", "com.google"), "backup", "com.google.android.apps.maps")
+        val otherCreds = RequestCredentials(Account("a@example.com", "com.google"), "backup", "com.example.other")
+        assertEquals(17, backupFileRefusal(timelineEnabled = false, callingPackage = "com.google.android.apps.maps", requestCredentials = mapsCreds)?.statusCode)
+        assertEquals(CommonStatusCodes.DEVELOPER_ERROR, backupFileRefusal(timelineEnabled = true, callingPackage = "com.example.other", requestCredentials = mapsCreds)?.statusCode)
+        assertEquals(CommonStatusCodes.DEVELOPER_ERROR, backupFileRefusal(timelineEnabled = true, callingPackage = "com.google.android.apps.maps", requestCredentials = otherCreds)?.statusCode)
+        assertNull(backupFileRefusal(timelineEnabled = true, callingPackage = "com.google.android.apps.maps", requestCredentials = mapsCreds))
     }
 }

@@ -40,6 +40,7 @@ import org.microg.gms.common.GmsService
 import org.microg.gms.common.PackageUtils
 import org.microg.gms.location.LocationSettings
 import org.microg.gms.utils.warnOnTransactionIssues
+import java.io.File
 
 private val FEATURES = arrayOf(
     Feature("semantic_location_history", 12),
@@ -56,6 +57,14 @@ private val FEATURES = arrayOf(
 
 /** Only Maps may export or restore Timeline in a device-to-device transfer, as in Play services. */
 internal val BACKUP_FILE_PACKAGES = setOf("com.google.android.apps.maps")
+
+/** Why a device-to-device backup file call is refused (Play services' status), or null. */
+internal fun backupFileRefusal(timelineEnabled: Boolean, callingPackage: String?, requestCredentials: RequestCredentials?): Status? = when {
+    !timelineEnabled -> Status(17, "Feature is disabled")
+    callingPackage !in BACKUP_FILE_PACKAGES || requestCredentials?.packageName !in BACKUP_FILE_PACKAGES ->
+        Status(CommonStatusCodes.DEVELOPER_ERROR, "Package not allowed")
+    else -> null
+}
 
 class SemanticLocationHistoryService : BaseService(TAG, GmsService.SEMANTIC_LOCATION_HISTORY) {
     override fun handleServiceRequest(callback: IGmsCallbacks, request: GetServiceRequest, service: GmsService) {
@@ -381,13 +390,8 @@ class SemanticLocationHistoryServiceImpl(
         callback?.onResult(Status.SUCCESS)
     }
 
-    /** Why a device-to-device backup file call is refused (Play services' status), or null. */
-    private fun backupFileRefusal(requestCredentials: RequestCredentials?): Status? = when {
-        !LocationSettings(context).mapsTimeline -> Status(17, "Feature is disabled")
-        callingPackage !in BACKUP_FILE_PACKAGES || requestCredentials?.packageName !in BACKUP_FILE_PACKAGES ->
-            Status(CommonStatusCodes.DEVELOPER_ERROR, "Package not allowed")
-        else -> null
-    }
+    private fun backupFileRefusal(requestCredentials: RequestCredentials?): Status? =
+        backupFileRefusal(LocationSettings(context).mapsTimeline, callingPackage, requestCredentials)
 
     override fun getBackupFile(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) {
         Log.d(TAG, "getBackupFile: caller=$callingPackage")
@@ -425,19 +429,22 @@ class SemanticLocationHistoryServiceImpl(
         }
         lifecycleScope.launch {
             val status = withContext(Dispatchers.IO) {
-                val copy = context.getDatabasePath("odlh-storage-backup.db")
+                var copy: File? = null
                 try {
                     ParcelFileDescriptor.AutoCloseInputStream(file).use { input ->
-                        copy.outputStream().use { input.copyTo(it) }
+                        context.cacheDir.mkdirs()
+                        val temp = File.createTempFile("odlh-storage-backup-", ".db", context.cacheDir)
+                        copy = temp
+                        temp.outputStream().use { input.copyTo(it) }
                     }
-                    val counts = storageManager.mergeSegmentsFrom(copy)
+                    val counts = storageManager.mergeSegmentsFrom(copy!!)
                     Log.d(TAG, "restoreBackupFile: $counts")
                     Status.SUCCESS
                 } catch (e: Exception) {
                     Log.w(TAG, "restoreBackupFile failed", e)
                     Status(CommonStatusCodes.INTERNAL_ERROR, e.message)
                 } finally {
-                    listOf("", "-journal", "-wal", "-shm").forEach { context.getDatabasePath("odlh-storage-backup.db$it").delete() }
+                    copy?.let { temp -> listOf("", "-journal", "-wal", "-shm").forEach { File("${temp.path}$it").delete() } }
                 }
             }
             runCatching { callback?.onResult(status) }.onFailure { Log.w(TAG, "restoreBackupFile: callback failed", it) }
