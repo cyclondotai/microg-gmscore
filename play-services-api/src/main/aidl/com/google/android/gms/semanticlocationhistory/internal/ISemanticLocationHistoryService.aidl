@@ -7,6 +7,7 @@ package com.google.android.gms.semanticlocationhistory.internal;
 
 import com.google.android.gms.common.api.ApiMetadata;
 import com.google.android.gms.common.api.internal.IStatusCallback;
+import android.os.ParcelFileDescriptor;
 import com.google.android.gms.semanticlocation.SemanticLocationState;
 import com.google.android.gms.semanticlocationhistory.LocationHistorySegment;
 import com.google.android.gms.semanticlocationhistory.LocationHistorySegmentRequest;
@@ -28,4 +29,7 @@ interface ISemanticLocationHistoryService {
     void getLocationHistorySettings(in ISemanticLocationHistoryCallbacks callback, in RequestCredentials requestCredentials, in ApiMetadata apiMetadata) = 10;
     void getExperimentVisits(in ISemanticLocationHistoryCallbacks callback, in RequestCredentials requestCredentials, in ApiMetadata apiMetadata) = 11;
     void editCsl(in IStatusCallback callback, in RequestCredentials requestCredentials, in SemanticLocationEditInputs editInputs, in SemanticLocationState state, in ApiMetadata apiMetadata) = 12;
+    // Play services 26.19+ (feature odlh_backup_file): Maps' device-to-device backup and restore of the Timeline database.
+    void getBackupFile(in ISemanticLocationHistoryCallbacks callback, in RequestCredentials requestCredentials, in ApiMetadata apiMetadata) = 13;
+    void restoreBackupFile(in IStatusCallback callback, in RequestCredentials requestCredentials, in ParcelFileDescriptor file, in ApiMetadata apiMetadata) = 14;
 }

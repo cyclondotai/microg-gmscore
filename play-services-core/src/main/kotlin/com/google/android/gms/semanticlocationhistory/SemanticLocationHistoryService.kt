@@ -7,6 +7,7 @@ package com.google.android.gms.semanticlocationhistory
 
 import android.content.Context
 import android.os.Parcel
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -31,7 +32,9 @@ import com.google.android.gms.semanticlocationhistory.internal.ISemanticLocation
 import com.google.android.gms.semanticlocationhistory.internal.ISemanticLocationHistoryService
 import com.google.android.gms.semanticlocationhistory.utils.SegmentEditHandler
 import com.google.android.gms.semanticlocationhistory.utils.SegmentQueryHandler
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.microg.gms.BaseService
 import org.microg.gms.common.GmsService
 import org.microg.gms.common.PackageUtils
@@ -47,7 +50,12 @@ private val FEATURES = arrayOf(
     Feature("get_location_history_settings", 1),
     Feature("get_experiment_visits", 1),
     Feature("edit_csl", 1),
+    // Maps 26.19+ backs up and restores Timeline in device-to-device transfers (getBackupFile, restoreBackupFile).
+    Feature("odlh_backup_file", 1),
 )
+
+/** Only Maps may export or replace Timeline in a device-to-device transfer, as in Play services. */
+internal val BACKUP_FILE_PACKAGES = setOf("com.google.android.apps.maps")
 
 class SemanticLocationHistoryService : BaseService(TAG, GmsService.SEMANTIC_LOCATION_HISTORY) {
     override fun handleServiceRequest(callback: IGmsCallbacks, request: GetServiceRequest, service: GmsService) {
@@ -55,13 +63,17 @@ class SemanticLocationHistoryService : BaseService(TAG, GmsService.SEMANTIC_LOCA
         Log.d(TAG, "handleServiceRequest: packageName: $packageName")
         OdlhBackupService.scheduleBackup(this)
         callback.onPostInitCompleteWithConnectionInfo(
-            ConnectionResult.SUCCESS, SemanticLocationHistoryServiceImpl(this, lifecycle).asBinder(), ConnectionInfo().apply {
+            ConnectionResult.SUCCESS, SemanticLocationHistoryServiceImpl(this, lifecycle, packageName).asBinder(), ConnectionInfo().apply {
                 features = FEATURES
             })
     }
 }
 
-class SemanticLocationHistoryServiceImpl(val context: Context, override val lifecycle: Lifecycle) : ISemanticLocationHistoryService.Stub(), LifecycleOwner {
+class SemanticLocationHistoryServiceImpl(
+    val context: Context,
+    override val lifecycle: Lifecycle,
+    private val callingPackage: String? = null
+) : ISemanticLocationHistoryService.Stub(), LifecycleOwner {
     private val storageManager by lazy { OdlhStorageManager.getInstance(context) }
 
     override fun getSegments(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, request: LocationHistorySegmentRequest?, apiMetadata: ApiMetadata?) {
@@ -367,6 +379,69 @@ class SemanticLocationHistoryServiceImpl(val context: Context, override val life
     override fun editCsl(callback: IStatusCallback?, requestCredentials: RequestCredentials?, editInputs: SemanticLocationEditInputs?, state: SemanticLocationState?, apiMetadata: ApiMetadata?) {
         Log.d(TAG, "Not yet implemented: editCsl editInputs:$editInputs state:$state")
         callback?.onResult(Status.SUCCESS)
+    }
+
+    /** Why a device-to-device backup file call is refused (Play services' status), or null. */
+    private fun backupFileRefusal(requestCredentials: RequestCredentials?): Status? = when {
+        !LocationSettings(context).mapsTimeline -> Status(17, "Feature is disabled")
+        callingPackage !in BACKUP_FILE_PACKAGES || requestCredentials?.packageName !in BACKUP_FILE_PACKAGES ->
+            Status(CommonStatusCodes.DEVELOPER_ERROR, "Package not allowed")
+        else -> null
+    }
+
+    override fun getBackupFile(callback: ISemanticLocationHistoryCallbacks?, requestCredentials: RequestCredentials?, apiMetadata: ApiMetadata?) {
+        Log.d(TAG, "getBackupFile: caller=$callingPackage")
+        backupFileRefusal(requestCredentials)?.let { runCatching { callback?.onBackupFile(it, null, ApiMetadata.DEFAULT) }; return }
+        lifecycleScope.launch {
+            val (status, file) = withContext(Dispatchers.IO) {
+                try {
+                    storageManager.openDatabaseFileForBackup()?.let { Status.SUCCESS to it }
+                        ?: (Status(CommonStatusCodes.ERROR, "Database file does not exist") to null)
+                } catch (e: Exception) {
+                    Log.w(TAG, "getBackupFile failed", e)
+                    Status(CommonStatusCodes.INTERNAL_ERROR, "Failed to open database file") to null
+                }
+            }
+            try {
+                callback?.onBackupFile(status, file, ApiMetadata.DEFAULT)
+            } catch (e: Exception) {
+                Log.w(TAG, "getBackupFile: callback failed", e)
+            } finally {
+                runCatching { file?.close() }
+            }
+        }
+    }
+
+    override fun restoreBackupFile(callback: IStatusCallback?, requestCredentials: RequestCredentials?, file: ParcelFileDescriptor?, apiMetadata: ApiMetadata?) {
+        Log.d(TAG, "restoreBackupFile: caller=$callingPackage")
+        backupFileRefusal(requestCredentials)?.let {
+            runCatching { file?.close() }
+            runCatching { callback?.onResult(it) }
+            return
+        }
+        if (file == null) {
+            runCatching { callback?.onResult(Status(CommonStatusCodes.DEVELOPER_ERROR, "Missing backup file")) }
+            return
+        }
+        lifecycleScope.launch {
+            val status = withContext(Dispatchers.IO) {
+                val copy = context.getDatabasePath("odlh-storage-backup.db")
+                try {
+                    ParcelFileDescriptor.AutoCloseInputStream(file).use { input ->
+                        copy.outputStream().use { input.copyTo(it) }
+                    }
+                    val counts = storageManager.mergeSegmentsFrom(copy)
+                    Log.d(TAG, "restoreBackupFile: $counts")
+                    Status.SUCCESS
+                } catch (e: Exception) {
+                    Log.w(TAG, "restoreBackupFile failed", e)
+                    Status(CommonStatusCodes.INTERNAL_ERROR, e.message)
+                } finally {
+                    listOf("", "-journal", "-wal", "-shm").forEach { context.getDatabasePath("odlh-storage-backup.db$it").delete() }
+                }
+            }
+            runCatching { callback?.onResult(status) }.onFailure { Log.w(TAG, "restoreBackupFile: callback failed", it) }
+        }
     }
 
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {

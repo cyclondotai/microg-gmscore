@@ -7,6 +7,7 @@ package com.google.android.gms.semanticlocationhistory.internal;
 
 import com.google.android.gms.common.api.ApiMetadata;
 import com.google.android.gms.common.api.Status;
+import android.os.ParcelFileDescriptor;
 import com.google.android.gms.common.data.DataHolder;
 import com.google.android.gms.semanticlocationhistory.ExperimentVisitsResponse;
 import com.google.android.gms.semanticlocationhistory.InferredPlace;
@@ -26,4 +27,5 @@ interface ISemanticLocationHistoryCallbacks {
     void onGetBackupSummaryResponse(in Status status, in List<OdlhBackupSummary> summaries, in ApiMetadata apiMetadata) = 7;
     void onLocationHistorySettings(in Status status, in LocationHistorySettings locationHistorySettings, in ApiMetadata apiMetadata) = 8;
     void onGetExperimentVisitsResponse(in Status status, in ExperimentVisitsResponse response, in ApiMetadata apiMetadata) = 9;
+    oneway void onBackupFile(in Status status, in ParcelFileDescriptor file, in ApiMetadata apiMetadata) = 10;
 }

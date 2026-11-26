@@ -8,8 +8,10 @@ package com.google.android.gms.semanticlocationhistory.db
 import android.content.ContentValues
 import android.content.Context
 import android.database.Cursor
+import android.database.DatabaseUtils
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.google.android.gms.semanticlocationhistory.SEGMENT_TYPE_ACTIVITY
 import com.google.android.gms.semanticlocationhistory.SEGMENT_TYPE_DELETED
@@ -74,6 +76,7 @@ class OdlhStorageManager(context: Context) : Closeable {
     }
 
     private val dbHelper = OdlhDatabaseHelper(context)
+    private val databaseFile: File = context.getDatabasePath(DATABASE_NAME)
     private var database: SQLiteDatabase? = null
     private val lock = Any()
 
@@ -974,6 +977,80 @@ class OdlhStorageManager(context: Context) : Closeable {
             })
         }
         setMetadata(tombstoneMetadataKey(gaiaId), array.toString())
+    }
+
+    /**
+     * The whole Timeline database for Maps' device-to-device backup (Play services 26.19+, `odlh_backup_file`): the
+     * write-ahead log is folded in first so the file alone is complete. Null when there is no database yet.
+     */
+    fun openDatabaseFileForBackup(): ParcelFileDescriptor? {
+        if (!databaseFile.exists()) return null
+        synchronized(lock) {
+            openDatabase().rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { it.moveToNext() }
+            return ParcelFileDescriptor.open(databaseFile, ParcelFileDescriptor.MODE_READ_ONLY)
+        }
+    }
+
+    data class MergeCounts(val restored: Int, val skipped: Int)
+
+    /**
+     * Merges the semantic segments of another phone's Timeline database ([backup], what Maps hands over in a
+     * device-to-device restore) into this one, account by account. Deleted segments and ones with an invalid time range
+     * are dropped; a segment that overlaps one of the same type already here is skipped, so restoring twice or onto a
+     * phone that already recorded the time adds nothing.
+     */
+    fun mergeSegmentsFrom(backup: File): MergeCounts {
+        SQLiteDatabase.openDatabase(backup.path, null, SQLiteDatabase.OPEN_READONLY).use { source ->
+            val sourceColumns = source.tableColumns(TABLE_SEMANTIC_SEGMENT)
+            require(sourceColumns.isNotEmpty()) { "Table not found in backup: $TABLE_SEMANTIC_SEGMENT" }
+            return withTransaction { db ->
+                val columns = (db.tableColumns(TABLE_SEMANTIC_SEGMENT) intersect sourceColumns.toSet()) - COLUMN_ID
+                val accounts = source.query(true, TABLE_SEMANTIC_SEGMENT, arrayOf(COLUMN_OBFUSCATED_GAIA_ID), null, null, null, null, null, null)
+                    .use { c -> buildList { while (c.moveToNext()) c.getString(0)?.let { add(it) } } }
+                var restored = 0
+                var skipped = 0
+                for (gaiaId in accounts) {
+                    source.query(TABLE_SEMANTIC_SEGMENT, columns.toTypedArray(), "$COLUMN_OBFUSCATED_GAIA_ID = ?", arrayOf(gaiaId), null, null, null).use { c ->
+                        while (c.moveToNext()) {
+                            val values = ContentValues().also { DatabaseUtils.cursorRowToContentValues(c, it) }
+                            val type = values.getAsInteger(COLUMN_SEGMENT_TYPE) ?: continue
+                            if (type == SEGMENT_TYPE_DELETED) continue
+                            val start = values.getAsLong(COLUMN_START_TIMESTAMP)
+                            val end = values.getAsLong(COLUMN_END_TIMESTAMP)
+                            if (start == null || end == null || start > end) {
+                                Log.w(TAG, "mergeSegmentsFrom: invalid segment start or end time")
+                                continue
+                            }
+                            if (db.hasOverlappingSegment(gaiaId, type, start, end)) {
+                                skipped++
+                                continue
+                            }
+                            if (values.getAsLong(COLUMN_DATABASE_ID) == null) values.put(COLUMN_DATABASE_ID, getDatabaseId())
+                            if (db.insertWithOnConflict(TABLE_SEMANTIC_SEGMENT, null, values, SQLiteDatabase.CONFLICT_IGNORE) != -1L) restored++ else skipped++
+                        }
+                    }
+                }
+                Log.i(TAG, "mergeSegmentsFrom: restored $restored segments, skipped $skipped segments")
+                MergeCounts(restored, skipped)
+            }
+        }
+    }
+
+    private fun SQLiteDatabase.tableColumns(table: String): List<String> =
+        rawQuery("PRAGMA table_info($table)", null).use { c ->
+            val name = c.getColumnIndexOrThrow("name")
+            buildList { while (c.moveToNext()) add(c.getString(name)) }
+        }
+
+    private fun SQLiteDatabase.hasOverlappingSegment(gaiaId: String, type: Int, start: Long, end: Long): Boolean {
+        // A point segment overlaps what contains it; a range overlaps what shares more than an end point with it.
+        val (selection, args) = if (start == end) {
+            "$COLUMN_START_TIMESTAMP <= ? AND $COLUMN_END_TIMESTAMP >= ?" to arrayOf(start.toString(), start.toString())
+        } else {
+            "$COLUMN_START_TIMESTAMP < ? AND $COLUMN_END_TIMESTAMP > ?" to arrayOf(end.toString(), start.toString())
+        }
+        return query(TABLE_SEMANTIC_SEGMENT, arrayOf(COLUMN_ID), "$COLUMN_OBFUSCATED_GAIA_ID = ? AND $COLUMN_SEGMENT_TYPE = ? AND $selection",
+            arrayOf(gaiaId, type.toString()) + args, null, null, null, "1").use { it.moveToNext() }
     }
 
     private fun Cursor.getLongOrNull(columnName: String): Long? =
