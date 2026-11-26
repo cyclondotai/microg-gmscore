@@ -123,6 +123,7 @@ private class CredentialManagerServiceImpl(private val context: Context, overrid
 
     override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean = warnOnTransactionIssues(code, reply, flags, TAG) { super.onTransact(code, data, reply, flags) }
 }
+
 /**
  * The device-wide "use screen lock before filling passwords" choice Chrome shows in its password settings. As in
  * Play services, it is off until the owner turns it on, and it only applies while the phone has a screen lock.

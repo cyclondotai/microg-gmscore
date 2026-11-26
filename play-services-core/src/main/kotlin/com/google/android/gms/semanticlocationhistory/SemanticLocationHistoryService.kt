@@ -54,7 +54,7 @@ private val FEATURES = arrayOf(
     Feature("odlh_backup_file", 1),
 )
 
-/** Only Maps may export or replace Timeline in a device-to-device transfer, as in Play services. */
+/** Only Maps may export or restore Timeline in a device-to-device transfer, as in Play services. */
 internal val BACKUP_FILE_PACKAGES = setOf("com.google.android.apps.maps")
 
 class SemanticLocationHistoryService : BaseService(TAG, GmsService.SEMANTIC_LOCATION_HISTORY) {
