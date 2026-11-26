@@ -35,6 +35,7 @@ internal class MigrationInstallQueue(private val context: Context,
         val throttledAt: Long,
         val tier: Int,
         val priorityRank: Int,
+        val sizeRank: Long,
     )
     /** Ordered priority packages for [id], falling back to the legacy unordered set if no order was stored. */
     fun priorityOrder(id: String = currentSessionId().orEmpty()): List<String> {
@@ -42,21 +43,35 @@ internal class MigrationInstallQueue(private val context: Context,
         if (stored != null) return stored.split(',').filter { it.isNotEmpty() }
         return prefs.getStringSet("$id:priority", emptySet()).orEmpty().sorted()
     }
+    /** Whether non-prioritized bulk apps for [id] are buffered until Switch finishes copying (CYC-3422). */
+    fun isBulkDeferred(id: String = currentSessionId().orEmpty()): Boolean {
+        if (id.isEmpty() || !prefs.getBoolean("$id:defer_bulk", false)) return false
+        if (prefs.getBoolean("$id:selection_closed", false)) return false
+        if (prefs.getString("$id:transfer_outcome", null) != null) return false
+        if (prefs.getString("handoff_session", null) == id && prefs.contains("handoff_outcome")) return false
+        return true
+    }
     /** Pending installs across sessions. Apps Play refused most recently go last, so one cannot block the rest. */
     fun dispatchOrder(): List<Pair<String, String>> = sessions().flatMap { id ->
         // Each app's sort keys are read once, not on every comparison (a stable sort on the same keys: the same order).
         val ordered = priorityOrder(id)
         val priority = ordered.toSet()
+        val deferred = isBulkDeferred(id)
         val rank = if (prefs.contains("$id:priority_order")) ordered.withIndex().associate { (i, name) -> name to i } else emptyMap()
-        pending(id).sorted().map { name ->
-            DispatchEntry(
-                id to name,
-                prefs.getLong("$id:$name:throttled_at", 0),
-                tier(id, name, priority),
-                rank[name] ?: Int.MAX_VALUE,
-            )
-        }
-    }.sortedWith(compareBy({ it.throttledAt }, { it.tier }, { it.priorityRank })).map { it.item }
+        pending(id).asSequence()
+            .filter { name -> !deferred || name in priority }
+            .sorted()
+            .map { name ->
+                val size = prefs.getLong("$id:$name:installSize", 0L)
+                DispatchEntry(
+                    id to name,
+                    prefs.getLong("$id:$name:throttled_at", 0),
+                    tier(id, name, priority),
+                    rank[name] ?: Int.MAX_VALUE,
+                    if (size > 0L) size else Long.MAX_VALUE,
+                )
+            }.toList()
+    }.sortedWith(compareBy({ it.throttledAt }, { it.tier }, { it.priorityRank }, { it.sizeRank })).map { it.item }
     /**
      * Within a session's open apps: the ones Setup asked for first ([prioritize]: the sign-in apps), then the ones going to
      * the phone's Google account after Play refused the anonymous session, then the rest in package order (11-17
@@ -177,12 +192,42 @@ internal class MigrationInstallQueue(private val context: Context,
         return id
     }
 
-    fun beginHandoff(run: String, resumeOnly: Boolean): Bundle = synchronized(LOCK) {
+    fun beginHandoff(run: String, resumeOnly: Boolean, deferBulk: Boolean = false): Bundle = synchronized(LOCK) {
+        var created = false
         if (prefs.getString("handoff_run", null) != run) {
             if (resumeOnly) return Bundle().apply { putBoolean("accepted", false) }
             newSession(run)
+            created = true
         }
-        Bundle().apply { putBoolean("accepted", !prefs.contains("handoff_outcome")) }
+        val accepted = !prefs.contains("handoff_outcome")
+        if (accepted && deferBulk) {
+            val id = prefs.getString("handoff_session", null)
+            if (id != null && (created || (!prefs.getBoolean("$id:selection_closed", false) && !prefs.getBoolean("$id:bulk_released", false)))) {
+                check(prefs.edit().putBoolean("$id:defer_bulk", true).commit())
+            }
+        }
+        Bundle().apply { putBoolean("accepted", accepted) }
+    }
+    /** Releases non-prioritized bulk apps for [run] once Switch finishes copying (CYC-3422). */
+    fun releaseBulkHandoff(run: String): Bundle = synchronized(LOCK) {
+        val id = prefs.getString("handoff_session", null)
+        if (prefs.getString("handoff_run", null) != run || id == null) {
+            return@synchronized Bundle().apply {
+                putBoolean("supported", true)
+                putBoolean("accepted", false)
+            }
+        }
+        val wasDeferred = prefs.getBoolean("$id:defer_bulk", false)
+        check(prefs.edit().putBoolean("$id:defer_bulk", false).putBoolean("$id:bulk_released", true).commit())
+        if (wasDeferred) {
+            changed(id)
+            if (pending(id).isNotEmpty()) schedule()
+        }
+        Bundle().apply {
+            putBoolean("supported", true)
+            putBoolean("accepted", true)
+            putBoolean("bulk_deferred", false)
+        }
     }
 
     /** A projection of saved selections only. Reading it never waits for or calls Aurora. */
@@ -209,6 +254,8 @@ internal class MigrationInstallQueue(private val context: Context,
             if (offset + names.size < selected.size) putInt("next_offset", offset + names.size)
             putStringArrayList("packages", ArrayList(names))
             putStringArrayList("titles", ArrayList(names.map { name -> (snapshot["$id:$name:title"] as? String)?.take(80) ?: name }))
+            putLongArray("install_sizes", LongArray(names.size) { i -> (snapshot["$id:${names[i]}:installSize"] as? Long)?.takeIf { it > 0L } ?: 0L })
+            putBoolean("bulk_deferred", id != null && isBulkDeferred(id))
             val pending = snapshot["$id:pending"] as? Set<*> ?: emptySet<String>()
             val restoreEligible = id != null && id == snapshot["current_session"] &&
                 (snapshot["$id:option:restore_source"] as? String)?.toIntOrNull() in ANDROID_D2D_RESTORE_SOURCES &&
@@ -371,6 +418,10 @@ internal class MigrationInstallQueue(private val context: Context,
             doc.getString(key)?.let { edit.putString("$id:$name:$key", it) }
         }
         if (doc.containsKey("version_code")) edit.putLong("$id:$name:expectedVersion", doc.getLong("version_code"))
+        if (doc.containsKey("install_size")) {
+            val size = doc.getLong("install_size")
+            if (size > 0L) edit.putLong("$id:$name:installSize", size)
+        }
     }
     fun select(documents: List<Bundle>) {
         // Aurora is asked outside LOCK: with Switch's update hold on, a slow answer must not hold the queue's bookkeeping.
@@ -395,7 +446,8 @@ internal class MigrationInstallQueue(private val context: Context,
     fun finishSelection(id: String) = synchronized(LOCK) {
         require(id in sessions())
         if (!prefs.getBoolean("$id:selection_closed", false)) {
-            check(prefs.edit().putBoolean("$id:selected", true).putBoolean("$id:selection_closed", true).commit())
+            check(prefs.edit().putBoolean("$id:selected", true).putBoolean("$id:selection_closed", true)
+                .putBoolean("$id:defer_bulk", false).putBoolean("$id:bulk_released", true).commit())
             changed(id); schedule()
         }
     }
@@ -412,6 +464,7 @@ internal class MigrationInstallQueue(private val context: Context,
         }
         val alreadyClosed = prefs.getBoolean("$id:selection_closed", false)
         val edit = prefs.edit().putBoolean("$id:selected", true).putBoolean("$id:selection_closed", true)
+            .putBoolean("$id:defer_bulk", false).putBoolean("$id:bulk_released", true)
         if (!prefs.contains("$id:transfer_outcome")) edit.putString("$id:transfer_outcome", outcome)
         if (recordHandoff) edit.putString("handoff_outcome", outcome)
         check(edit.commit())
@@ -861,12 +914,22 @@ internal class MigrationInstallQueue(private val context: Context,
         } + prefs.getStringSet("$id:excluded", emptySet()).orEmpty().filter { !isSelected(id, it) }.sorted().map { name ->
             document(id, name).apply { putBoolean("terminal", true); putBoolean("excluded", true) }
         }
+        val bulkDeferred = isBulkDeferred(id)
+        val prioritySet = if (bulkDeferred) priorityOrder(id).toSet() else emptySet()
+        val pendingSet = pending(id)
+        val activePending = if (bulkDeferred) pendingSet.any { it in prioritySet } else pendingSet.isNotEmpty()
+        val hasActiveWork = activePending || results.any { row ->
+            val pkg = row.getString("package_name").orEmpty()
+            !row.getBoolean("terminal") && !(bulkDeferred && pkg in pendingSet && pkg !in prioritySet)
+        }
         return Bundle().apply {
             putString("session_id", id); putParcelableArray("cyclon_app_results", results.toTypedArray())
             putString("transfer_outcome", prefs.getString("$id:transfer_outcome", null))
             putBoolean("all_installed", results.all { it.getBoolean("installed") })
             putBoolean("selection_closed", prefs.getBoolean("$id:selection_closed", false))
-            putBoolean("installs_settled", pending(id).isEmpty() && results.all { it.getBoolean("terminal") })
+            putBoolean("installs_settled", pendingSet.isEmpty() && results.all { it.getBoolean("terminal") })
+            putBoolean("bulk_deferred", bulkDeferred)
+            putBoolean("has_active_work", hasActiveWork)
             putBoolean("complete", getBoolean("selection_closed") && getBoolean("installs_settled"))
             putBundle("setup_options", options(id))
             putString("cyclon_hold_state", if (getBoolean("complete")) "complete" else "installing")
@@ -1201,7 +1264,7 @@ internal class MigrationInstallQueue(private val context: Context,
         /** At most this many sign-in apps go first per call ([prioritize]). */
         private const val MAX_PRIORITY = 50
         /** Maximum total ordered priority packages retained for one session. */
-        private const val MAX_PRIORITY_TOTAL = 200
+        private const val MAX_PRIORITY_TOTAL = 500
         private val PACKAGE = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
         /** The anonymous session's own limits: Play throttling it, not listing the app in its country, or no session. */
         private val ANONYMOUS_FAILURES = setOf(RATE_LIMITED, "not_found", "anonymous_sign_in_required", "not_signed_in", "session_expired")
@@ -1245,7 +1308,7 @@ class MigrationInstallJob : JobService() {
                         } else if (queue.selected(id).isNotEmpty()) {
                             // Settled chunks do not prove the selection closed. Preserve the lease and
                             // receipts without polling forever; the next chunk/explicit close schedules work.
-                            if (!state.getBoolean("installs_settled")) retry = true
+                            if (state.getBoolean("has_active_work", !state.getBoolean("installs_settled"))) retry = true
                             queue.renewPause(id)
                         }
                     }

@@ -438,4 +438,40 @@ class TransferSessionProviderTest {
         assertEquals(companionUid, Binder.getCallingUid())
         assertEquals(0, TransferSessionBinderIdentityShadow.clears)
     }
+
+    @Test fun beginHandoffDeferBulkAndCoreReleaseBulkHandoffEnforceCallerChecks() {
+        val run = "00000000-0000-0000-0000-000000000042"
+        val coreUid = 42424
+        install("ai.cyclon.core", coreUid, ApplicationInfo.FLAG_SYSTEM, platform)
+
+        // Companion starts iPhone handoff with defer_bulk=true.
+        ShadowBinder.setCallingUid(companionUid)
+        val started = provider.call("beginHandoff", run, Bundle().apply { putBoolean("defer_bulk", true) })
+        assertTrue(started.getBoolean("accepted"))
+
+        val q = MigrationInstallQueue(context) { _, name ->
+            Bundle().apply { putString("package_name", name); putString("status", "none") }
+        }
+        q.select(listOf(Bundle().apply {
+            putString("package_name", "org.example.bulk")
+            putLong("version_code", 1)
+            putLong("install_size", 123_456L)
+        }))
+        assertTrue(q.isBulkDeferred())
+
+        // Companion cannot call releaseBulkHandoff (CORE-only).
+        assertTrue(runCatching { provider.call("releaseBulkHandoff", run, null) }.exceptionOrNull() is SecurityException)
+
+        // Core can read bulk_deferred + install_sizes and releaseBulkHandoff.
+        ShadowBinder.setCallingUid(coreUid)
+        val before = provider.call("getHandoff", run, null)
+        assertTrue(before.getBoolean("bulk_deferred"))
+        assertArrayEquals(longArrayOf(123_456L), before.getLongArray("install_sizes"))
+
+        val released = provider.call("releaseBulkHandoff", run, null)
+        assertTrue(released.getBoolean("supported"))
+        assertTrue(released.getBoolean("accepted"))
+        assertFalse(released.getBoolean("bulk_deferred"))
+        assertFalse(q.isBulkDeferred())
+    }
 }

@@ -297,4 +297,82 @@ class MigrationPriorityTest {
         queue.dispatchRound()
         assertEquals("once op 8 returns success=true, priority_dirty clears and stops retrying", afterSecond, attempts)
     }
+
+    @Test fun deferBulkHoldsUnprioritizedAppsUntilReleasedThenDispatchesSmallestFirst() {
+        val handed = mutableListOf<String>()
+        val queue = MigrationInstallQueue(context) { operation, name ->
+            if (operation == 2) { handed += name; state(name, "queued") } else state(name, "none")
+        }
+        fun sizedDoc(name: String, size: Long) = doc(name).apply { if (size > 0L) putLong("install_size", size) }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
+        queue.select(listOf(
+            sizedDoc("com.big.app", 500_000_000L),
+            sizedDoc("com.medium.app", 150_000_000L),
+            sizedDoc("com.small.app", 20_000_000L),
+            sizedDoc("com.unknown.app", 0L),
+            sizedDoc("com.signin.one", 90_000_000L),
+            sizedDoc("com.signin.two", 110_000_000L),
+        ))
+
+        // Full roster + install_sizes + bulk_deferred visible immediately in handoff().
+        val receipt = queue.handoff(run)
+        assertTrue(receipt.getBoolean("bulk_deferred"))
+        assertEquals(6, receipt.getInt("total"))
+        val pkgs = receipt.getStringArrayList("packages")!!
+        val sizes = receipt.getLongArray("install_sizes")!!
+        assertEquals(pkgs.size, sizes.size)
+        assertEquals(500_000_000L, sizes[pkgs.indexOf("com.big.app")])
+        assertEquals(0L, sizes[pkgs.indexOf("com.unknown.app")])
+
+        // Nothing dispatches while gated and unprioritized; summary reports no active work.
+        assertTrue(queue.dispatchOrder().isEmpty())
+        queue.dispatchRound()
+        assertTrue(handed.isEmpty())
+        val idleSummary = queue.summary()
+        assertTrue(idleSummary.getBoolean("bulk_deferred"))
+        assertFalse(idleSummary.getBoolean("has_active_work"))
+        assertFalse(idleSummary.getBoolean("complete"))
+
+        // Sliding window: first prioritize signin.one, then signin.two — only those dispatch.
+        assertEquals(1, queue.prioritize(run, listOf("com.signin.one")).getInt("prioritized"))
+        queue.dispatchRound()
+        assertEquals(listOf("com.signin.one"), handed)
+        assertEquals(1, queue.prioritize(run, listOf("com.signin.two")).getInt("prioritized"))
+        queue.dispatchRound()
+        assertEquals(listOf("com.signin.one", "com.signin.two"), handed)
+
+        // Release bulk: remaining apps dispatch smallest-first, with unknown size last.
+        val released = queue.releaseBulkHandoff(run)
+        assertTrue(released.getBoolean("supported"))
+        assertTrue(released.getBoolean("accepted"))
+        assertFalse(released.getBoolean("bulk_deferred"))
+        assertFalse(queue.handoff(run).getBoolean("bulk_deferred"))
+
+        queue.dispatchRound()
+        assertEquals(
+            listOf("com.signin.one", "com.signin.two", "com.small.app", "com.medium.app", "com.big.app", "com.unknown.app"),
+            handed,
+        )
+        assertTrue(queue.pending().isEmpty())
+    }
+
+    @Test fun endHandoffAutomaticallyReleasesDeferredBulkAppsSmallestFirst() {
+        val handed = mutableListOf<String>()
+        val queue = MigrationInstallQueue(context) { operation, name ->
+            if (operation == 2) { handed += name; state(name, "queued") } else state(name, "none")
+        }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
+        queue.select(listOf(
+            doc("com.large.game").apply { putLong("install_size", 400_000_000L) },
+            doc("com.tiny.util").apply { putLong("install_size", 5_000_000L) },
+        ))
+        assertTrue(queue.dispatchOrder().isEmpty())
+
+        val ended = queue.endHandoff(run, "success")
+        assertTrue(ended.getBoolean("accepted"))
+        assertFalse(ended.getBoolean("bulk_deferred"))
+
+        queue.dispatchRound()
+        assertEquals(listOf("com.tiny.util", "com.large.game"), handed)
+    }
 }
