@@ -25,11 +25,11 @@ tasks.register('testVersionAllocation') {
         }
         baselines.each { label, baseline ->
             assertUpgradeFrom(allocated, baseline, label)
-            // These are valid range allocations but cannot advance this pair.
-            // Exercise each APK and baseline independently, including equality.
+            // These codes cannot advance this pair (an older reported version's block
+            // included). Exercise each APK and baseline independently, including equality.
             baseline.each { name, code ->
                 [code - 1, code].each { staleCode ->
-                    def stale = cyclonValidateVersion(release + [(name): staleCode], 40226)
+                    def stale = allocated + [(name): staleCode]
                     boolean rejected = false
                     try {
                         assertUpgradeFrom(stale, baseline, label)
@@ -41,8 +41,9 @@ tasks.register('testVersionAllocation') {
             }
         }
         assert allocated.gmsCode == Integer.parseInt(release.reportedGmsVersion.replaceAll('\\.', ''))
-        // Stay below Cloud Messaging's 26.12 gate until microG implements that service.
-        assert allocated.gmsCode < 261200
+        // Chrome 158 ships the Play services client library 26.43.80 (264380000) and asks for a Play services
+        // update below it (CYC-3296). Cloud Messaging service 457 (26.12+) is served by CloudMessagingService.
+        assert allocated.gmsCode >= 264380
         // First delivery after the exhausted FakeStore block is valid; neither
         // its compatibility version nor the reported GMS API version must rise.
         assert cyclonValidateVersion(release + [vendingVersionCode: 84022700], 40226).vendingVersionCode == 84022700
@@ -64,7 +65,7 @@ tasks.register('testVersionAllocation') {
                 assert expected.message.contains('allocation')
             }
         }
-        println('Verified upgrade from the published and installed APK versions, the Cloud Messaging ceiling and rejection of invalid allocations.')
+        println('Verified upgrade from the published and installed APK versions, the Chrome 158 floor and rejection of invalid allocations.')
     }
 }
 

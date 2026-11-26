@@ -468,6 +468,7 @@ public enum GmsService {
 
     NATIVE_HOTLOADER(447),
     TELEMETRY_NOTIFICATION(449, "com.google.android.gms.common.telemetry.notification.service.START"),
+    CLOUD_MESSAGING(457, "com.google.android.gms.cloudmessaging.service.START"),
     TELEMETRY_THROTTLING(483, "com.google.android.gms.common.telemetry.throttling.service.START"),
     ;
 

@@ -417,6 +417,16 @@
             android:name="org.microg.gms.gcm.McsService"
             android:process=":persistent" />
 
+        <!-- Cloud Messaging service 457: Firebase Messaging registers by Firebase installation here (Play services 26.12+). -->
+        <service
+            android:name="org.microg.gms.gcm.CloudMessagingService"
+            android:exported="true"
+            android:process=":persistent">
+            <intent-filter>
+                <action android:name="com.google.android.gms.cloudmessaging.service.START" />
+            </intent-filter>
+        </service>
+
         <!-- Cyclon: read-only push state for holders of READ_PUSH_STATE; call() enforces it, in McsService's process. -->
         <provider
             android:name="org.microg.gms.cyclon.PushStateProvider"

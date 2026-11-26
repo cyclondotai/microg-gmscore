@@ -29,7 +29,7 @@ import kotlin.coroutines.suspendCoroutine
 
 private const val TAG = "GmsGcmRegister"
 
-private suspend fun ensureCheckinIsUpToDate(context: Context) {
+internal suspend fun ensureCheckinIsUpToDate(context: Context) {
     if (!CheckinPreferences.isEnabled(context)) throw RuntimeException("Checkin disabled")
     val lastCheckin = LastCheckinInfo.read(context).lastCheckin
     if (lastCheckin < System.currentTimeMillis() - CheckinService.MAX_VALID_CHECKIN_AGE) {
