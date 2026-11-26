@@ -64,10 +64,21 @@ class ReauthBeforeAutofillingTest {
     @Test
     fun theCallbackIsOneWayTransactionOneWithStatusValueAndMetadata() {
         var received: Pair<Int, Boolean>? = null
-        val callback = object : IBooleanCallback.Stub() {
+        val stub = object : IBooleanCallback.Stub() {
             override fun onBoolean(status: Status?, value: Boolean, apiMetadata: ApiMetadata?) { received = status!!.statusCode to value }
         }
-        IBooleanCallback.Stub.asInterface(callback).onBoolean(Status.SUCCESS, true, ApiMetadata.DEFAULT)
+        var sentCode: Int? = null
+        var sentFlags: Int? = null
+        val remote = object : Binder() {
+            override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+                sentCode = code
+                sentFlags = flags
+                return stub.transact(code, data, reply, flags)
+            }
+        }
+        IBooleanCallback.Stub.asInterface(remote).onBoolean(Status.SUCCESS, true, ApiMetadata.DEFAULT)
+        assertEquals(1, sentCode)
+        assertEquals(Binder.FLAG_ONEWAY, sentFlags)
         assertEquals(0 to true, received)
     }
 

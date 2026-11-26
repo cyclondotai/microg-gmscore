@@ -77,6 +77,7 @@ class OdlhStorageManager(context: Context) : Closeable {
 
     private val dbHelper = OdlhDatabaseHelper(context)
     private val databaseFile: File = context.getDatabasePath(DATABASE_NAME)
+    private val backupCacheDir: File = context.cacheDir
     private var database: SQLiteDatabase? = null
     private val lock = Any()
 
@@ -980,14 +981,27 @@ class OdlhStorageManager(context: Context) : Closeable {
     }
 
     /**
-     * The whole Timeline database for Maps' device-to-device backup (Play services 26.19+, `odlh_backup_file`): the
-     * write-ahead log is folded in first so the file alone is complete. Null when there is no database yet.
+     * A point-in-time snapshot of the Timeline database for Maps' device-to-device backup (Play services 26.19+,
+     * `odlh_backup_file`). Pending edits are flushed into the main table first, then SQLite exports an isolated copy
+     * via `VACUUM INTO` so concurrent writes cannot tear pages while Maps reads the descriptor. Null when no database
+     * exists yet.
      */
     fun openDatabaseFileForBackup(): ParcelFileDescriptor? {
         if (!databaseFile.exists()) return null
         synchronized(lock) {
-            openDatabase().rawQuery("PRAGMA wal_checkpoint(TRUNCATE)", null).use { it.moveToNext() }
-            return ParcelFileDescriptor.open(databaseFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            val db = openDatabase()
+            val editedAccounts = db.query(true, TABLE_EDITED_SEGMENT, arrayOf(COLUMN_OBFUSCATED_GAIA_ID), null, null, null, null, null, null)
+                .use { c -> buildList { while (c.moveToNext()) c.getString(0)?.let { add(it) } } }
+            editedAccounts.forEach { flushEditsToMainTable(it) }
+            backupCacheDir.mkdirs()
+            val snapshot = File(backupCacheDir, "odlh-export-${System.nanoTime()}-${Random().nextInt(Int.MAX_VALUE)}.db")
+            snapshot.delete()
+            return try {
+                db.execSQL("VACUUM INTO ?", arrayOf(snapshot.path))
+                ParcelFileDescriptor.open(snapshot, ParcelFileDescriptor.MODE_READ_ONLY)
+            } finally {
+                listOf("", "-journal", "-wal", "-shm").forEach { File("${snapshot.path}$it").delete() }
+            }
         }
     }
 
@@ -996,13 +1010,14 @@ class OdlhStorageManager(context: Context) : Closeable {
     /**
      * Merges the semantic segments of another phone's Timeline database ([backup], what Maps hands over in a
      * device-to-device restore) into this one, account by account. Deleted segments and ones with an invalid time range
-     * are dropped; a segment that overlaps one of the same type already here is skipped, so restoring twice or onto a
-     * phone that already recorded the time adds nothing.
+     * are dropped; segments overlapping pre-existing rows of the same type (and hierarchy level for nested visits) are
+     * skipped, and restored rows receive this phone's local database ID so future cloud backups include them.
      */
     fun mergeSegmentsFrom(backup: File): MergeCounts {
         SQLiteDatabase.openDatabase(backup.path, null, SQLiteDatabase.OPEN_READONLY).use { source ->
             val sourceColumns = source.tableColumns(TABLE_SEMANTIC_SEGMENT)
             require(sourceColumns.isNotEmpty()) { "Table not found in backup: $TABLE_SEMANTIC_SEGMENT" }
+            val localDatabaseId = getDatabaseId()
             return withTransaction { db ->
                 val columns = (db.tableColumns(TABLE_SEMANTIC_SEGMENT) intersect sourceColumns.toSet()) - COLUMN_ID
                 val accounts = source.query(true, TABLE_SEMANTIC_SEGMENT, arrayOf(COLUMN_OBFUSCATED_GAIA_ID), null, null, null, null, null, null)
@@ -1010,6 +1025,7 @@ class OdlhStorageManager(context: Context) : Closeable {
                 var restored = 0
                 var skipped = 0
                 for (gaiaId in accounts) {
+                    val existingRanges = db.loadExistingRanges(gaiaId)
                     source.query(TABLE_SEMANTIC_SEGMENT, columns.toTypedArray(), "$COLUMN_OBFUSCATED_GAIA_ID = ?", arrayOf(gaiaId), null, null, null).use { c ->
                         while (c.moveToNext()) {
                             val values = ContentValues().also { DatabaseUtils.cursorRowToContentValues(c, it) }
@@ -1021,11 +1037,12 @@ class OdlhStorageManager(context: Context) : Closeable {
                                 Log.w(TAG, "mergeSegmentsFrom: invalid segment start or end time")
                                 continue
                             }
-                            if (db.hasOverlappingSegment(gaiaId, type, start, end)) {
+                            val level = if (type == SEGMENT_TYPE_VISIT) values.getAsInteger(COLUMN_HIERARCHY_LEVEL) ?: 0 else 0
+                            if (existingRanges.overlaps(type, level, start, end)) {
                                 skipped++
                                 continue
                             }
-                            if (values.getAsLong(COLUMN_DATABASE_ID) == null) values.put(COLUMN_DATABASE_ID, getDatabaseId())
+                            values.put(COLUMN_DATABASE_ID, localDatabaseId)
                             if (db.insertWithOnConflict(TABLE_SEMANTIC_SEGMENT, null, values, SQLiteDatabase.CONFLICT_IGNORE) != -1L) restored++ else skipped++
                         }
                     }
@@ -1042,15 +1059,33 @@ class OdlhStorageManager(context: Context) : Closeable {
             buildList { while (c.moveToNext()) add(c.getString(name)) }
         }
 
-    private fun SQLiteDatabase.hasOverlappingSegment(gaiaId: String, type: Int, start: Long, end: Long): Boolean {
-        // A point segment overlaps what contains it; a range overlaps what shares more than an end point with it.
-        val (selection, args) = if (start == end) {
-            "$COLUMN_START_TIMESTAMP <= ? AND $COLUMN_END_TIMESTAMP >= ?" to arrayOf(start.toString(), start.toString())
-        } else {
-            "$COLUMN_START_TIMESTAMP < ? AND $COLUMN_END_TIMESTAMP > ?" to arrayOf(end.toString(), start.toString())
+    private fun SQLiteDatabase.loadExistingRanges(gaiaId: String): Map<Pair<Int, Int>, List<Pair<Long, Long>>> {
+        val byKey = HashMap<Pair<Int, Int>, MutableList<Pair<Long, Long>>>()
+        query(
+            TABLE_SEMANTIC_SEGMENT,
+            arrayOf(COLUMN_SEGMENT_TYPE, COLUMN_HIERARCHY_LEVEL, COLUMN_START_TIMESTAMP, COLUMN_END_TIMESTAMP),
+            "$COLUMN_OBFUSCATED_GAIA_ID = ?",
+            arrayOf(gaiaId), null, null, null
+        ).use { c ->
+            while (c.moveToNext()) {
+                if (c.isNull(0) || c.isNull(2) || c.isNull(3)) continue
+                val type = c.getInt(0)
+                val level = if (type == SEGMENT_TYPE_VISIT && !c.isNull(1)) c.getInt(1) else 0
+                val start = c.getLong(2)
+                val end = c.getLong(3)
+                if (start <= end) byKey.getOrPut(type to level) { mutableListOf() }.add(start to end)
+            }
         }
-        return query(TABLE_SEMANTIC_SEGMENT, arrayOf(COLUMN_ID), "$COLUMN_OBFUSCATED_GAIA_ID = ? AND $COLUMN_SEGMENT_TYPE = ? AND $selection",
-            arrayOf(gaiaId, type.toString()) + args, null, null, null, "1").use { it.moveToNext() }
+        return byKey
+    }
+
+    private fun Map<Pair<Int, Int>, List<Pair<Long, Long>>>.overlaps(type: Int, level: Int, start: Long, end: Long): Boolean {
+        val ranges = this[type to level] ?: return false
+        return if (start == end) {
+            ranges.any { (exStart, exEnd) -> exStart <= start && exEnd >= start }
+        } else {
+            ranges.any { (exStart, exEnd) -> exStart < end && exEnd > start }
+        }
     }
 
     private fun Cursor.getLongOrNull(columnName: String): Long? =

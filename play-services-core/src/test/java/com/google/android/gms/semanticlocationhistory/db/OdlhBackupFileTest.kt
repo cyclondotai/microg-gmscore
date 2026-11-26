@@ -51,23 +51,29 @@ class OdlhBackupFileTest {
     @After fun close() = manager.close()
 
     /** Another phone's database: the shared columns plus one this build doesn't know. */
-    private fun backup(vararg rows: Triple<String, Int, Pair<Long?, Long?>>): File {
+    private data class BackupRow(val gaiaId: String, val type: Int, val start: Long?, val end: Long?, val hierarchyLevel: Int = 0)
+
+    private fun backup(vararg rows: Triple<String, Int, Pair<Long?, Long?>>): File =
+        backupRows(*rows.map { (g, t, r) -> BackupRow(g, t, r.first, r.second) }.toTypedArray())
+
+    private fun backupRows(vararg rows: BackupRow): File {
         val file = File(context.cacheDir, "backup-${System.nanoTime()}.db")
         SQLiteDatabase.openOrCreateDatabase(file, null).use { db ->
             db.execSQL(
                 "CREATE TABLE semantic_segment_table (_id INTEGER PRIMARY KEY, obfuscated_gaia_id TEXT NOT NULL, segment_id TEXT NOT NULL UNIQUE, " +
                     "segment_type INTEGER NOT NULL, semantic_segment BLOB NOT NULL, start_timestamp_seconds INTEGER, end_timestamp_seconds INTEGER, " +
-                    "timestamp_millis INTEGER NOT NULL DEFAULT 0, database_id INTEGER NOT NULL, newer_column TEXT)"
+                    "hierarchy_level INTEGER NOT NULL DEFAULT 0, timestamp_millis INTEGER NOT NULL DEFAULT 0, database_id INTEGER NOT NULL, newer_column TEXT)"
             )
-            rows.forEachIndexed { i, (gaiaId, type, range) ->
+            rows.forEachIndexed { i, row ->
                 db.insert("semantic_segment_table", null, ContentValues().apply {
                     put("_id", i + 1)
-                    put("obfuscated_gaia_id", gaiaId)
-                    put("segment_id", "$gaiaId-$type-${range.first}-${range.second}-${file.name}")
-                    put("segment_type", type)
+                    put("obfuscated_gaia_id", row.gaiaId)
+                    put("segment_id", "${row.gaiaId}-${row.type}-${row.hierarchyLevel}-${row.start}-${row.end}-${file.name}")
+                    put("segment_type", row.type)
                     put("semantic_segment", byteArrayOf(1, 2, 3))
-                    put("start_timestamp_seconds", range.first)
-                    put("end_timestamp_seconds", range.second)
+                    put("start_timestamp_seconds", row.start)
+                    put("end_timestamp_seconds", row.end)
+                    put("hierarchy_level", row.hierarchyLevel)
                     put("database_id", 77L)
                     put("newer_column", "x")
                 })
@@ -108,15 +114,54 @@ class OdlhBackupFileTest {
     }
 
     @Test
-    fun theBackupFileIsTheWholeDatabaseReadOnly() {
-        manager.mergeSegmentsFrom(backup(Triple("gaia-1", 1, 100L to 200L)))
+    fun theBackupFileIsAnIsolatedSnapshotThatFlushesPendingEdits() {
+        val localDbId = manager.getDatabaseId()
+        manager.insertSegment(
+            "gaia-1",
+            SemanticSegment(
+                segmentId = "orig-1", segmentType = 1, data = byteArrayOf(1),
+                startTimestamp = 100L, endTimestamp = 200L, databaseId = localDbId
+            )
+        )
+        manager.insertEditedSegment(
+            "gaia-1",
+            SemanticSegment(
+                segmentId = "edit-1", segmentType = 1, data = byteArrayOf(9, 9),
+                startTimestamp = 100L, endTimestamp = 200L,
+                blockStartTimestamp = 100L, blockEndTimestamp = 200L, databaseId = localDbId
+            )
+        )
         val descriptor = manager.openDatabaseFileForBackup()
         assertNotNull(descriptor)
+        // Writes after openDatabaseFileForBackup must not mutate the already-opened snapshot.
+        manager.insertSegment(
+            "gaia-1",
+            SemanticSegment(
+                segmentId = "after-export", segmentType = 2, data = byteArrayOf(3),
+                startTimestamp = 500L, endTimestamp = 600L, databaseId = localDbId
+            )
+        )
         val copy = File(context.cacheDir, "exported.db")
         ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { input -> copy.outputStream().use { out -> input.copyTo(out) } }
         SQLiteDatabase.openDatabase(copy.path, null, SQLiteDatabase.OPEN_READONLY).use { db ->
-            db.rawQuery("SELECT count(*) FROM semantic_segment_table", null).use { c -> assertTrue(c.moveToNext()); assertEquals(1, c.getInt(0)) }
+            db.rawQuery("SELECT segment_id FROM semantic_segment_table", null).use { c ->
+                val ids = buildList { while (c.moveToNext()) add(c.getString(0)) }
+                assertEquals(listOf("edit-1"), ids)
+            }
         }
+    }
+
+    @Test
+    fun nestedVisitsArePreservedAndRestoredRowsGetLocalDatabaseId() {
+        val nested = backupRows(
+            BackupRow("gaia-1", 1, 100L, 300L, hierarchyLevel = 0),
+            BackupRow("gaia-1", 1, 150L, 200L, hierarchyLevel = 1)
+        )
+        assertEquals(OdlhStorageManager.MergeCounts(restored = 2, skipped = 0), manager.mergeSegmentsFrom(nested))
+        assertEquals(OdlhStorageManager.MergeCounts(restored = 0, skipped = 2), manager.mergeSegmentsFrom(nested))
+        val localRows = manager.queryRawSegmentRows("gaia-1", manager.getDatabaseId())
+        assertEquals(2, localRows.size)
+        assertTrue(localRows.all { it.databaseId == manager.getDatabaseId() })
     }
 
     @Test
