@@ -263,6 +263,61 @@ class TransferSessionProviderTest {
         assertEquals(listOf("org.example.notfound", "org.example.unsupported"), closed.getStringArrayList("packages"))
         assertEquals(listOf("unavailable", "unavailable"), closed.getStringArrayList("statuses"))
         assertEquals(listOf("not_found", "app_not_supported"), closed.getStringArrayList("errors"))
+        assertArrayEquals(booleanArrayOf(true, true), closed.getBooleanArray("excluded"))
+        assertArrayEquals(booleanArrayOf(false, false), closed.getBooleanArray("recoverable"))
+    }
+
+    /** CYC-3409: handoff distinguishes selected apps, non-recoverable catalog exclusions, and recoverable ones, and persists learned titles. */
+    @Test fun cyc3409HandoffCarriesExclusionProvenanceAndBackfillsLearnedTitles() {
+        val run = "00000000-0000-0000-0000-000000000001"
+        val queue = MigrationInstallQueue(context) { _, name ->
+            Bundle().apply { putString("package_name", name); putString("status", "none") }
+        }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false).getBoolean("accepted"))
+        val id = queue.catalogSession()
+        val chosen = "org.example.a.chosen"
+        val timedOut = "org.example.b.unchecked"
+        val missing = "org.example.c.missing"
+        val throttled = "org.example.d.throttled"
+        queue.recordCatalog(listOf(
+            Bundle().apply { putString("package_name", chosen); putString("title", "Chosen App"); putInt("availability", 1); putLong("version_code", 10) },
+            Bundle().apply { putString("package_name", timedOut); putString("title", timedOut); putInt("availability", 1); putBoolean("unchecked", true) },
+            MigrationInstallQueue.unavailable(missing, "not_found").apply { putBoolean("recoverable", false) },
+            MigrationInstallQueue.unavailable(throttled, "rate_limited").apply { putBoolean("recoverable", true) },
+        ))
+        queue.select(listOf(
+            Bundle().apply { putString("package_name", chosen); putString("title", "Chosen App"); putLong("version_code", 10) },
+            Bundle().apply { putString("package_name", timedOut); putString("title", timedOut) },
+        ))
+        // Aurora resolves a real display name for the unchecked app at install time even when it fails (e.g. paid).
+        queue.save(timedOut, Bundle().apply {
+            putString("package_name", timedOut)
+            putString("title", "Swiss Post")
+            putString("status", "unavailable")
+            putString("error", "paid")
+            putBoolean("terminal", true)
+        }, dispatched = true, id = id)
+        // A later package-name fallback must never overwrite the real Play title.
+        queue.save(timedOut, Bundle().apply {
+            putString("package_name", timedOut)
+            putString("title", timedOut)
+            putString("status", "unavailable")
+            putString("error", "paid")
+            putBoolean("terminal", true)
+        }, dispatched = true, id = id)
+
+        val receipt = queue.handoff(run)
+        assertEquals(listOf(chosen, timedOut, missing, throttled), receipt.getStringArrayList("packages"))
+        assertEquals(listOf("Chosen App", "Swiss Post", missing, throttled), receipt.getStringArrayList("titles"))
+        assertArrayEquals(booleanArrayOf(false, false, true, true), receipt.getBooleanArray("excluded"))
+        assertArrayEquals(booleanArrayOf(false, false, false, true), receipt.getBooleanArray("recoverable"))
+
+        // Retrying a recoverable exclusion moves it out of excluded into the handoff selection.
+        queue.retry(id, throttled)
+        val afterRetry = queue.handoff(run)
+        assertEquals(listOf(chosen, timedOut, missing, throttled), afterRetry.getStringArrayList("packages"))
+        assertArrayEquals(booleanArrayOf(false, false, true, false), afterRetry.getBooleanArray("excluded"))
+        assertArrayEquals(booleanArrayOf(false, false, false, false), afterRetry.getBooleanArray("recoverable"))
     }
 
     @Test fun wizardSuccessAndCancelCloseSelectionWithoutClaimingAnInstallSucceeded() {

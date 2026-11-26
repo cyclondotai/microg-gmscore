@@ -218,11 +218,15 @@ internal class MigrationInstallQueue(private val context: Context,
             } else emptySet()
             val statuses = ArrayList<String>(names.size)
             val errors = ArrayList<String>(names.size)
-            for (name in names) {
+            val excludedFlags = BooleanArray(names.size)
+            val recoverableFlags = BooleanArray(names.size)
+            for ((index, name) in names.withIndex()) {
                 val rawStatus = (snapshot["$id:$name:status"] as? String).orEmpty()
                 val rawError = (snapshot["$id:$name:error"] as? String).orEmpty()
                 val rawErrorCode = (snapshot["$id:$name:errorCode"] as? String).orEmpty()
                 val inSelection = name in handoffPackages
+                excludedFlags[index] = !inSelection
+                recoverableFlags[index] = !inSelection && snapshot["$id:$name:recoverable"] == true
                 val baseStatus = when {
                     name in pending -> "pending"
                     // summary() may have lost its Aurora connection while checking a dispatched app.
@@ -253,6 +257,8 @@ internal class MigrationInstallQueue(private val context: Context,
             }
             putStringArrayList("statuses", statuses)
             putStringArrayList("errors", errors)
+            putBooleanArray("excluded", excludedFlags)
+            putBooleanArray("recoverable", recoverableFlags)
         }
     }
 
@@ -367,8 +373,12 @@ internal class MigrationInstallQueue(private val context: Context,
     }
     private fun metadata(edit: android.content.SharedPreferences.Editor, id: String, doc: Bundle) {
         val name = requireNotNull(doc.getString("package_name"))
+        val existingTitle = prefs.getString("$id:$name:title", null)
         for (key in listOf("title", "icon_url", "developer_name", "error", "status")) {
-            doc.getString(key)?.let { edit.putString("$id:$name:$key", it) }
+            val value = doc.getString(key) ?: continue
+            // Never overwrite a real Play display title with a package-name fallback (e.g. an unchecked doc from Switch).
+            if (key == "title" && value == name && !existingTitle.isNullOrBlank() && existingTitle != name) continue
+            edit.putString("$id:$name:$key", value)
         }
         if (doc.containsKey("version_code")) edit.putLong("$id:$name:expectedVersion", doc.getLong("version_code"))
     }
@@ -556,6 +566,13 @@ internal class MigrationInstallQueue(private val context: Context,
             val before = row(id, name)
             val edit = prefs.edit()
             for (key in listOf("status", "error")) edit.putString("$id:$name:$key", result.getString(key) ?: if (key == "error") result.getString("errorCode") else "unknown")
+            // Backfill a real display title learned later from Aurora when catalog metadata only has the package name.
+            val existingTitle = prefs.getString("$id:$name:title", null)?.trim()
+            if (existingTitle.isNullOrEmpty() || existingTitle == name) {
+                result.getString("title")?.trim()?.takeIf { it.isNotEmpty() && it != name }?.let {
+                    edit.putString("$id:$name:title", it)
+                }
+            }
             // The store's own failure code beside the error: a refusal of the anonymous session stays known ([refusedBefore]).
             if (result.getString("errorCode") != null) edit.putString("$id:$name:errorCode", result.getString("errorCode")) else edit.remove("$id:$name:errorCode")
             edit.putBoolean("$id:$name:installed", result.getBoolean("installed"))
@@ -704,8 +721,14 @@ internal class MigrationInstallQueue(private val context: Context,
         // A left-out app joins the selection now; the install looks it up again, as for any selected app.
         val added = recoverableExclusions(id).filter { it in names }
         val edit = prefs.edit().putStringSet("$id:pending", pending(id) + names)
-        if (added.isNotEmpty()) edit.putStringSet("$id:packages", selected(id) + added)
-            .putStringSet("$id:excluded", prefs.getStringSet("$id:excluded", emptySet()).orEmpty() - added.toSet())
+        if (added.isNotEmpty()) {
+            edit.putStringSet("$id:packages", selected(id) + added)
+                .putStringSet("$id:excluded", prefs.getStringSet("$id:excluded", emptySet()).orEmpty() - added.toSet())
+            if (prefs.getString("handoff_session", null) == id) {
+                val priorHandoff = prefs.getStringSet("$id:handoff_packages", emptySet()).orEmpty()
+                edit.putStringSet("$id:handoff_packages", priorHandoff + added)
+            }
+        }
         for (name in names) bump(id, name)
         for (name in names) edit.putInt("$id:$name:retry_gen", prefs.getInt("$id:$name:retry_gen", 0) + 1)
         // A Retry starts clean (Greptile on #102): the previous attempt's all_accounts mark goes with its account choice, so
@@ -1204,7 +1227,7 @@ internal class MigrationInstallQueue(private val context: Context,
         private const val MAX_PRIORITY_TOTAL = 200
         private val PACKAGE = Regex("^[A-Za-z][A-Za-z0-9_]*(\\.[A-Za-z][A-Za-z0-9_]*)+$")
         /** The anonymous session's own limits: Play throttling it, not listing the app in its country, or no session. */
-        private val ANONYMOUS_FAILURES = setOf(RATE_LIMITED, "not_found", "anonymous_sign_in_required", "not_signed_in", "session_expired")
+        private val ANONYMOUS_FAILURES = setOf(RATE_LIMITED, "not_found", "app_not_supported", "anonymous_sign_in_required", "not_signed_in", "session_expired")
         /** The store had no usable session: says nothing about the app, so it is tried again like a rate limit. */
         private val SESSION_FAILURES = setOf("anonymous_sign_in_required", "not_signed_in", "session_expired")
         /** Aurora's codes for Play refusing the anonymous session a download it had queued (DownloadFailure). */
