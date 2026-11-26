@@ -13,7 +13,6 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.credentials.provider.CallingAppInfo
 import androidx.test.core.app.ActivityScenario
-import androidx.test.espresso.Espresso.closeSoftKeyboard
 import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.action.CoordinatesProvider
 import androidx.test.espresso.action.GeneralClickAction
@@ -26,6 +25,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.google.android.gms.R
 import com.google.android.gms.credential.manager.EXTRA_KEY_ACCOUNT_NAME
 import com.google.android.gms.credential.manager.PasswordManagerActivity
+import com.google.android.gms.credential.manager.SignIns
 import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
@@ -122,30 +122,46 @@ class AgentSignInAndroidTest {
             exactProbe(before, realm)
             beforeDigest = recordDigest(before)
             val intent = Intent(context, PasswordManagerActivity::class.java)
+                .putExtra(SignIns.EXTRA_PAGE, SignIns.PAGE)
                 .putExtra(EXTRA_KEY_ACCOUNT_NAME, "cyc779-no-account-${UUID.randomUUID()}.invalid")
-            step = "launch-owner-manager"
+            step = "launch-sign-ins-page"
             ActivityScenario.launch<PasswordManagerActivity>(intent).use { scenario ->
                 step = "wait-owner-manager-focus"
                 waitForFocus(scenario)
+                step = "verify-sign-ins-page"
+                compose.onNodeWithText(context.getString(R.string.cyclon_sign_ins_title)).assertExists()
                 step = "tap-owner-open"
                 tap(compose.onNodeWithText(context.getString(R.string.passwords_open)))
                 step = "wait-local-storage-choice"
                 waitForOneNode(hasText(context.getString(R.string.passwords_on_device)))
                 step = "tap-local-storage-choice"
                 tap(compose.onNodeWithText(context.getString(R.string.passwords_on_device)))
-                step = "wait-local-search-field"
-                waitForOneNode(hasSetTextAction())
-                step = "filter-local-probe"
-                compose.onNode(hasSetTextAction()).performScrollTo().performTextReplacement(USERNAME)
-                closeSoftKeyboard()
-                step = "wait-filtered-probe-row"
-                waitForOneNode(hasText(USERNAME) and !hasSetTextAction())
-                step = "open-verified-probe-detail"
-                tap(compose.onNode(hasText(USERNAME) and !hasSetTextAction()).performScrollTo())
-                step = "verify-probe-detail"
-                compose.onNodeWithText(context.getString(R.string.passwords_back_to_passwords)).assertExists()
+                step = "visit-all-passwords-settings-and-return"
+                waitForOneNode(hasText(context.getString(R.string.cyclon_sign_ins_all_passwords)))
+                tap(compose.onNodeWithText(context.getString(R.string.cyclon_sign_ins_all_passwords)).performScrollTo())
+                waitForOneNode(hasText(context.getString(R.string.passwords_tab_settings)))
+                tap(compose.onNodeWithText(context.getString(R.string.passwords_tab_settings)))
+                tap(compose.onNodeWithContentDescription(context.getString(R.string.cyclon_back)))
+                waitForOneNode(hasText(context.getString(R.string.cyclon_sign_ins_title)))
+                step = "wait-sign-ins-probe-row"
+                waitForOneNode(hasText(USERNAME, substring = true))
+                step = "verify-no-access-labels-on-sign-ins"
+                compose.onAllNodes(hasText("Ask each time", substring = true, ignoreCase = true)).assertCountEquals(0)
+                compose.onAllNodes(hasText("Always allow", substring = true, ignoreCase = true)).assertCountEquals(0)
+                compose.onAllNodes(hasText("Require device authentication", substring = true, ignoreCase = true)).assertCountEquals(0)
+                step = "open-verified-probe-detail-from-sign-ins"
+                tap(compose.onNode(hasText(USERNAME, substring = true)).performScrollTo())
+                step = "verify-probe-detail-without-assistant-controls"
+                waitForOneNode(hasContentDescription(context.getString(R.string.passwords_back_to_passwords)))
                 compose.onNodeWithText(USERNAME).assertExists()
+                compose.onAllNodes(hasText("Sign in with Cyclon", substring = true, ignoreCase = true)).assertCountEquals(0)
+                compose.onAllNodes(hasText("Ask each time", substring = true, ignoreCase = true)).assertCountEquals(0)
+                compose.onAllNodes(hasText("Always allow", substring = true, ignoreCase = true)).assertCountEquals(0)
+                compose.onAllNodes(hasText("Require device authentication", substring = true, ignoreCase = true)).assertCountEquals(0)
                 compose.onAllNodes(hasSetTextAction()).assertCountEquals(0)
+                step = "back-returns-to-sign-ins"
+                tap(compose.onNodeWithContentDescription(context.getString(R.string.passwords_back_to_passwords)))
+                waitForOneNode(hasText(context.getString(R.string.cyclon_sign_ins_title)))
                 check(probeRealm() == realm)
             }
         } finally {
