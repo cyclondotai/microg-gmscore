@@ -58,9 +58,14 @@ class PasswordAutofillActivity : PasswordOwnerActivity() {
                 TextButton(onClick = { finish() }) { Text(stringResource(android.R.string.cancel)) }
             }
         } } }
-        authenticateOwner()
+        // CYC-3338 (Thomas, 2026-11-25: never block): a tap on a saved login fills it, and a save opens its choices,
+        // without asking for the screen lock first. The phone's assistant could not pass that prompt and had to ask the
+        // owner to unlock (founders-03), while Core's own sign-in fills the same logins without it. The ticket still
+        // pins the login, the requesting app and its fields; the password goes only into the app it was saved for.
+        open()
     }
-    override fun onOwnerAuthenticated() {
+    override fun onOwnerAuthenticated() = open()
+    private fun open() {
         lifecycleScope.launch {
             try {
                 val prepared = withContext(Dispatchers.IO) {
@@ -72,7 +77,6 @@ class PasswordAutofillActivity : PasswordOwnerActivity() {
                     val consumed = tickets.consume(intent.data, caller, selected.mode)
                     consumed to fields
                 }
-                requireOwner()
                 ticket = prepared.first; payload = prepared.second
                 if (prepared.first.mode == 2) fill(prepared.first, prepared.second)
                 else {
@@ -82,7 +86,6 @@ class PasswordAutofillActivity : PasswordOwnerActivity() {
                             runCatching { PasswordRepository(this@PasswordAutofillActivity, it).acceptsAutomaticSave(prepared.first.realm) }.getOrDefault(false)
                         }
                     }
-                    requireOwner()
                     localSavingAllowed = available.first; accounts = available.second
                     saving = localSavingAllowed || accounts.isNotEmpty(); savingBlocked = !saving
                 }
@@ -106,7 +109,6 @@ class PasswordAutofillActivity : PasswordOwnerActivity() {
             vault.list()
                 .singleOrNull { it.id == selected.tag && matcher.canFill(it.data, selected.realm) } ?: throw VaultLockedException()
         }
-        requireOwner()
         val presentation = RemoteViews(packageName, android.R.layout.simple_list_item_1).apply { setTextViewText(android.R.id.text1, getString(R.string.passwords_fill)) }
         @Suppress("DEPRECATION")
         val dataset = Dataset.Builder(presentation).setValue(passwordId, AutofillValue.forText(entry.data.password)).apply {
@@ -115,7 +117,6 @@ class PasswordAutofillActivity : PasswordOwnerActivity() {
         setResult(RESULT_OK, Intent().putExtra(AutofillManager.EXTRA_AUTHENTICATION_RESULT, dataset)); finish()
     }
     private fun save(account: Account?) {
-        requireOwner()
         if (busy) return
         val selected = ticket ?: return
         val fields = payload ?: return
