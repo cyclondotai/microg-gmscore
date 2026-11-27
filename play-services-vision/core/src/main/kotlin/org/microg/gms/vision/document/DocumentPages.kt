@@ -13,6 +13,7 @@ import android.os.Build.VERSION.SDK_INT
 import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
+import java.util.Locale
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -32,7 +33,8 @@ fun importPage(open: () -> InputStream, file: File) {
     writePage(bitmap, rotation, file)
 }
 
-fun loadPagePreview(file: File, maxSize: Int): Bitmap? = decodeScaled({ file.inputStream() }, maxSize)
+fun loadPagePreview(file: File, maxSize: Int): Bitmap? =
+    runCatching { decodeScaled({ file.inputStream() }, maxSize) }.getOrNull()
 
 fun rotatePage(file: File) {
     val bitmap = decodeScaled({ file.inputStream() }) ?: throw IllegalArgumentException("Failed to decode $file")
@@ -100,7 +102,7 @@ private class PdfWriter(private val out: OutputStream) {
         val xref = position
         val size = offsets.lastKey() + 1
         write("xref\n0 $size\n0000000000 65535 f \n")
-        for (id in 1 until size) write("%010d 00000 n \n".format(offsets[id] ?: 0L))
+        for (id in 1 until size) write("%010d 00000 n \n".format(Locale.ROOT, offsets[id] ?: 0L))
         write("trailer\n<< /Size $size /Root $rootId 0 R >>\nstartxref\n$xref\n%%EOF\n")
     }
 }

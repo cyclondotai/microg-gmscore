@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Bundle
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -22,6 +23,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume
 import org.junit.Test
@@ -33,6 +35,8 @@ import org.microg.gms.auth.blockstore.BlockStoreImpl
 import org.microg.gms.location.reporting.fetchEffectiveAccountLocationSettings
 import org.microg.gms.location.reporting.fetchEffectiveTimelineEnabled
 import org.microg.gms.people.PeopleServiceImpl
+import org.microg.gms.vision.document.loadPagePreview
+import org.microg.gms.vision.document.writePdf
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
@@ -40,6 +44,7 @@ import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowLooper
 import java.io.File
 import java.io.FileOutputStream
+import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.zip.CRC32
@@ -213,5 +218,29 @@ class UpstreamCatchupRegressionTest {
         assertEquals(Status.SUCCESS.statusCode, status?.statusCode)
         assertNotNull("Stock GMS returns ByteArray(0), never null", bytes)
         assertArrayEquals(ByteArray(0), bytes)
+    }
+
+    @Test
+    fun documentScannerPdfExportUsesAsciiXrefOffsetsUnderArabicLocale() {
+        val originalLocale = Locale.getDefault()
+        val pageFile = File(context.cacheDir, "doc-page-${System.nanoTime()}.jpg")
+        val pdfFile = File(context.cacheDir, "doc-out-${System.nanoTime()}.pdf")
+        try {
+            val bitmap = Bitmap.createBitmap(100, 140, Bitmap.Config.ARGB_8888)
+            pageFile.outputStream().use { bitmap.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+            bitmap.recycle()
+
+            Locale.setDefault(Locale("ar", "EG"))
+            writePdf(listOf(pageFile), pdfFile)
+            val pdfText = pdfFile.readBytes().toString(Charsets.ISO_8859_1)
+            val xrefSection = pdfText.substringAfter("xref\n").substringBefore("trailer\n")
+            assertFalse("PDF xref must not contain '?' from non-ASCII digits: $xrefSection", xrefSection.contains('?'))
+            assertTrue("PDF xref must contain 10-digit ASCII offsets: $xrefSection", Regex("""\d{10} 00000 n """).containsMatchIn(xrefSection))
+            assertNull("Missing preview file must return null rather than throwing", loadPagePreview(File(context.cacheDir, "missing-${System.nanoTime()}.jpg"), 192))
+        } finally {
+            Locale.setDefault(originalLocale)
+            pageFile.delete()
+            pdfFile.delete()
+        }
     }
 }

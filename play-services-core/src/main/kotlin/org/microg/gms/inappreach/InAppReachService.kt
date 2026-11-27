@@ -12,6 +12,7 @@ import com.google.android.gms.common.internal.GetServiceRequest
 import com.google.android.gms.common.internal.IGmsCallbacks
 import org.microg.gms.BaseService
 import org.microg.gms.common.GmsService
+import org.microg.gms.common.GooglePackagePermission
 import org.microg.gms.common.PackageUtils
 
 private const val TAG = "InAppReachService"
@@ -26,6 +27,9 @@ class InAppReachService : BaseService(TAG, GmsService.INAPP_REACH) {
     override fun handleServiceRequest(callback: IGmsCallbacks, request: GetServiceRequest, service: GmsService) {
         val packageName = PackageUtils.getAndCheckCallingPackage(this, request.packageName)
             ?: throw IllegalArgumentException("Missing package name")
+        // Matches stock Play services 26.45.64 (InAppReachApiChimeraService visibility=FIRST_PARTY):
+        // prevents untrusted third-party apps from enumerating accounts and fetching Drive quotas via microG's identity.
+        PackageUtils.assertGooglePackagePermission(this, GooglePackagePermission.OWNER)
         callback.onPostInitCompleteWithConnectionInfo(
             CommonStatusCodes.SUCCESS,
             InAppReachServiceImpl(this, packageName, lifecycle).asBinder(),

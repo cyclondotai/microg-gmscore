@@ -63,22 +63,27 @@ import org.microg.mlkit.vision.documentscanner.GmsDocumentScannerConstants.EXTRA
 import org.microg.mlkit.vision.documentscanner.GmsDocumentScannerConstants.EXTRA_SHADOW_REMOVAL_ALLOWED
 import org.microg.mlkit.vision.documentscanner.GmsDocumentScannerConstants.EXTRA_STAIN_REMOVAL_ALLOWED
 import java.io.File
+import java.io.IOException
+import java.util.UUID
 
 private const val TAG = "DocumentScanning"
 
 private const val SCAN_DIR = "mlkit_docscan"
+private const val SESSION_RETENTION_MS = 24L * 60 * 60 * 1000
 private const val PREVIEW_SIZE = 1280
 private const val THUMBNAIL_SIZE = 192
 
 private class ScanPage(val source: File, val cropped: File, val output: File, var corners: FloatArray?, var detected: FloatArray?, var filter: DocumentFilter)
 
-private class Review(val source: File, val corners: FloatArray?, val detected: FloatArray?, val page: ScanPage?)
+private class Review(var source: File, val corners: FloatArray?, val detected: FloatArray?, val page: ScanPage?, var tempSource: File? = null)
 
 class DocumentScanningActivity : AppCompatActivity() {
 
     private val pages = mutableListOf<ScanPage>()
     private val pendingReview = ArrayDeque<Pair<File, FloatArray?>>()
     private var reviewing: Review? = null
+    private var loadingReview = false
+    private var resultDelivered = false
     private var insertIndex: Int? = null
     private var selectedPage = 0
     private var fileCounter = 0
@@ -132,8 +137,9 @@ class DocumentScanningActivity : AppCompatActivity() {
             finish()
             return
         }
-        scanDir = File(cacheDir, SCAN_DIR)
-        scanDir.deleteRecursively()
+        val scanRoot = File(cacheDir, SCAN_DIR)
+        pruneStaleScanSessions(scanRoot)
+        scanDir = File(scanRoot, UUID.randomUUID().toString())
         scanDir.mkdirs()
 
         setContentView(R.layout.activity_document_scanning)
@@ -230,15 +236,31 @@ class DocumentScanningActivity : AppCompatActivity() {
         get() = findViewById<View>(R.id.document_scanning_preview).visibility == View.VISIBLE
 
     private val pageCount: Int
-        get() = pages.size + pendingReview.size + (if (reviewing?.page == null && reviewing != null) 1 else 0)
+        get() = pages.size + pendingReview.size + (if (loadingReview || (reviewing != null && reviewing?.page == null)) 1 else 0)
 
     private val isPageLimitReached: Boolean
         get() = pageLimit > 0 && pageCount >= pageLimit
 
     private fun nextPageFile(suffix: String) = File(scanDir, "page_${++fileCounter}_$suffix.jpg")
 
+    private fun pruneStaleScanSessions(scanRoot: File) {
+        val cutoff = System.currentTimeMillis() - SESSION_RETENTION_MS
+        scanRoot.listFiles()?.forEach { entry ->
+            if (!entry.isDirectory || entry.lastModified() < cutoff) {
+                entry.deleteRecursively()
+            }
+        }
+    }
+
+    private fun replaceFile(temp: File, target: File) {
+        if (!temp.renameTo(target)) {
+            temp.copyTo(target, overwrite = true)
+            temp.delete()
+        }
+    }
+
     private fun capturePage() {
-        if (SDK_INT < 21 || busy || reviewing != null || isPreviewVisible || isPageLimitReached) return
+        if (SDK_INT < 21 || busy || loadingReview || reviewing != null || isPreviewVisible || isPageLimitReached) return
         busy = true
         updateControls()
         val file = nextPageFile("source")
@@ -266,36 +288,50 @@ class DocumentScanningActivity : AppCompatActivity() {
                 if (added) imported.add(file)
             }
             busy = false
-            imported.forEach { queueForReview(it, null) }
-            updateControls()
+            imported.forEach { pendingReview.addLast(it to null) }
+            if (imported.isNotEmpty() && reviewing == null && !loadingReview) {
+                showNextReview()
+            } else {
+                updateControls()
+            }
         }
     }
 
     private fun queueForReview(file: File, previewCorners: FloatArray?) {
         pendingReview.addLast(file to previewCorners)
-        if (reviewing == null) showNextReview() else updateControls()
+        if (reviewing == null && !loadingReview) showNextReview() else updateControls()
     }
 
     private fun showNextReview() {
+        if (loadingReview) return
         val (file, previewCorners) = pendingReview.removeFirstOrNull() ?: (null to null)
         if (file == null) {
             closeReview()
             if (pages.isNotEmpty()) showPreview() else showCamera(insertIndex)
             return
         }
+        loadingReview = true
         busy = true
         updateControls()
         lifecycleScope.launch {
-            val adjustedPreviewCorners = runCatching { withContext(Dispatchers.IO) { previewCorners?.let { scaleCorners(file, it) } } }
-                .onFailure { Log.w(TAG, "Failed to translate preview edges", it) }.getOrNull()
-            val newlyDetectedCorners = runCatching { withContext(Dispatchers.IO) {  detectDocumentCorners(file, adjustedPreviewCorners) } }
-                .onFailure { Log.w(TAG, "Failed to detect document edges", it) }.getOrNull()
-            val corners = newlyDetectedCorners ?: adjustedPreviewCorners
-            openReview(Review(file, corners, corners, null))
+            try {
+                val adjustedPreviewCorners = runCatching { withContext(Dispatchers.IO) { previewCorners?.let { scaleCorners(file, it) } } }
+                    .onFailure { Log.w(TAG, "Failed to translate preview edges", it) }.getOrNull()
+                val newlyDetectedCorners = runCatching { withContext(Dispatchers.IO) { detectDocumentCorners(file, adjustedPreviewCorners) } }
+                    .onFailure { Log.w(TAG, "Failed to detect document edges", it) }.getOrNull()
+                val corners = newlyDetectedCorners ?: adjustedPreviewCorners
+                openReview(Review(file, corners, corners, null))
+            } catch (e: Exception) {
+                loadingReview = false
+                busy = false
+                updateControls()
+                throw e
+            }
         }
     }
 
     private fun openReview(review: Review) {
+        loadingReview = false
         reviewing = review
         setCameraTorch(false)
         findViewById<DocumentCropView>(R.id.document_scanning_crop).setPage(review.source, review.detected, review.corners)
@@ -305,6 +341,8 @@ class DocumentScanningActivity : AppCompatActivity() {
     }
 
     private fun closeReview() {
+        loadingReview = false
+        reviewing?.tempSource?.delete()
         reviewing = null
         findViewById<DocumentCropView>(R.id.document_scanning_crop).clear()
         findViewById<View>(R.id.document_scanning_review).visibility = View.GONE
@@ -319,18 +357,39 @@ class DocumentScanningActivity : AppCompatActivity() {
         val cropView = findViewById<DocumentCropView>(R.id.document_scanning_crop)
         val corners = cropView.corners.copyOf()
         val detected = cropView.detectedCorners
-        val page = review.page ?: ScanPage(review.source, nextPageFile("crop"), nextPageFile("page"), corners, detected, defaultFilter)
-        page.corners = corners
-        page.detected = detected
+        val existingPage = review.page
+        val page = existingPage ?: ScanPage(review.source, nextPageFile("crop"), nextPageFile("page"), corners, detected, defaultFilter)
+        val tempCropped = nextPageFile("crop_tmp")
+        val tempOutput = nextPageFile("page_tmp")
         lifecycleScope.launch {
-            runCatching {
+            val saved = runCatching {
                 withContext(Dispatchers.IO) {
-                    cropPage(page.source, corners, page.cropped)
-                    applyFilter(page.cropped, page.filter, page.output, removeShadows)
+                    cropPage(review.source, corners, tempCropped)
+                    applyFilter(tempCropped, page.filter, tempOutput, removeShadows)
+                    if (!tempOutput.isFile || tempOutput.length() <= 0L) {
+                        throw IOException("Document page output was not written")
+                    }
+                    review.tempSource?.let { rotatedSource ->
+                        replaceFile(rotatedSource, page.source)
+                        review.tempSource = null
+                    }
+                    replaceFile(tempCropped, page.cropped)
+                    replaceFile(tempOutput, page.output)
                 }
-            }.onFailure { Log.w(TAG, "Failed to crop page", it) }
+            }.onFailure {
+                tempCropped.delete()
+                tempOutput.delete()
+                Log.w(TAG, "Failed to crop page", it)
+            }.isSuccess
             busy = false
-            if (review.page == null) {
+            if (!saved) {
+                Toast.makeText(this@DocumentScanningActivity, R.string.document_scanner_capture_failed, Toast.LENGTH_SHORT).show()
+                updateControls()
+                return@launch
+            }
+            page.corners = corners
+            page.detected = detected
+            if (existingPage == null) {
                 val index = (insertIndex ?: pages.size).coerceIn(0, pages.size)
                 pages.add(index, page)
                 selectedPage = index
@@ -356,6 +415,7 @@ class DocumentScanningActivity : AppCompatActivity() {
             showPreview()
             return
         }
+        review.tempSource?.delete()
         review.source.delete()
         showNextReview()
     }
@@ -368,7 +428,20 @@ class DocumentScanningActivity : AppCompatActivity() {
         val cropView = findViewById<DocumentCropView>(R.id.document_scanning_crop)
         val (corners, detected) = cropView.rotatedClockwise()
         lifecycleScope.launch {
-            runCatching { withContext(Dispatchers.IO) { rotatePage(review.source) } }
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val target = if (review.page != null) {
+                        review.tempSource ?: nextPageFile("rotate_tmp").also { copy ->
+                            review.source.copyTo(copy, overwrite = true)
+                            review.tempSource = copy
+                            review.source = copy
+                        }
+                    } else {
+                        review.source
+                    }
+                    rotatePage(target)
+                }
+            }
                 .onSuccess { cropView.setPage(review.source, detected, corners) }
                 .onFailure { Log.w(TAG, "Failed to rotate page", it) }
             busy = false
@@ -440,10 +513,23 @@ class DocumentScanningActivity : AppCompatActivity() {
         if (filter == page.filter) return
         busy = true
         updateControls()
+        val tempOutput = nextPageFile("page_tmp")
         lifecycleScope.launch {
-            runCatching { withContext(Dispatchers.IO) { applyFilter(page.cropped, filter, page.output, removeShadows) } }
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    applyFilter(page.cropped, filter, tempOutput, removeShadows)
+                    if (!tempOutput.isFile || tempOutput.length() <= 0L) {
+                        throw IOException("Filtered document page output was not written")
+                    }
+                    replaceFile(tempOutput, page.output)
+                }
+            }
                 .onSuccess { page.filter = filter }
-                .onFailure { Log.w(TAG, "Failed to apply filter", it) }
+                .onFailure {
+                    tempOutput.delete()
+                    Log.w(TAG, "Failed to apply filter", it)
+                    Toast.makeText(this@DocumentScanningActivity, R.string.document_scanner_capture_failed, Toast.LENGTH_SHORT).show()
+                }
             busy = false
             showPreview()
         }
@@ -473,21 +559,21 @@ class DocumentScanningActivity : AppCompatActivity() {
     }
 
     private fun updateControls() {
-        val canAdd = !busy && reviewing == null && !isPageLimitReached
+        val canAdd = !busy && !loadingReview && reviewing == null && !isPageLimitReached
         findViewById<View>(R.id.document_scanning_capture).isEnabled = canAdd
         findViewById<Button>(R.id.document_scanning_import).isEnabled = canAdd
         findViewById<View>(R.id.document_scanning_done).apply {
-            isEnabled = !busy && reviewing == null
+            isEnabled = !busy && !loadingReview && reviewing == null
             visibility = if (pages.isNotEmpty()) View.VISIBLE else View.INVISIBLE
         }
         findViewById<TextView>(R.id.document_scanning_done_count).text = pages.size.toString()
         findViewById<ImageView>(R.id.document_scanning_done_thumbnail)
             .setImageBitmap(pages.firstOrNull()?.output?.let { loadPagePreview(it, PREVIEW_SIZE) })
-        val reviewEnabled = !busy && reviewing != null
+        val reviewEnabled = !busy && !loadingReview && reviewing != null
         for (id in intArrayOf(R.id.document_scanning_keep, R.id.document_scanning_auto_crop, R.id.document_scanning_no_crop, R.id.document_scanning_rotate)) {
             findViewById<Button>(id).isEnabled = reviewEnabled
         }
-        val previewEnabled = !busy && reviewing == null && pages.isNotEmpty()
+        val previewEnabled = !busy && !loadingReview && reviewing == null && pages.isNotEmpty()
         for (id in intArrayOf(R.id.document_scanning_preview_done, R.id.document_scanning_preview_crop, R.id.document_scanning_preview_filter, R.id.document_scanning_preview_retake, R.id.document_scanning_preview_delete)) {
             findViewById<Button>(id).isEnabled = previewEnabled
         }
@@ -519,6 +605,7 @@ class DocumentScanningActivity : AppCompatActivity() {
             val result = runCatching { withContext(Dispatchers.IO) { buildResult() } }
                 .onFailure { Log.w(TAG, "Failed to create scan result", it) }.getOrNull()
             if (result != null) {
+                resultDelivered = true
                 setResult(RESULT_OK, result)
                 finish()
             } else {
@@ -552,6 +639,14 @@ class DocumentScanningActivity : AppCompatActivity() {
             result.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         return result
+    }
+
+    override fun onDestroy() {
+        reviewing?.tempSource?.delete()
+        if (isFinishing && !resultDelivered && ::scanDir.isInitialized) {
+            scanDir.deleteRecursively()
+        }
+        super.onDestroy()
     }
 
     private fun showPermissionDialog() {
