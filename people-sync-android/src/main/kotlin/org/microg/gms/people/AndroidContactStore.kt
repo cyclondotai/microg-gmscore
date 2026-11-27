@@ -195,7 +195,7 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
         val checked = prefs.importChecks(backendOwner)
         return imports().any { checked[it.id] != if (it.unsupported) -it.version - 1 else it.version }
     }
-    override fun reconcileImports(people: List<Person>, full: Boolean): Int {
+    override fun reconcileImports(people: List<Person>, full: Boolean, fetch: ((String) -> Person?)?): Int {
         check(prefs.mode != SyncMode.OFF)
         val candidates = imports()
         if (candidates.isEmpty()) return 0
@@ -244,7 +244,7 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
             val keeper = matches.singleOrNull()?.let(owned::get)
             if (keeper != null) {
                 val keeperRemote = remote ?: keeper.resource?.let(remoteByResource::get)
-                if (!collapseImport(candidate, keeper, keeperRemote)) { checked[candidate.id] = candidate.version; unverified++; continue }
+                if (!collapseImport(candidate, keeper, keeperRemote, fetch)) { checked[candidate.id] = candidate.version; unverified++; continue }
                 checked.remove(candidate.id)
                 val current = readContacts("${rawScope(keeper.id)} AND ${RawContacts.SYNC4}=?", args + backendOwner).single()
                 owned[current.id] = current; index(current)
@@ -282,16 +282,23 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
         prefs.importChecks(backendOwner, checked)
         return unverified
     }
-    private fun collapseImport(candidate: LocalContact, keeper: LocalContact, remote: Person?): Boolean {
+    private fun collapseImport(candidate: LocalContact, keeper: LocalContact, remote: Person?, fetch: ((String) -> Person?)? = null): Boolean {
         if (candidate.unsupported || candidate.deleted || keeper.deleted) return false
         val json = state(keeper.id)
         val signature = importSignature(candidate)
         val signatures = importSignatures(json)
         val sameFields = importFields(candidate.fields) in setOf(importFields(keeper.fields), importFields(keeper.baseline))
         val remoteBlocksPhoto = remote != null && (remote.deleted || ContactPhotos.reference(remote) != null)
-        val copyPhoto = signature !in signatures && sameFields && candidate.hasPhoto && !keeper.hasPhoto &&
+        var copyPhoto = signature !in signatures && sameFields && candidate.hasPhoto && !keeper.hasPhoto &&
             prefs.mode == SyncMode.TWO_WAY && !remoteBlocksPhoto && !json.optBoolean("_photoDeleted") &&
             photoBaseline(json) == null && (json.isNull("_photoRemote") || json.optString("_photoRemote").isEmpty())
+        val keeperResource = keeper.resource
+        if (copyPhoto && fetch != null && keeperResource != null) {
+            // List snapshots can lag behind a recent cloud photo write or deletion; verify via direct read before
+            // copying the local photo and deleting the imported row.
+            val live = fetch(keeperResource)
+            if (live == null || live.deleted || ContactPhotos.reference(live) != null) copyPhoto = false
+        }
         if (signature !in signatures && (!sameFields || candidate.hasPhoto && !copyPhoto && signature.split(':')[1] != importSignature(keeper).split(':')[1])) return false
         val operations = arrayListOf(assertImport(candidate), assertVersion(keeper))
         if (signature in signatures) {
@@ -355,13 +362,15 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
     }
     private fun baseline(person: Person, existing: LocalContact?): String = JSONObject().apply {
         for ((key, value) in project(person)) put(key, org.json.JSONArray(value))
+        val ref = ContactPhotos.reference(person)
         existing?.let {
             val previous = state(it.id)
             previous.optJSONObject("_photo")?.let { put("_photo", it) }
             previous.optJSONArray("_imports")?.let { put("_imports", it) }
-            if (previous.optBoolean("_photoDeleted")) put("_photoDeleted", true)
+            val hadRemote = !previous.isNull("_photoRemote") && previous.optString("_photoRemote").isNotEmpty()
+            if (ref == null && (previous.optBoolean("_photoDeleted") || hadRemote)) put("_photoDeleted", true)
         }
-        put("_photoRemote", ContactPhotos.reference(person) ?: JSONObject.NULL)
+        put("_photoRemote", ref ?: JSONObject.NULL)
         put("_photoRevision", ContactPhotos.revision(person))
     }.toString()
     private fun photoDirty(existing: LocalContact?): Boolean {

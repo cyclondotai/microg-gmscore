@@ -47,11 +47,12 @@ class ImportedContactsSyncTest {
         var creates = 0; var updates = 0; var deletes = 0; var skipped = 0
         var canUpload: () -> Boolean = { true }
         var afterList: (() -> Unit)? = null
+        var directGet: ((String) -> Person?)? = null
         override fun list(syncToken: String?, pageToken: String?): Page {
             listTokens.add(syncToken)
             return Page(remote.values.toList() + tombstones, null, "cursor", skipped).also { afterList?.invoke() }
         }
-        override fun get(resource: String) = remote[resource]
+        override fun get(resource: String) = directGet?.invoke(resource) ?: remote[resource]
         override fun create(body: JSONObject): Person {
             if (!canUpload()) throw UploadDisabled()
             creates++
@@ -1001,5 +1002,52 @@ class ImportedContactsSyncTest {
         assertEquals(1, report.unverifiedImports)
         assertEquals(listOf(keeper, copied), provider.rawIds)
         assertNull(raw(copied, RawContacts.SYNC4))
+    }
+
+    @Test fun cloudPhotoRemovedBeforePhotoPassStillBlocksCopiedPhotoResurrection() = fixture {
+        val cloudPhoto = "fsa2-photo:17:${ContactPhotos.hash(byteArrayOf(7, 7, 7))}"
+        val withPhoto = Person.parse(JSONObject(person(etag = "e1").json.toString()).apply {
+            put("photos", JSONArray().put(JSONObject().put("url", cloudPhoto)
+                .put("metadata", JSONObject().put("source", JSONObject().put("type", "CONTACT")))))
+        })
+        api.remote[withPhoto.resource] = withPhoto
+        sync() // Metadata records _photoRemote, photo pass never runs.
+        // Google deletes the cloud photo before PhotosSync ever installed it; next metadata pull clears _photoRemote.
+        api.remote[withPhoto.resource] = person(etag = "e2")
+        sync()
+        val keeper = store.contacts().single().id
+        assertFalse(store.contacts().single().hasPhoto)
+
+        val copied = nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+            put(ContactsContract.CommonDataKinds.Photo.PHOTO, byteArrayOf(1, 2, 3))
+        })
+        val report = sync()
+        assertEquals(1, report.unverifiedImports)
+        assertEquals(listOf(keeper, copied), provider.rawIds)
+        assertFalse(store.contacts().single().hasPhoto)
+    }
+
+    @Test fun staleListWithoutPhotoVerifiesDirectReadBeforeCopyingPhoto() = fixture {
+        val remote = person(); api.remote[remote.resource] = remote
+        sync()
+        val keeper = store.contacts().single().id
+        val copied = nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+            put(ContactsContract.CommonDataKinds.Photo.PHOTO, byteArrayOf(1, 2, 3))
+        })
+        // List snapshot still lags without a photo, while direct read already sees a cloud photo.
+        val cloudPhoto = "fsa2-photo:17:${ContactPhotos.hash(byteArrayOf(9, 9, 9))}"
+        val freshWithPhoto = Person.parse(JSONObject(person(etag = "e2").json.toString()).apply {
+            put("photos", JSONArray().put(JSONObject().put("url", cloudPhoto)
+                .put("metadata", JSONObject().put("source", JSONObject().put("type", "CONTACT")))))
+        })
+        api.directGet = { res -> if (res == remote.resource) freshWithPhoto else api.remote[res] }
+
+        val report = sync()
+        assertEquals(1, report.unverifiedImports)
+        assertEquals(listOf(keeper, copied), provider.rawIds)
+        assertNull(raw(copied, RawContacts.SYNC4))
+        assertFalse(store.contacts().single().hasPhoto)
     }
 }
