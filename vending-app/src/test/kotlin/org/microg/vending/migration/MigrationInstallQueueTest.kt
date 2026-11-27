@@ -69,7 +69,7 @@ class MigrationInstallQueueTest {
             if (operation == 3) state("none") else answer(installs.last())
         }.apply { sentOptions = { operation, options -> if (operation == 2) installs += options!!.getBoolean("owner_account_approved") } }
     @Test fun anonymousRefusalFallsBackToThePhonesGoogleAccountByItself() {
-        for (error in listOf("rate_limited", "not_found", "anonymous_sign_in_required")) {
+        for (error in listOf("rate_limited", "not_found", "app_not_supported", "anonymous_sign_in_required")) {
             clear()
             val installs = mutableListOf<Boolean>()
             val queue = fallbackQueue(true, installs) { owner -> if (owner) state("queued") else MigrationInstallQueue.unavailable("org.example.app", error) }

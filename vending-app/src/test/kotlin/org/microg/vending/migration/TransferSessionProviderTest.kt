@@ -131,23 +131,37 @@ class TransferSessionProviderTest {
         assertTrue(runCatching { provider.call("endHandoff", run, null) }.exceptionOrNull() is SecurityException)
 
         val names = (0 until 256).map { "org.example.app$it" }
+        val excludedTail = "org.example.zz.excluded"
         val id = queue.catalogSession()
         assertEquals(armed.getString("session_id"), id)
+        queue.recordCatalog(listOf(
+            MigrationInstallQueue.unavailable(excludedTail, "not_found").apply { putBoolean("recoverable", false) },
+        ))
         names.chunked(50).forEach { batch ->
             queue.select(batch.map { name -> Bundle().apply { putString("package_name", name) } })
         }
         val read = mutableListOf<String>()
+        val excluded = mutableListOf<Boolean>()
+        val recoverable = mutableListOf<Boolean>()
         var offset = 0
         do {
             val open = provider.call("getHandoff", run, Bundle().apply { putInt("offset", offset) })
             assertEquals(id, open.getString("session_id"))
             assertFalse(open.getBoolean("selection_closed"))
-            assertEquals(256, open.getInt("total"))
-            read += open.getStringArrayList("packages")!!
-            assertEquals(List(64) { "pending" }, open.getStringArrayList("statuses"))
+            assertEquals(257, open.getInt("total"))
+            val pagePackages = open.getStringArrayList("packages")!!
+            read += pagePackages
+            excluded += open.getBooleanArray("excluded")!!.toList()
+            recoverable += open.getBooleanArray("recoverable")!!.toList()
             offset = open.getInt("next_offset")
         } while (offset > 0)
-        assertEquals(names.sorted(), read)
+        assertEquals((names + excludedTail).sorted(), read)
+        val tailIndex = read.indexOf(excludedTail)
+        assertTrue("excluded item past offset 64", tailIndex >= 64)
+        assertTrue(excluded[tailIndex])
+        assertFalse(recoverable[tailIndex])
+        assertEquals(1, excluded.count { it })
+        assertTrue(recoverable.none { it })
 
         val stale = provider.call("cancelHandoff", "00000000-0000-0000-0000-000000000002", null)
         assertFalse(stale.getBoolean("accepted"))
@@ -263,6 +277,79 @@ class TransferSessionProviderTest {
         assertEquals(listOf("org.example.notfound", "org.example.unsupported"), closed.getStringArrayList("packages"))
         assertEquals(listOf("unavailable", "unavailable"), closed.getStringArrayList("statuses"))
         assertEquals(listOf("not_found", "app_not_supported"), closed.getStringArrayList("errors"))
+        assertArrayEquals(booleanArrayOf(true, true), closed.getBooleanArray("excluded"))
+        assertArrayEquals(booleanArrayOf(false, false), closed.getBooleanArray("recoverable"))
+    }
+
+    /** CYC-3409: handoff distinguishes selected apps, non-recoverable catalog exclusions, and recoverable ones, and persists learned titles. */
+    @Test fun cyc3409HandoffCarriesExclusionProvenanceAndBackfillsLearnedTitles() {
+        val run = "00000000-0000-0000-0000-000000000001"
+        val queue = MigrationInstallQueue(context) { _, name ->
+            Bundle().apply { putString("package_name", name); putString("status", "none") }
+        }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false).getBoolean("accepted"))
+        val id = queue.catalogSession()
+        val chosen = "org.example.a.chosen"
+        val timedOut = "org.example.b.unchecked"
+        val missing = "org.example.c.missing"
+        val throttled = "org.example.d.throttled"
+        queue.recordCatalog(listOf(
+            Bundle().apply { putString("package_name", chosen); putString("title", "Chosen App"); putInt("availability", 1); putLong("version_code", 10) },
+            Bundle().apply { putString("package_name", timedOut); putString("title", timedOut); putInt("availability", 1); putBoolean("unchecked", true) },
+            MigrationInstallQueue.unavailable(missing, "not_found").apply { putBoolean("recoverable", false) },
+            MigrationInstallQueue.unavailable(throttled, "rate_limited").apply { putBoolean("recoverable", true) },
+        ))
+        queue.select(listOf(
+            Bundle().apply { putString("package_name", chosen); putString("title", "Chosen App"); putLong("version_code", 10) },
+            Bundle().apply { putString("package_name", timedOut); putString("title", timedOut) },
+        ))
+        // Aurora resolves a real display name for the unchecked app at install time even when it fails (e.g. paid).
+        queue.save(timedOut, Bundle().apply {
+            putString("package_name", timedOut)
+            putString("title", "Swiss Post")
+            putString("status", "unavailable")
+            putString("error", "paid")
+            putBoolean("terminal", true)
+        }, dispatched = true, id = id)
+        // A later package-name fallback must never overwrite the real Play title.
+        queue.save(timedOut, Bundle().apply {
+            putString("package_name", timedOut)
+            putString("title", timedOut)
+            putString("status", "unavailable")
+            putString("error", "paid")
+            putBoolean("terminal", true)
+        }, dispatched = true, id = id)
+
+        val receipt = queue.handoff(run)
+        assertEquals(listOf(chosen, timedOut, missing, throttled), receipt.getStringArrayList("packages"))
+        assertEquals(listOf("Chosen App", "Swiss Post", missing, throttled), receipt.getStringArrayList("titles"))
+        assertArrayEquals(booleanArrayOf(false, false, true, true), receipt.getBooleanArray("excluded"))
+        assertArrayEquals(booleanArrayOf(false, false, false, true), receipt.getBooleanArray("recoverable"))
+
+        // Retrying a recoverable exclusion moves it out of excluded into the handoff selection.
+        queue.retry(id, throttled)
+        val afterRetry = queue.handoff(run)
+        assertEquals(listOf(chosen, timedOut, missing, throttled), afterRetry.getStringArrayList("packages"))
+        assertArrayEquals(booleanArrayOf(false, false, true, false), afterRetry.getBooleanArray("excluded"))
+        assertArrayEquals(booleanArrayOf(false, false, false, false), afterRetry.getBooleanArray("recoverable"))
+
+        // A second catalog pass sending a package-name fallback must never overwrite an already-saved real Play title in metadata().
+        queue.recordCatalog(listOf(
+            Bundle().apply { putString("package_name", chosen); putString("title", chosen); putInt("availability", 1); putLong("version_code", 10) },
+        ))
+        assertEquals("Chosen App", queue.handoff(run).getStringArrayList("titles")!![0])
+
+        // A bridge() transport failure during catalog lookup produces recoverable=true so Setup never hides the app as Not on Google Play.
+        val transportQueue = MigrationInstallQueue(context) { _, _ -> throw RuntimeException("binder died") }
+        val bridgeFailure = transportQueue.bridge(1, "org.example.bridge.fail")
+        assertEquals("store_unavailable", bridgeFailure.getString("error"))
+        assertTrue("store_unavailable bridge failure must be recoverable", bridgeFailure.getBoolean("recoverable"))
+        queue.recordCatalog(listOf(bridgeFailure))
+        val withBridgeFailure = queue.handoff(run)
+        val bridgeIdx = withBridgeFailure.getStringArrayList("packages")!!.indexOf("org.example.bridge.fail")
+        assertTrue(bridgeIdx >= 0)
+        assertTrue(withBridgeFailure.getBooleanArray("excluded")!![bridgeIdx])
+        assertTrue(withBridgeFailure.getBooleanArray("recoverable")!![bridgeIdx])
     }
 
     @Test fun wizardSuccessAndCancelCloseSelectionWithoutClaimingAnInstallSucceeded() {

@@ -55,13 +55,13 @@ class MigrationAllAccountsTest {
 
     /** Aurora already asked the Google accounts: its refusal in the reply is the app's result, not a second request. */
     @Test fun aRefusalInTheReplyIsFinalWhenAuroraTriedEveryAccount() {
-        for (error in listOf("not_found", "app_not_purchased")) {
+        for (error in listOf("not_found", "app_not_supported", "app_not_purchased")) {
             clear()
             val sent = mutableListOf<Bundle>()
             val queue = MigrationInstallQueue(context, { _, _ -> capabilities(true) }) { operation, _ ->
                 when {
                     operation == 3 -> state("none")
-                    error == "not_found" -> MigrationInstallQueue.unavailable(name, error)
+                    error in setOf("not_found", "app_not_supported") -> MigrationInstallQueue.unavailable(name, error)
                     else -> refused()
                 }
             }.apply { sentOptions = { operation, options -> if (operation == 2) sent += options!! } }

@@ -147,6 +147,7 @@ internal class PlaySetupProtocol(open: () -> MigrationInstallQueue,
         val prepared = queue.control(6)
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(catalogSeconds)
         fun preparationFailures(results: List<Bundle>) = results.onEach { result ->
+            if (result.getString("error") == "store_unavailable") result.putBoolean("recoverable", true)
             if (!prepared.getBoolean("ready") && result.getString("error") in setOf("anonymous_sign_in_required", "store_unavailable")) {
                 result.putBoolean("recoverable", true)
                 result.putString("error", prepared.getString("error", "store_unavailable"))
