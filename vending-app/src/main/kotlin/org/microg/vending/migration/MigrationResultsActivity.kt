@@ -107,8 +107,8 @@ import kotlinx.coroutines.withContext
  * selected" while every change restarted it.
  */
 class MigrationResultsActivity : ComponentActivity() {
-    /** The transfer the opening intent or the owner asked for; null opens [MigrationInstallQueue.resultsSession]'s pick. */
-    private val target = mutableStateOf<String?>(null)
+    /** Shared state & publication coordinator: handles transfer switching, out-of-order reads, and CYC-968 retries. */
+    internal val coordinator = ResultsCoordinator()
     /** Saved-receipt reads: conflated, so a burst of changes is one read. */
     private val snapshots = Channel<Unit>(Channel.CONFLATED)
     /** Aurora checks: conflated, one at a time, never cancelled by a newer change. */
@@ -116,7 +116,7 @@ class MigrationResultsActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        target.value = savedInstanceState?.getString(STATE_TARGET) ?: intent.getStringExtra("session_id")
+        coordinator.target = savedInstanceState?.getString(STATE_TARGET) ?: intent.getStringExtra("session_id")
         drawBehindBars()
         refresh()
         setContent { ResultsTheme { Results() } }
@@ -124,15 +124,16 @@ class MigrationResultsActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        // A notification or Transfer Phone opened the results again: show the transfer it names (or the default pick).
+        // A notification or Transfer Phone opened the results again: switch into loading immediately if the target
+        // changed so actions on the previous transfer cannot fire while the new transfer's receipt loads.
         setIntent(intent)
-        target.value = intent.getStringExtra("session_id")
+        coordinator.switchTarget(intent.getStringExtra("session_id"))
         refresh()
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putString(STATE_TARGET, target.value)
+        outState.putString(STATE_TARGET, coordinator.target)
     }
 
     private fun refresh() {
@@ -162,41 +163,6 @@ class MigrationResultsActivity : ComponentActivity() {
         // Opened on first use, inside the IO blocks below: a legacy upgrade takes the install lock.
         val queue by remember { lazy { MigrationInstallQueue(applicationContext) } }
         val scope = rememberCoroutineScope()
-        var sessionId by remember { mutableStateOf<String?>(null) }
-        var choices by remember { mutableStateOf(emptyList<Pair<String, Int>>()) }
-        var results by remember { mutableStateOf(emptyList<Bundle>()) }
-        var labels by remember { mutableStateOf(emptyMap<String, String>()) }
-        // Nothing is said about the transfer's apps until its saved receipt has been read once.
-        var loading by remember { mutableStateOf(true) }
-        var retryable by remember { mutableStateOf(emptySet<String>()) }
-        var complete by remember { mutableStateOf(false) }
-        var selectionClosed by remember { mutableStateOf(false) }
-        var activeWork by remember { mutableStateOf(false) }
-        // The apps an owner Retry is still working on, and what to tell them: a Retry that failed again in under a
-        // second used to leave the screen exactly as it was (CYC-968).
-        var retrying by remember { mutableStateOf(emptySet<String>()) }
-        var retryNote by remember { mutableStateOf<String?>(null) }
-        // Retries tapped but not recorded yet (queue.retry can take a while): no outcome is reported before they are.
-        var submitting by remember { mutableStateOf(0) }
-        // Advanced by every Retry tap and registration: a read that started before one only reports an outcome if none
-        // happened since (a newer read does not cancel one already reading).
-        var retryGeneration by remember { mutableStateOf(0) }
-        // Retry feedback belongs to the transfer it was started in; another transfer starts without it.
-        LaunchedEffect(sessionId) { retrying = emptySet(); retryNote = null }
-
-        fun apply(id: String, receipt: Bundle, retry: Set<String>, readAt: Int) {
-            if (sessionId != id) return
-            @Suppress("DEPRECATION")
-            results = receipt.getParcelableArray("cyclon_app_results")?.map { it as Bundle }.orEmpty()
-            complete = receipt.getBoolean("complete")
-            selectionClosed = receipt.getBoolean("selection_closed")
-            activeWork = receipt.getBoolean("has_active_work")
-            retryable = retry
-            if (retrying.isNotEmpty() && submitting == 0 && retryGeneration == readAt) {
-                MigrationResultText.retryOutcome(results.filter { it.getString("package_name") in retrying })
-                    ?.let { retryNote = it; retrying = emptySet() }
-            }
-        }
 
         DisposableEffect(Unit) {
             val receiver = object : BroadcastReceiver() {
@@ -214,9 +180,11 @@ class MigrationResultsActivity : ComponentActivity() {
         // The saved receipt: preferences only, so it never waits for Aurora or for an install in flight.
         LaunchedEffect(Unit) {
             for (signal in snapshots) {
-                val want = target.value
-                val readAt = retryGeneration
-                val known = labels
+                val epoch = coordinator.targetEpoch
+                val want = coordinator.target
+                val readAt = coordinator.retryGeneration
+                val seq = coordinator.nextSequence()
+                val known = coordinator.labels
                 val read = withContext(Dispatchers.IO) {
                     val id = queue.resultsSession(want)
                     val visible = queue.visibleSessions(id).map { it to queue.appCount(it) }
@@ -226,37 +194,30 @@ class MigrationResultsActivity : ComponentActivity() {
                     val rows = receipt?.getParcelableArray("cyclon_app_results")?.map { it as Bundle }.orEmpty()
                     SnapshotRead(id, visible, receipt, retry, installedLabels(packageManager, rows, known))
                 }
-                // A newer request (the picker, a new intent) has its own read queued.
-                if (target.value != want) continue
-                if (sessionId != read.id) {
-                    sessionId = read.id
+                if (coordinator.publishSnapshot(epoch, want, read.id, read.choices, read.receipt, read.retry, read.labels, readAt, seq)) {
                     checks.trySend(Unit)
                 }
-                choices = read.choices
-                if (read.labels.isNotEmpty()) labels = labels + read.labels
-                val id = read.id
-                if (id != null && read.receipt != null) apply(id, read.receipt, read.retry, readAt)
-                else { results = emptyList(); retryable = emptySet(); complete = false; selectionClosed = true; activeWork = false }
-                loading = false
             }
         }
         // Aurora's live check, one pass at a time, only while the screen is visible.
         LaunchedEffect(Unit) {
             for (signal in checks) {
                 lifecycle.withStarted {}
-                val id = sessionId ?: continue
-                val readAt = retryGeneration
+                val epoch = coordinator.targetEpoch
+                val id = coordinator.sessionId ?: continue
+                val readAt = coordinator.retryGeneration
+                val seq = coordinator.nextSequence()
                 val checked = withContext(Dispatchers.IO) {
                     runCatching {
                         queue.summary(id) to queue.retryDocuments(id).mapNotNull { it.getString("package_name") }.toSet()
                     }.getOrNull()
                 }
-                if (checked != null) apply(id, checked.first, checked.second, readAt)
+                if (checked != null) coordinator.publishLive(epoch, id, checked.first, checked.second, readAt, seq)
             }
         }
         // Aurora does not announce download progress: while apps are still installing, check again now and then.
-        LaunchedEffect(activeWork) {
-            while (activeWork) {
+        LaunchedEffect(coordinator.activeWork) {
+            while (coordinator.activeWork) {
                 delay(LIVE_CHECK_MS)
                 lifecycle.withResumed {}
                 checks.trySend(Unit)
@@ -264,51 +225,55 @@ class MigrationResultsActivity : ComponentActivity() {
         }
 
         fun retry(packageName: String? = null) {
-            val id = sessionId ?: return
-            val names = packageName?.let(::setOf) ?: retryable
-            retryNote = "Trying again…"
-            submitting++
-            retryGeneration++
+            val epoch = coordinator.targetEpoch
+            val id = coordinator.actionableSessionId() ?: return
+            val names = packageName?.let(::setOf) ?: coordinator.retryable
+            coordinator.beginRetry()
             scope.launch {
                 try {
                     withContext(Dispatchers.IO) { queue.retry(id, packageName) }
                     // Only now: a read before the retry is recorded would report the old failure as its outcome.
-                    if (sessionId == id) retrying = retrying + names
-                    retryGeneration++
+                    coordinator.finishRetryStarted(epoch, id, names)
                 } catch (e: Exception) {
-                    if (sessionId == id) retryNote = "Couldn't start the retry. Try again."
+                    coordinator.finishRetryFailed(epoch, id)
                 } finally {
-                    submitting--
-                    refresh()
+                    coordinator.endRetrySubmit(epoch)
+                    if (coordinator.targetEpoch == epoch) refresh()
                 }
             }
         }
 
-        val groups = remember(results, retryable, labels) {
-            MigrationResultGroups.group(results, retryable) { MigrationResultGroups.label(it, labels) }
+        val groups = remember(coordinator.results, coordinator.retryable, coordinator.labels) {
+            MigrationResultGroups.group(coordinator.results, coordinator.retryable) {
+                MigrationResultGroups.label(it, coordinator.labels)
+            }
         }
         ResultsScreen(
-            loading = loading,
+            loading = coordinator.loading,
             groups = groups,
-            labels = labels,
-            choices = choices,
-            sessionId = sessionId,
-            complete = complete,
-            selectionClosed = selectionClosed,
-            retryable = retryable,
-            retryBusy = retrying.isNotEmpty() || submitting > 0,
-            retryNote = retryNote,
+            labels = coordinator.labels,
+            choices = coordinator.choices,
+            sessionId = coordinator.sessionId,
+            complete = coordinator.complete,
+            selectionClosed = coordinator.selectionClosed,
+            retryable = coordinator.retryable,
+            retryBusy = coordinator.retryBusy,
+            retryNote = coordinator.retryNote,
             actions = ResultsActions(
                 back = { finish() },
-                choose = { id -> target.value = id; snapshots.trySend(Unit) },
+                choose = { id -> coordinator.switchTarget(id); refresh() },
                 retry = ::retry,
                 appStore = { name ->
                     runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=$name")).setPackage("com.aurora.store")) }
                 },
                 open = { name -> packageManager.getLaunchIntentForPackage(name)?.let { runCatching { startActivity(it) } } },
                 finishSelection = {
-                    val id = sessionId
-                    if (id != null) scope.launch { withContext(Dispatchers.IO) { queue.finishSelection(id) }; refresh() }
+                    val epoch = coordinator.targetEpoch
+                    val id = coordinator.actionableSessionId()
+                    if (id != null) scope.launch {
+                        withContext(Dispatchers.IO) { queue.finishSelection(id) }
+                        if (coordinator.targetEpoch == epoch) refresh()
+                    }
                 },
                 done = { finish() },
             ),
@@ -900,6 +865,7 @@ internal object MigrationResultGroups {
     private val STORAGE = setOf("insufficient_storage", "storage", "no_space", "package_installer_status_6")
     private val OWNER = setOf("installation_confirmation_required", "needs_confirmation", "user_action_required")
     private val UNLISTED = setOf("not_found", "app_removed", "app_not_supported")
+    private val NO_LISTING_ERRORS = setOf("not_found", "app_removed")
 
     /** The store's title when it is a real name, not blank and not a package name. */
     fun realTitle(title: String?, packageName: String): String? =
@@ -913,11 +879,29 @@ internal object MigrationResultGroups {
 
     fun initial(label: String): String = label.trim().firstOrNull { it.isLetterOrDigit() }?.uppercaseChar()?.toString() ?: "·"
 
-    fun section(row: Bundle, retryable: Set<String>): Section {
+    fun restoringData(row: Bundle): Boolean = row.getBoolean("restoring_data") || row.getString("status") == "restoring_data"
+
+    /**
+     * Parity with Transfer Phone (TransferHooks.classify): only apps genuinely absent from Google Play fold into
+     * "Not on Google Play" (no Play title, not retryable/recoverable, and an unlisted status/error). Paid apps and
+     * other Play-listed exclusions stay under Needs attention.
+     */
+    fun isNotOnPlay(row: Bundle, retryable: Set<String> = emptySet()): Boolean {
         val name = row.getString("package_name").orEmpty()
+        if (name in retryable || row.getBoolean("recoverable")) return false
+        if (realTitle(row.getString("title"), name) != null) return false
+        val status = row.getString("status").orEmpty()
+        val error = row.getString("errorCode")?.takeIf { it.isNotEmpty() } ?: row.getString("error").orEmpty()
+        return status == "not_found" ||
+            ((status == "unavailable" || status == "failed") &&
+                (error in NO_LISTING_ERRORS || (status == "unavailable" && error == "app_not_supported")))
+    }
+
+    fun section(row: Bundle, retryable: Set<String>): Section {
         return when {
+            restoringData(row) -> Section.INSTALLING
             row.getBoolean("installed") -> Section.INSTALLED
-            row.getBoolean("excluded") -> if (row.getBoolean("recoverable") || name in retryable) Section.ATTENTION else Section.NOT_ON_PLAY
+            row.getBoolean("excluded") -> if (isNotOnPlay(row, retryable)) Section.NOT_ON_PLAY else Section.ATTENTION
             !row.getBoolean("terminal") -> Section.INSTALLING
             else -> Section.ATTENTION
         }
@@ -925,13 +909,13 @@ internal object MigrationResultGroups {
 
     /** An app still being worked on reads as waiting, not as the failure of the attempt before (an owner Retry). */
     fun normalize(row: Bundle): Bundle {
-        if (row.getBoolean("terminal") || row.getBoolean("installed") || row.getBoolean("excluded") ||
+        if (restoringData(row) || row.getBoolean("terminal") || row.getBoolean("installed") || row.getBoolean("excluded") ||
             row.getString("status") !in FAILED) return row
         return Bundle(row).apply { putString("status", "pending"); remove("error"); remove("errorCode") }
     }
 
-    /** Aurora is moving this app right now (the row's live dots), not only holding it in its queue. */
-    fun active(row: Bundle): Boolean = row.getString("status") in ACTIVE
+    /** Aurora or app-data restore is moving this app right now (the row's live dots), not only holding it in its queue. */
+    fun active(row: Bundle): Boolean = restoringData(row) || row.getString("status") in ACTIVE
 
     /** An app left out for a reason App Store may still help with (paid, incompatible), not one it does not list. */
     fun listedSomewhere(row: Bundle): Boolean = (row.getString("error") ?: row.getString("errorCode")) !in UNLISTED &&
@@ -986,9 +970,9 @@ internal object MigrationResultGroups {
 }
 
 internal object MigrationResultText {
-    /** What an owner Retry came to once all its apps are settled; null while any is still being tried. */
+    /** What an owner Retry came to once all its apps are settled; null while any is still being tried or restoring data. */
     fun retryOutcome(rows: List<Bundle>): String? {
-        if (rows.isEmpty() || !rows.all { it.getBoolean("terminal") }) return null
+        if (rows.isEmpty() || !rows.all { it.getBoolean("terminal") && !MigrationResultGroups.restoringData(it) }) return null
         val failed = rows.filter { !it.getBoolean("installed") }
         if (failed.isEmpty()) return if (rows.size == 1) "Retry worked: the app is installed." else "Retry worked: all ${rows.size} apps are installed."
         val reasons = failed.map(::description).distinct()
@@ -997,6 +981,7 @@ internal object MigrationResultText {
     }
 
     fun description(result: Bundle): String {
+        if (MigrationResultGroups.restoringData(result)) return "Restoring app data"
         if (result.getBoolean("installed")) return "Installed and verified"
         return when (result.getString("error") ?: result.getString("errorCode")) {
             "anonymous_sign_in_required", "not_signed_in", "session_expired" -> "App Store could not start an anonymous session. Retry when it is available."
@@ -1031,5 +1016,183 @@ internal object MigrationResultText {
             }
             else -> "Could not install this app. Retry or check App Store."
         }
+    }
+}
+
+/**
+ * Publication order for receipts of one transfer (CYC-3525): a newer committed queue state always wins; at the same
+ * state version, Aurora's live check beats a cached snapshot so a slow snapshot label read can never repaint over it.
+ */
+internal data class ReceiptOrder(val stateVersion: Long, val live: Boolean, val seq: Long) : Comparable<ReceiptOrder> {
+    override fun compareTo(other: ReceiptOrder): Int =
+        compareValuesBy(this, other, { it.stateVersion }, { it.live }, { it.seq })
+}
+
+/**
+ * Coordinates transfer switching, publication ordering between the snapshot and live-check loops, and CYC-968 retry
+ * feedback so a switch immediately enters loading and disables actions on the previous transfer until the new transfer
+ * publishes, and out-of-order reads never repaint older rows.
+ */
+internal class ResultsCoordinator {
+    var target by mutableStateOf<String?>(null)
+    var targetEpoch by mutableStateOf(0)
+        private set
+    var sessionId by mutableStateOf<String?>(null)
+        private set
+    var choices by mutableStateOf(emptyList<Pair<String, Int>>())
+        private set
+    var results by mutableStateOf(emptyList<Bundle>())
+        private set
+    var labels by mutableStateOf(emptyMap<String, String>())
+        private set
+    var loading by mutableStateOf(true)
+        private set
+    var retryable by mutableStateOf(emptySet<String>())
+        private set
+    var complete by mutableStateOf(false)
+        private set
+    var selectionClosed by mutableStateOf(true)
+        private set
+    var activeWork by mutableStateOf(false)
+        private set
+    var retrying by mutableStateOf(emptySet<String>())
+        private set
+    var retryNote by mutableStateOf<String?>(null)
+        private set
+    var submitting by mutableStateOf(0)
+        private set
+    var retryGeneration by mutableStateOf(0)
+        private set
+    val retryBusy: Boolean get() = retrying.isNotEmpty() || submitting > 0
+
+    private var appliedOrder: ReceiptOrder? = null
+    private var nextSeq = 0L
+
+    fun nextSequence(): Long = ++nextSeq
+
+    /** The transfer whose session actions (Retry, Finish app selection) are currently valid; null while loading/switching. */
+    fun actionableSessionId(): String? = sessionId?.takeIf { !loading }
+
+    /**
+     * Switches to [newTarget] (from onNewIntent or the transfer picker). Enters loading immediately and clears the
+     * previous session whenever the requested target may differ from the visible transfer.
+     */
+    fun switchTarget(newTarget: String?) {
+        val sameShown = !loading && newTarget != null && newTarget == sessionId
+        target = newTarget
+        if (sameShown) return
+        targetEpoch++
+        loading = true
+        sessionId = null
+        results = emptyList()
+        retryable = emptySet()
+        complete = false
+        selectionClosed = true
+        activeWork = false
+        retrying = emptySet()
+        retryNote = null
+        submitting = 0
+        retryGeneration++
+        appliedOrder = null
+    }
+
+    fun beginRetry() {
+        retryNote = "Trying again…"
+        submitting++
+        retryGeneration++
+    }
+
+    fun finishRetryStarted(epoch: Int, id: String, names: Set<String>) {
+        if (targetEpoch == epoch && sessionId == id) {
+            retrying = retrying + names
+            retryGeneration++
+        }
+    }
+
+    fun finishRetryFailed(epoch: Int, id: String) {
+        if (targetEpoch == epoch && sessionId == id) {
+            retryNote = "Couldn't start the retry. Try again."
+        }
+    }
+
+    fun endRetrySubmit(epoch: Int) {
+        if (targetEpoch == epoch && submitting > 0) submitting--
+    }
+
+    /**
+     * Publishes a saved-receipt read for ([epoch], [want]). Returns true when it changed to a non-null transfer so
+     * the live-check loop knows to inspect Aurora for the new transfer.
+     */
+    fun publishSnapshot(
+        epoch: Int,
+        want: String?,
+        id: String?,
+        newChoices: List<Pair<String, Int>>,
+        receipt: Bundle?,
+        retry: Set<String>,
+        newLabels: Map<String, String>,
+        readAt: Int,
+        seq: Long,
+    ): Boolean {
+        if (targetEpoch != epoch || target != want) return false
+        val changedSession = sessionId != id
+        if (changedSession) {
+            sessionId = id
+            appliedOrder = null
+            retrying = emptySet()
+            retryNote = null
+        }
+        choices = newChoices
+        if (newLabels.isNotEmpty()) labels = labels + newLabels
+        if (id != null && receipt != null) {
+            applyReceipt(epoch, id, receipt, retry, readAt, live = false, seq = seq)
+        } else {
+            results = emptyList()
+            retryable = emptySet()
+            complete = false
+            selectionClosed = true
+            activeWork = false
+            appliedOrder = null
+        }
+        loading = false
+        return changedSession && id != null
+    }
+
+    /** Publishes a live Aurora check for ([epoch], [id]); returns true if its receipt was newer and applied. */
+    fun publishLive(epoch: Int, id: String, receipt: Bundle, retry: Set<String>, readAt: Int, seq: Long): Boolean {
+        if (targetEpoch != epoch || sessionId != id) return false
+        return applyReceipt(epoch, id, receipt, retry, readAt, live = true, seq = seq)
+    }
+
+    private fun applyReceipt(
+        epoch: Int,
+        id: String,
+        receipt: Bundle,
+        retry: Set<String>,
+        readAt: Int,
+        live: Boolean,
+        seq: Long,
+    ): Boolean {
+        if (targetEpoch != epoch || sessionId != id) return false
+        val order = ReceiptOrder(receipt.getLong("state_version", 0L), live, seq)
+        val current = appliedOrder
+        val accepted = current == null || order >= current
+        if (accepted) {
+            appliedOrder = order
+            @Suppress("DEPRECATION")
+            val rows = receipt.getParcelableArray("cyclon_app_results")?.map { it as Bundle }.orEmpty()
+            val restoringAny = rows.any(MigrationResultGroups::restoringData)
+            results = rows
+            complete = receipt.getBoolean("complete") && !restoringAny
+            selectionClosed = receipt.getBoolean("selection_closed")
+            activeWork = receipt.getBoolean("has_active_work") || restoringAny
+            retryable = retry
+        }
+        val currentAtLeast = current != null && current.stateVersion >= order.stateVersion
+        if ((accepted || currentAtLeast) && retrying.isNotEmpty() && submitting == 0 && retryGeneration == readAt) {
+            MigrationResultText.retryOutcome(results.filter { it.getString("package_name") in retrying })
+                ?.let { retryNote = it; retrying = emptySet() }
+        }
+        return accepted
     }
 }

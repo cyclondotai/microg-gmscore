@@ -241,7 +241,7 @@ class MigrationResultsSessionTest {
             row("com.full", "Full", "failed", "insufficient_storage"),
             row("com.late", "Late", "unavailable", "lookup_timeout", excluded = true, recoverable = true),
             row("com.retry.listed", "Listed retry", "unavailable", "store_unavailable", excluded = true),
-            row("com.gone", "Gone", "unavailable", "not_found", excluded = true),
+            row("com.gone", null, "unavailable", "not_found", excluded = true),
             row("com.paid", "Paid", "unavailable", "paid", excluded = true),
         )
         val labels = mapOf("org.nameless" to "Nameless")
@@ -249,16 +249,161 @@ class MigrationResultsSessionTest {
         fun names(section: MigrationResultGroups.Section) = groups[section].orEmpty().map { MigrationResultGroups.label(it, labels) }
         assertEquals(listOf("alpha", "Mike", "Nameless", "Zulu"), names(MigrationResultGroups.Section.INSTALLED))
         assertEquals(listOf("Another", "Busy"), names(MigrationResultGroups.Section.INSTALLING))
-        assertEquals(listOf("Approve me", "Broken", "Full", "Late", "Listed retry"), names(MigrationResultGroups.Section.ATTENTION))
-        assertEquals(listOf("Gone", "Paid"), names(MigrationResultGroups.Section.NOT_ON_PLAY))
+        assertEquals(listOf("Approve me", "Broken", "Full", "Late", "Listed retry", "Paid"), names(MigrationResultGroups.Section.ATTENTION))
+        assertEquals(listOf("com.gone"), names(MigrationResultGroups.Section.NOT_ON_PLAY))
 
         val counts = MigrationResultGroups.counts(groups)
-        assertEquals(MigrationResultGroups.Counts(installed = 4, installing = 2, attention = 5, notOnPlay = 2), counts)
-        assertEquals(11, counts.total)
-        assertEquals(MigrationResultGroups.Reasons(storage = 1, owner = 1, other = 3), MigrationResultGroups.reasons(groups))
-        assertEquals("4 of 11 installed", MigrationResultGroups.headline(counts, loading = false))
-        assertTrue(MigrationResultGroups.listedSomewhere(groups.getValue(MigrationResultGroups.Section.NOT_ON_PLAY)[1]))
-        assertFalse(MigrationResultGroups.listedSomewhere(groups.getValue(MigrationResultGroups.Section.NOT_ON_PLAY)[0]))
+        assertEquals(MigrationResultGroups.Counts(installed = 4, installing = 2, attention = 6, notOnPlay = 1), counts)
+        assertEquals(12, counts.total)
+        assertEquals(MigrationResultGroups.Reasons(storage = 1, owner = 1, other = 4), MigrationResultGroups.reasons(groups))
+        assertEquals("4 of 12 installed", MigrationResultGroups.headline(counts, loading = false))
+        assertFalse(MigrationResultGroups.listedSomewhere(groups.getValue(MigrationResultGroups.Section.NOT_ON_PLAY).single()))
+    }
+
+    @Test fun paidAppsStayInAttentionWhileGenuinelyMissingListingsFoldIntoNotOnPlay() {
+        val paidWithTitle = row("com.paid.game", "Paid Game", "unavailable", "paid", excluded = true, recoverable = false)
+        val paidWithoutTitle = row("com.paid.bare", "com.paid.bare", "unavailable", "paid", excluded = true, recoverable = false)
+        val incompatibleWithTitle = row("com.incompat.app", "Tablet Only", "unavailable", "app_not_supported", excluded = true, recoverable = false)
+        val missingNoTitle = row("com.missing.app", null, "unavailable", "not_found", excluded = true, recoverable = false)
+        val missingPkgTitle = row("com.removed.app", "com.removed.app", "unavailable", "app_removed", excluded = true, recoverable = false)
+        val unsupportedNoTitle = row("com.unsupported.app", null, "unavailable", "app_not_supported", excluded = true, recoverable = false)
+
+        assertEquals(MigrationResultGroups.Section.ATTENTION, MigrationResultGroups.section(paidWithTitle, emptySet()))
+        assertEquals(MigrationResultGroups.Section.ATTENTION, MigrationResultGroups.section(paidWithoutTitle, emptySet()))
+        assertEquals(MigrationResultGroups.Section.ATTENTION, MigrationResultGroups.section(incompatibleWithTitle, emptySet()))
+        assertEquals(MigrationResultGroups.Section.NOT_ON_PLAY, MigrationResultGroups.section(missingNoTitle, emptySet()))
+        assertEquals(MigrationResultGroups.Section.NOT_ON_PLAY, MigrationResultGroups.section(missingPkgTitle, emptySet()))
+        assertEquals(MigrationResultGroups.Section.NOT_ON_PLAY, MigrationResultGroups.section(unsupportedNoTitle, emptySet()))
+
+        // A paid-only transfer must never claim the app isn't on Google Play.
+        val paidOnly = MigrationResultGroups.group(listOf(paidWithTitle), emptySet()) { MigrationResultGroups.label(it, emptyMap()) }
+        val paidCounts = MigrationResultGroups.counts(paidOnly)
+        assertEquals(MigrationResultGroups.Counts(installed = 0, installing = 0, attention = 1, notOnPlay = 0), paidCounts)
+        assertEquals("0 of 1 installed", MigrationResultGroups.headline(paidCounts, loading = false))
+    }
+
+    @Test fun switchingTransferEntersLoadingDisablesPreviousActionsAndDropsDelayedReads() {
+        fun receipt(id: String, version: Long, selectionClosed: Boolean, vararg appRows: Bundle) = Bundle().apply {
+            putString("session_id", id)
+            putLong("state_version", version)
+            putBoolean("selection_closed", selectionClosed)
+            putBoolean("complete", false)
+            putBoolean("has_active_work", false)
+            putParcelableArray("cyclon_app_results", appRows)
+        }
+        val coordinator = ResultsCoordinator()
+        coordinator.target = "session-A"
+        val epochA = coordinator.targetEpoch
+        val seqA1 = coordinator.nextSequence()
+        assertTrue(coordinator.publishSnapshot(
+            epoch = epochA, want = "session-A", id = "session-A",
+            newChoices = listOf("session-B" to 1, "session-A" to 1),
+            receipt = receipt("session-A", 1L, selectionClosed = false, row("com.a", "App A", "failed", "network")),
+            retry = setOf("com.a"), newLabels = emptyMap(), readAt = coordinator.retryGeneration, seq = seqA1,
+        ))
+        assertFalse(coordinator.loading)
+        assertEquals("session-A", coordinator.actionableSessionId())
+
+        // Start a delayed live check for A before switching to B.
+        val delayedLiveSeqA = coordinator.nextSequence()
+        val delayedReadAtA = coordinator.retryGeneration
+
+        // Switching via onNewIntent / picker immediately enters loading and disables actions on A.
+        coordinator.switchTarget("session-B")
+        assertTrue(coordinator.loading)
+        assertNull(coordinator.sessionId)
+        assertNull(coordinator.actionableSessionId())
+        assertTrue(coordinator.results.isEmpty())
+        assertTrue(coordinator.retryable.isEmpty())
+
+        // Delayed live check and delayed snapshot from A must be discarded.
+        assertFalse(coordinator.publishLive(
+            epoch = epochA, id = "session-A",
+            receipt = receipt("session-A", 2L, selectionClosed = false, row("com.a", "App A", "installed", installed = true)),
+            retry = emptySet(), readAt = delayedReadAtA, seq = delayedLiveSeqA,
+        ))
+        assertFalse(coordinator.publishSnapshot(
+            epoch = epochA, want = "session-A", id = "session-A",
+            newChoices = listOf("session-B" to 1, "session-A" to 1),
+            receipt = receipt("session-A", 2L, selectionClosed = false, row("com.a", "App A", "failed", "network")),
+            retry = setOf("com.a"), newLabels = emptyMap(), readAt = delayedReadAtA, seq = coordinator.nextSequence(),
+        ))
+        assertTrue(coordinator.loading)
+        assertNull(coordinator.actionableSessionId())
+
+        // Once B's snapshot finishes, B's receipt and action target publish atomically.
+        val epochB = coordinator.targetEpoch
+        assertTrue(coordinator.publishSnapshot(
+            epoch = epochB, want = "session-B", id = "session-B",
+            newChoices = listOf("session-B" to 1, "session-A" to 1),
+            receipt = receipt("session-B", 3L, selectionClosed = true, row("com.b", "App B", "installed", installed = true)),
+            retry = emptySet(), newLabels = emptyMap(), readAt = coordinator.retryGeneration, seq = coordinator.nextSequence(),
+        ))
+        assertFalse(coordinator.loading)
+        assertEquals("session-B", coordinator.actionableSessionId())
+        assertEquals(listOf("com.b"), coordinator.results.map { it.getString("package_name") })
+    }
+
+    @Test fun outOfOrderSnapshotNeverRepaintsOverLiveCheckAndRetryFailureStillReports() {
+        fun receipt(id: String, version: Long, vararg appRows: Bundle) = Bundle().apply {
+            putString("session_id", id)
+            putLong("state_version", version)
+            putBoolean("selection_closed", true)
+            putBoolean("complete", false)
+            putBoolean("has_active_work", appRows.any { !it.getBoolean("terminal") })
+            putParcelableArray("cyclon_app_results", appRows)
+        }
+        val coordinator = ResultsCoordinator()
+        coordinator.target = "session-1"
+        val epoch = coordinator.targetEpoch
+
+        // Initial load: downloading at state_version 10.
+        coordinator.publishSnapshot(
+            epoch, "session-1", "session-1", listOf("session-1" to 1),
+            receipt("session-1", 10L, row("com.app", "App", "downloading", terminal = false)),
+            emptySet(), emptyMap(), coordinator.retryGeneration, coordinator.nextSequence(),
+        )
+        // Snapshot 2 starts while downloading (state_version 10), before live check completes.
+        val slowSnapSeq = coordinator.nextSequence()
+        val slowSnapReadAt = coordinator.retryGeneration
+        // Live check sees installed (state_version 11) and publishes first.
+        assertTrue(coordinator.publishLive(
+            epoch, "session-1",
+            receipt("session-1", 11L, row("com.app", "App", "installed", installed = true, terminal = true)),
+            emptySet(), coordinator.retryGeneration, coordinator.nextSequence(),
+        ))
+        assertEquals("installed", coordinator.results.single().getString("status"))
+        // Slow snapshot finishes label lookups afterward: must not regress row back to downloading, yet still merges labels.
+        coordinator.publishSnapshot(
+            epoch, "session-1", "session-1", listOf("session-1" to 1),
+            receipt("session-1", 10L, row("com.app", "App", "downloading", terminal = false)),
+            emptySet(), mapOf("com.app" to "App Label"), slowSnapReadAt, slowSnapSeq,
+        )
+        assertEquals("installed", coordinator.results.single().getString("status"))
+        assertEquals("App Label", coordinator.labels["com.app"])
+
+        // CYC-968: retry starts, fails again in <1s before next refresh, and an older pre-retry live check arrives late.
+        val preRetryLiveSeq = coordinator.nextSequence()
+        val preRetryReadAt = coordinator.retryGeneration
+        coordinator.beginRetry()
+        coordinator.finishRetryStarted(epoch, "session-1", setOf("com.app"))
+        coordinator.endRetrySubmit(epoch)
+        // Post-retry snapshot sees the new fast failure (state_version 13) with matching retryGeneration.
+        val postRetryReadAt = coordinator.retryGeneration
+        coordinator.publishSnapshot(
+            epoch, "session-1", "session-1", listOf("session-1" to 1),
+            receipt("session-1", 13L, row("com.app", "App", "failed", "not_signed_in", installed = false, terminal = true)),
+            setOf("com.app"), emptyMap(), postRetryReadAt, coordinator.nextSequence(),
+        )
+        assertTrue(coordinator.retrying.isEmpty())
+        assertTrue(coordinator.retryNote.orEmpty().startsWith("1 app still couldn't be installed"))
+        // Late pre-retry live check (state_version 11) must be ignored.
+        assertFalse(coordinator.publishLive(
+            epoch, "session-1",
+            receipt("session-1", 11L, row("com.app", "App", "installed", installed = true, terminal = true)),
+            emptySet(), preRetryReadAt, preRetryLiveSeq,
+        ))
+        assertEquals("failed", coordinator.results.single().getString("status"))
     }
 
     @Test fun packageNamesAreNeverShownAsTitlesWhenABetterNameIsKnown() {
