@@ -477,8 +477,8 @@ class MigrationPriorityTest {
         assertTrue(queue.isBulkDeferred(sessionB))
         assertTrue(queue.dispatchOrder().isEmpty())
 
-        // Switch in-app retry creates newer session C while handoff_session stays on B.
-        val sessionC = queue.catalogSession()
+        // An independent transfer creates newer session C while handoff_session stays on B.
+        val sessionC = queue.beginTransfer()
         assertNotEquals(sessionB, sessionC)
         assertEquals(sessionC, queue.currentSessionId())
         scheduler.cancelAll()
@@ -496,6 +496,34 @@ class MigrationPriorityTest {
             listOf(sessionB to "com.small.app", sessionB to "com.large.app"),
             queue.dispatchOrder(),
         )
+    }
+
+    /** Round-2 Sol P1: repeated Pause / catalog retries after selection reuse the bound deferred handoff session. */
+    @Test fun repeatedPauseAndCatalogRetriesAfterSelectionReuseBoundDeferredHandoffSession() {
+        val handed = mutableListOf<String>()
+        val queue = MigrationInstallQueue(context) { operation, name ->
+            if (operation == 2) { handed += name; state(name, "queued") } else state(name, "none")
+        }
+        assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
+        val sessionB = queue.startPausedTransfer()
+        queue.select(listOf(doc("com.first.big").apply { putLong("install_size", 400_000_000L) }))
+
+        // Repeated Switch op 13 (Pause) and op 7/22 (catalog) after selection must stay on sessionB.
+        assertEquals(sessionB, queue.startPausedTransfer())
+        assertEquals(sessionB, queue.catalogSession())
+        queue.select(listOf(doc("com.second.small").apply { putLong("install_size", 20_000_000L) }))
+
+        assertEquals(sessionB, queue.currentSessionId())
+        assertTrue(queue.isBulkDeferred(sessionB))
+        val receipt = queue.handoff(run)
+        assertEquals(sessionB, receipt.getString("session_id"))
+        assertTrue(receipt.getBoolean("bulk_deferred"))
+        assertEquals(listOf("com.first.big", "com.second.small"), receipt.getStringArrayList("packages"))
+        assertTrue("neither app may dispatch while deferred", queue.dispatchOrder().isEmpty())
+
+        assertTrue(queue.releaseBulkHandoff(run).getBoolean("accepted"))
+        queue.dispatchRound()
+        assertEquals(listOf("com.second.small", "com.first.big"), handed)
     }
 
     /** R3: starting a new beginHandoff(run2) unblocks the superseded run1 session and schedules it. */
@@ -549,8 +577,8 @@ class MigrationPriorityTest {
         )
     }
 
-    /** Durable 3-hour fail-open cap unblocks bulk apps smallest-first and is not reset by repeat beginHandoff. */
-    @Test fun deferBulkFailsOpenAfterThreeHoursAndRepeatBeginHandoffDoesNotResetClock() {
+    /** Durable 12-hour fail-open cap refreshes on live heartbeats and never resurrects once expired. */
+    @Test fun deferBulkFailsOpenAfterTwelveHoursAndRefreshesOnLiveHeartbeats() {
         val startMs = 1_700_000_000_000L
         var nowMs = startMs
         val handed = mutableListOf<String>()
@@ -558,28 +586,41 @@ class MigrationPriorityTest {
             if (operation == 2) { handed += name; state(name, "queued") } else state(name, "none")
         }.apply { clock = { nowMs } }
 
+        assertEquals(12L * 60L * 60_000L, MigrationInstallQueue.MAX_DEFER_BULK_MS)
         assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
         val sessionId = queue.startPausedTransfer()
         queue.select(listOf(
             doc("com.big.app").apply { putLong("install_size", 500_000_000L) },
             doc("com.small.app").apply { putLong("install_size", 10_000_000L) },
+            doc("com.signin.one").apply { putLong("install_size", 50_000_000L) },
         ))
 
-        // Repeat beginHandoff after 2 hours must not push the 3-hour fail-open deadline back.
-        nowMs = startMs + 2L * 60L * 60_000L
+        // Heartbeat 1: beginHandoff(resumeOnly=true) at +6h refreshes defer_bulk_at so +12h from start stays deferred.
+        nowMs = startMs + 6L * 60L * 60_000L
         assertTrue(queue.beginHandoff(run, resumeOnly = true, deferBulk = true).getBoolean("accepted"))
+        nowMs = startMs + 13L * 60L * 60_000L
+        assertTrue("resume heartbeat must keep long cable copy deferred past original 12h", queue.isBulkDeferred(sessionId))
 
-        nowMs = startMs + MigrationInstallQueue.MAX_DEFER_BULK_MS - 1L
+        // Heartbeat 2: prioritize() while still deferred at +13h refreshes defer_bulk_at again (new expiry: +25h).
+        assertEquals(1, queue.prioritize(run, listOf("com.signin.one")).getInt("prioritized"))
+        assertTrue(queue.dispatch("com.signin.one", sessionId))
+        nowMs = startMs + 25L * 60L * 60_000L - 1L
         assertTrue(queue.isBulkDeferred(sessionId))
         assertTrue(queue.handoff(run).getBoolean("bulk_deferred"))
         assertTrue(queue.dispatchOrder().isEmpty())
 
-        nowMs = startMs + MigrationInstallQueue.MAX_DEFER_BULK_MS
+        // Once 12h elapse since the last live heartbeat, deferral fails open smallest-first.
+        nowMs = startMs + 25L * 60L * 60_000L
         assertFalse(queue.isBulkDeferred(sessionId))
         assertFalse(queue.handoff(run).getBoolean("bulk_deferred"))
+
+        // Late heartbeats after expiry must not resurrect an expired deferral.
+        assertTrue(queue.beginHandoff(run, resumeOnly = true, deferBulk = true).getBoolean("accepted"))
+        assertFalse(queue.isBulkDeferred(sessionId))
+
         assertEquals(listOf(sessionId to "com.small.app", sessionId to "com.big.app"), queue.dispatchOrder())
         queue.dispatchRound()
-        assertEquals(listOf("com.small.app", "com.big.app"), handed)
+        assertEquals(listOf("com.signin.one", "com.small.app", "com.big.app"), handed)
     }
 
     /** Idle deferred job renews Aurora's 15-min update hold via a ~10-min delayed wake until release or 3h cap. */
@@ -856,5 +897,154 @@ class MigrationPriorityTest {
         polled.clear()
         queue.summary(id, reschedule = false)
         assertEquals(21, polled.toSet().size)
+    }
+
+    /** Round-2 Sol P2 #3 & #4: schedule before cancel fallback wake; secure next wake before onFinished(false) & handle mid-pass expiry. */
+    @Test fun safeWakeScheduleOrderingPreservesFallbackAndRetriesOnScheduleFailure() {
+        val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+        val startMs = 1_700_000_000_000L
+        var nowMs = startMs
+        var expireOnRenew = false
+        val queue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, _ ->
+                when (operation) {
+                    4 -> {
+                        if (expireOnRenew) nowMs = startMs + MigrationInstallQueue.MAX_DEFER_BULK_MS
+                        Bundle().apply { putBoolean("success", true) }
+                    }
+                    5 -> Bundle().apply { putBoolean("success", true) }
+                    7 -> Bundle().apply { putBoolean("automatic_update_hold", true) }
+                    else -> Bundle()
+                }
+            },
+            storeCall = { _, name -> state(name, "none") },
+        ).apply { clock = { nowMs } }
+
+        assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
+        val sessionId = queue.startPausedTransfer()
+        assertTrue(queue.pause(sessionId).getBoolean("success"))
+        queue.select(listOf(doc("com.bulk.app")))
+        assertNotNull(queue.syncDeferredWake())
+        assertTrue(scheduler.allPendingJobs.any { it.id == MigrationInstallQueue.DEFER_WAKE_JOB })
+
+        // Part A: if scheduleImmediate() fails during releaseBulkHandoff, DEFER_WAKE_JOB must stay intact as fallback.
+        queue.jobSchedulerHook = { s, info ->
+            if (info.id == MigrationInstallQueue.JOB) JobScheduler.RESULT_FAILURE else s.schedule(info)
+        }
+        assertTrue(runCatching { queue.releaseBulkHandoff(run) }.isFailure)
+        assertTrue(
+            "fallback wake must not be cancelled when primary job scheduling fails",
+            scheduler.allPendingJobs.any { it.id == MigrationInstallQueue.DEFER_WAKE_JOB },
+        )
+        queue.jobSchedulerHook = null
+        assertTrue(queue.releaseBulkHandoff(run).getBoolean("accepted"))
+        assertTrue(scheduler.allPendingJobs.any { it.id == MigrationInstallQueue.JOB })
+        assertTrue(scheduler.allPendingJobs.none { it.id == MigrationInstallQueue.DEFER_WAKE_JOB })
+
+        val controller = Robolectric.buildService(MigrationInstallJob::class.java).create()
+        try {
+            val job = controller.get()
+
+            // Part B: runJob secures DEFER_WAKE_JOB strictly BEFORE calling onFinished(false).
+            clear()
+            nowMs = startMs
+            assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
+            val id2 = queue.startPausedTransfer()
+            assertTrue(queue.pause(id2).getBoolean("success"))
+            queue.select(listOf(doc("com.bulk.app")))
+            scheduler.cancelAll()
+            val events = mutableListOf<String>()
+            queue.jobSchedulerHook = { s, info ->
+                if (info.id == MigrationInstallQueue.DEFER_WAKE_JOB) events += "schedule_wake"
+                s.schedule(info)
+            }
+            job.runJob(MigrationInstallQueue.JOB, queue = queue, deadlineNanos = System.nanoTime()) { reschedule ->
+                events += "finished:$reschedule"
+            }
+            assertEquals(listOf("schedule_wake", "finished:false"), events)
+
+            // If scheduling the next wake fails, runJob passes onFinished(true) so JobScheduler retries with backoff.
+            queue.jobSchedulerHook = { s, info ->
+                if (info.id == MigrationInstallQueue.DEFER_WAKE_JOB) JobScheduler.RESULT_FAILURE else s.schedule(info)
+            }
+            var rescheduled: Boolean? = null
+            job.runJob(MigrationInstallQueue.JOB, queue = queue, deadlineNanos = System.nanoTime()) { rescheduled = it }
+            assertEquals(true, rescheduled)
+
+            // Part C: deferral expires between summary() and post-loop wake check (during renewPause).
+            queue.jobSchedulerHook = null
+            scheduler.cancelAll()
+            nowMs = startMs
+            expireOnRenew = true
+            job.runJob(MigrationInstallQueue.DEFER_WAKE_JOB, queue = queue, deadlineNanos = System.nanoTime()) { rescheduled = it }
+            assertEquals(false, rescheduled)
+            assertTrue("expired deferral must hand off to primary JOB", scheduler.allPendingJobs.any { it.id == MigrationInstallQueue.JOB })
+            assertTrue(scheduler.allPendingJobs.none { it.id == MigrationInstallQueue.DEFER_WAKE_JOB })
+
+            // If primary JOB scheduling fails during that handoff, DEFER_WAKE_JOB returns onFinished(true).
+            clear()
+            nowMs = startMs
+            expireOnRenew = false
+            assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
+            val id3 = queue.startPausedTransfer()
+            assertTrue(queue.pause(id3).getBoolean("success"))
+            queue.select(listOf(doc("com.bulk.app")))
+            expireOnRenew = true
+            queue.jobSchedulerHook = { s, info ->
+                if (info.id == MigrationInstallQueue.JOB) JobScheduler.RESULT_FAILURE else s.schedule(info)
+            }
+            job.runJob(MigrationInstallQueue.DEFER_WAKE_JOB, queue = queue, deadlineNanos = System.nanoTime()) { rescheduled = it }
+            assertEquals(true, rescheduled)
+        } finally {
+            queue.jobSchedulerHook = null
+            controller.destroy()
+        }
+    }
+
+    /** Round-2 Sol P2 #6: syncStorePriority reserves Aurora's 200-slot priority window for already-dispatched apps. */
+    @Test fun syncStorePriorityReserves200SlotWindowForAlreadyDispatchedApps() {
+        val prefs = context.getSharedPreferences("migration-installs", 0)
+        val sentBatches = mutableListOf<List<String>>()
+        val queue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, options ->
+                when (operation) {
+                    7 -> Bundle().apply { putBoolean("prioritize_downloads", true) }
+                    8 -> {
+                        val pkgs = options.getStringArrayList("packages").orEmpty()
+                        sentBatches += pkgs
+                        Bundle().apply {
+                            putBoolean("success", true)
+                            putStringArrayList("packages", ArrayList(pkgs.take(200)))
+                        }
+                    }
+                    else -> Bundle()
+                }
+            },
+            storeCall = { _, name -> state(name, "queued") },
+        )
+
+        assertTrue(queue.beginHandoff(run, resumeOnly = false).getBoolean("accepted"))
+        val id = queue.currentSessionId()!!
+        val queued = (0 until 10).map { "com.queued.app%02d".format(it) }
+        val pendingHints = (0 until 205).map { "com.pending.app%03d".format(it) }
+        queue.select((queued + pendingHints).map(::doc))
+        for (pkg in queued) {
+            queue.save(pkg, state(pkg, "queued"), dispatched = true, id = id)
+        }
+
+        // Prioritize queued apps first, then prepend 205 not-yet-dispatched pending hints ahead of them (total 215 > 200).
+        queue.prioritize(run, queued)
+        pendingHints.chunked(50).reversed().forEach { batch -> queue.prioritize(run, batch) }
+
+        // Stop right after initial syncStorePriority so we verify the exact 200-slot batch sent before pending dispatch.
+        queue.dispatchRound(cancelled = { sentBatches.isNotEmpty() })
+        assertEquals(1, sentBatches.size)
+        val batch = sentBatches.single()
+        assertEquals(200, batch.size)
+        assertTrue("all 10 already-dispatched apps must fit inside Aurora's 200-slot window", batch.containsAll(queued))
+        assertEquals(pendingHints.take(190) + queued, batch)
+        assertTrue("overflowing pending hints must keep priority_dirty set", prefs.getBoolean("$id:priority_dirty", false))
     }
 }

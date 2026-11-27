@@ -196,6 +196,8 @@ internal class MigrationInstallQueue(private val context: Context,
             if (wanted.isNotEmpty()) {
                 edit.putBoolean("$id:priority_dirty", true)
                 roundSyncedPriority.remove(id)
+                val now = clock()
+                if (isBulkDeferred(id, now)) edit.putLong("$id:defer_bulk_at", now)
             }
             check(edit.commit())
             val open = wanted.count { isPending(id, it) || (storeSupportsPrioritize && isQueuedNotActive(id, it)) }
@@ -314,12 +316,24 @@ internal class MigrationInstallQueue(private val context: Context,
             return Bundle().apply { putBoolean("accepted", true) }
         }
         val accepted = !prefs.contains("handoff_outcome")
-        if (accepted && deferBulk) {
-            val id = prefs.getString("handoff_session", null)
-            if (id != null && !prefs.getBoolean("$id:selection_closed", false) && !prefs.getBoolean("$id:bulk_released", false)) {
-                val edit = prefs.edit().putBoolean("$id:defer_bulk", true).putBoolean("$id:defer_opted_in", true)
-                if (prefs.getLong("$id:defer_bulk_at", 0L) <= 0L) edit.putLong("$id:defer_bulk_at", clock())
-                check(edit.commit())
+        val id = prefs.getString("handoff_session", null)
+        if (accepted && id != null) {
+            val now = clock()
+            if (isBulkDeferred(id, now)) {
+                // Live heartbeat on an active deferred copy extends the fail-open cap.
+                if (resumeOnly || deferBulk) {
+                    check(prefs.edit().putLong("$id:defer_bulk_at", now).commit())
+                }
+            } else if (deferBulk &&
+                !prefs.getBoolean("$id:defer_bulk", false) &&
+                !prefs.getBoolean("$id:selection_closed", false) &&
+                !prefs.getBoolean("$id:bulk_released", false)
+            ) {
+                check(prefs.edit()
+                    .putBoolean("$id:defer_bulk", true)
+                    .putBoolean("$id:defer_opted_in", true)
+                    .putLong("$id:defer_bulk_at", now)
+                    .commit())
             }
         }
         Bundle().apply { putBoolean("accepted", accepted) }
@@ -336,7 +350,7 @@ internal class MigrationInstallQueue(private val context: Context,
         val wasDeferred = prefs.getBoolean("$id:defer_bulk", false)
         check(prefs.edit().putBoolean("$id:defer_bulk", false).putBoolean("$id:bulk_released", true).commit())
         if (wasDeferred) changed(id)
-        if (pending(id).isNotEmpty()) schedule() else syncDeferredWake()
+        if (pending(id).isNotEmpty()) scheduleImmediate() else syncDeferredWake()
         Bundle().apply {
             putBoolean("supported", true)
             putBoolean("accepted", true)
@@ -460,12 +474,26 @@ internal class MigrationInstallQueue(private val context: Context,
         }
         handoff(run).apply { putBoolean("accepted", true) }
     }
+    /** Active, unclosed handoff session currently bound to [currentSessionId], if any. */
+    private fun activeUnclosedHandoffSession(): String? {
+        if (!prefs.contains("handoff_run") || prefs.contains("handoff_outcome")) return null
+        val id = prefs.getString("handoff_session", null) ?: return null
+        if (id != currentSessionId()) return null
+        if (prefs.getBoolean("$id:selection_closed", false)) return null
+        if (prefs.getString("$id:transfer_outcome", null) != null) return null
+        return id
+    }
     fun startPausedTransfer(): String {
-        val id = synchronized(LOCK) {
-            currentSessionId()?.let { if (prefs.getBoolean("$it:pause_requested", false)) resume(it) }
-            newSession()
+        val (id, created) = synchronized(LOCK) {
+            val bound = activeUnclosedHandoffSession()
+            if (bound != null && prefs.getBoolean("$bound:selected", false)) {
+                bound to false
+            } else {
+                currentSessionId()?.let { if (prefs.getBoolean("$it:pause_requested", false)) resume(it) }
+                newSession() to true
+            }
         }
-        acknowledgeTransferStart(id)
+        if (created) acknowledgeTransferStart(id)
         return id
     }
     fun catalogSession(): String {
@@ -474,10 +502,14 @@ internal class MigrationInstallQueue(private val context: Context,
             if (current == null) {
                 newSession() to true
             } else if (prefs.getBoolean("$current:selected", false)) {
-                val held = prefs.getBoolean("$current:pause_requested", false)
-                val next = newSession()
-                if (held) { resume(current); pause(next) }
-                next to true
+                if (current == activeUnclosedHandoffSession()) {
+                    current to false
+                } else {
+                    val held = prefs.getBoolean("$current:pause_requested", false)
+                    val next = newSession()
+                    if (held) { resume(current); pause(next) }
+                    next to true
+                }
             } else {
                 current to false
             }
@@ -1104,21 +1136,36 @@ internal class MigrationInstallQueue(private val context: Context,
         }
     }
 
+    /**
+     * Selects up to [MAX_STORE_PRIORITY] actionable priority packages for Aurora's 200-slot priority list.
+     * Reserves slots for already-dispatched/active apps before not-yet-dispatched pending hints so queued
+     * sign-in apps in Aurora are never pushed past slot 200 (and evaluated under Aurora's 6 GiB bulk floor),
+     * while preserving relative priority order among the selected packages.
+     */
+    private fun selectStorePriorityBatch(id: String, actionable: List<String>): List<String> {
+        if (actionable.size <= MAX_STORE_PRIORITY) return actionable
+        val dispatched = actionable.filter { !isPending(id, it) }.take(MAX_STORE_PRIORITY)
+        val room = (MAX_STORE_PRIORITY - dispatched.size).coerceAtLeast(0)
+        val pendingHints = if (room > 0) actionable.filter { isPending(id, it) }.take(room) else emptyList()
+        val keep = (dispatched + pendingHints).toSet()
+        return actionable.filter { it in keep }
+    }
+
     /** Forwards a session's actionable ordered priority list to Aurora when it advertises `prioritize_downloads`. */
     private fun syncStorePriority(id: String) {
-        val (ordered, actionable) = synchronized(LOCK) {
+        val (ordered, toSend, hasOverflow) = synchronized(LOCK) {
             if (!prefs.getBoolean("$id:priority_dirty", false)) return
             val all = priorityOrder(id)
-            all to all.filter { isPriorityActive(id, it) }
+            val actionable = all.filter { isPriorityActive(id, it) }
+            val batch = selectStorePriorityBatch(id, actionable)
+            Triple(all, batch, actionable.size > batch.size)
         }
-        if (actionable.isEmpty()) {
+        if (toSend.isEmpty()) {
             synchronized(LOCK) {
                 if (priorityOrder(id) == ordered) check(prefs.edit().putBoolean("$id:priority_dirty", false).commit())
             }
             return
         }
-        val toSend = actionable.take(MAX_STORE_PRIORITY)
-        val hasOverflow = actionable.size > toSend.size
         if (roundSyncedPriority[id] == toSend) return
         val capabilities = storeCapabilities()
         if (capabilities.getString("error") == "store_unavailable") return
@@ -1394,18 +1441,24 @@ internal class MigrationInstallQueue(private val context: Context,
         controlCall?.invoke(operation, options) ?: AuroraMigrationClient(context).use { it.control(operation, options) }
     } catch (_: Exception) { Bundle().apply { putBoolean("success", false); putBoolean("recoverable", true); putString("error", "store_unavailable") } }
     fun changed(id: String) { context.sendBroadcast(Intent(ACTION_CHANGED).setPackage(context.packageName).putExtra("session_id", id)) }
+    /** Tests: optional override for JobScheduler.schedule to test wake/schedule ordering and failure recovery. */
+    internal var jobSchedulerHook: ((JobScheduler, JobInfo) -> Int)? = null
+    private fun scheduleJob(scheduler: JobScheduler, info: JobInfo): Int =
+        jobSchedulerHook?.invoke(scheduler, info) ?: scheduler.schedule(info)
     private fun schedule() {
         val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
-        // Immediate active work supersedes any delayed deferred-copy wake.
-        scheduler.cancel(DEFER_WAKE_JOB)
         // Expedited (CYC-2499, 11-18 founders-02): at thermal status 2 Android held the default-priority job back for
         // minutes (Restricted due to: thermal) while the copy's apps waited; an expedited job still runs there.
-        check(scheduleInstallJob(JobInfo.Builder(JOB, ComponentName(context, MigrationInstallJob::class.java)).setPersisted(true)) { scheduler.schedule(it) })
+        check(scheduleInstallJob(JobInfo.Builder(JOB, ComponentName(context, MigrationInstallJob::class.java)).setPersisted(true)) {
+            scheduleJob(scheduler, it)
+        })
+        // Only cancel the fallback deferred wake AFTER the primary install job is durably scheduled.
+        scheduler.cancel(DEFER_WAKE_JOB)
     }
     internal fun scheduleImmediate() = schedule()
     /**
      * Soonest delay before [MigrationInstallJob] should wake during an idle deferred copy:
-     * ~10 min to renew Aurora's 15-min update hold while paused, capped at the remaining 3h fail-open window.
+     * ~10 min to renew Aurora's 15-min update hold while paused, capped at the remaining 12h fail-open window.
      */
     internal fun nextDeferredWakeDelayMs(nowMs: Long = clock()): Long? = synchronized(LOCK) {
         var soonest: Long? = null
@@ -1438,7 +1491,7 @@ internal class MigrationInstallQueue(private val context: Context,
             .setMinimumLatency(latency)
             .setOverrideDeadline(latency + DEFER_WAKE_FLEX_MS)
             .build()
-        check(scheduler.schedule(job) == JobScheduler.RESULT_SUCCESS)
+        check(scheduleJob(scheduler, job) == JobScheduler.RESULT_SUCCESS)
         latency
     }
     companion object {
@@ -1473,7 +1526,7 @@ internal class MigrationInstallQueue(private val context: Context,
         internal const val JOB = 700714
         internal const val DEFER_WAKE_JOB = 700715
         /** Fail-open wall-clock cap on bulk deferral so apps can never strand indefinitely (CYC-3422). */
-        internal const val MAX_DEFER_BULK_MS = 3L * 60L * 60_000L
+        internal const val MAX_DEFER_BULK_MS = 12L * 60L * 60_000L
         /** Renewal cadence for Aurora's 15-minute MigrationUpdateHold lease during an idle deferred copy. */
         internal const val DEFER_RENEW_INTERVAL_MS = 10L * 60_000L
         internal const val DEFER_WAKE_FLEX_MS = 2L * 60_000L
@@ -1564,12 +1617,20 @@ class MigrationInstallJob : JobService() {
         }
         if (!cancelled.get()) {
             val fromDeferredWake = jobId == MigrationInstallQueue.DEFER_WAKE_JOB
-            onFinished(retry && !fromDeferredWake)
-            if (!retry) {
-                runCatching { queue.syncDeferredWake() }
-            } else if (fromDeferredWake) {
-                runCatching { queue.scheduleImmediate() }
+            // Re-check ready work after the loop in case a deferral expired or released between summary() and exit.
+            val readyNow = retry || queue.dispatchOrder().isNotEmpty()
+            val reschedule = if (readyNow) {
+                if (fromDeferredWake) {
+                    // Hand back to the primary install job first; if scheduling fails, retry this wake with backoff.
+                    runCatching { queue.scheduleImmediate() }.isFailure
+                } else {
+                    true
+                }
+            } else {
+                // Secure the next delayed wake (or cancel when settled) BEFORE finishing; on failure, back off & retry.
+                runCatching { queue.syncDeferredWake() }.isFailure
             }
+            onFinished(reschedule)
         }
     }
     override fun onStopJob(params: JobParameters): Boolean { stopped.set(true); return true }
