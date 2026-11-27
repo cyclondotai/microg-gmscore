@@ -236,6 +236,28 @@ internal class MigrationInstallQueue(private val context: Context,
     private fun legacy() = !prefs.contains("sessions") && prefs.contains("packages")
     fun currentSessionId(): String? = prefs.getString("current_session", null)
     fun sessions(): List<String> = prefs.getString("sessions", "").orEmpty().split(',').filter { it.isNotEmpty() }
+    /** Whether [id] lists any app, chosen or left out. */
+    fun hasApps(id: String): Boolean = selected(id).isNotEmpty() || prefs.getStringSet("$id:excluded", null)?.isNotEmpty() == true
+    /**
+     * The transfer the results screen opens on: [requestedId] when it names a known transfer, else the current one when it
+     * lists apps, else the latest that does. An empty transfer (a hand-off cancelled before any app was chosen) never hides
+     * an earlier one with apps; with none, the current transfer.
+     */
+    fun resultsSession(requestedId: String? = null): String? {
+        val ids = sessions()
+        requestedId?.takeIf { it in ids }?.let { return it }
+        val current = currentSessionId()
+        if (current != null && hasApps(current)) return current
+        return ids.firstOrNull(::hasApps) ?: current
+    }
+    /** How many apps [id] lists, chosen or left out. */
+    fun appCount(id: String): Int {
+        val selected = selected(id)
+        return selected.size + prefs.getStringSet("$id:excluded", emptySet()).orEmpty().count { it !in selected }
+    }
+    /** Transfers worth offering in the results screen's picker, newest first: those with apps, and [requestedId]. */
+    fun visibleSessions(requestedId: String? = null): List<String> =
+        sessions().filter { it == requestedId || hasApps(it) }
     fun beginTransfer(): String {
         val id = synchronized(LOCK) { newSession() }
         acknowledgeTransferStart(id)
@@ -382,15 +404,12 @@ internal class MigrationInstallQueue(private val context: Context,
             if (offset + names.size < selected.size) putInt("next_offset", offset + names.size)
             putStringArrayList("packages", ArrayList(names))
             putStringArrayList("titles", ArrayList(names.map { name -> (snapshot["$id:$name:title"] as? String)?.take(80) ?: name }))
+            putStringArrayList("icon_urls", ArrayList(names.map { name -> (snapshot["$id:$name:icon_url"] as? String).orEmpty() }))
             putLongArray("install_sizes", LongArray(names.size) { i -> (snapshot["$id:${names[i]}:installSize"] as? Long)?.takeIf { it > 0L } ?: 0L })
             putBoolean("bulk_deferred", id != null && isBulkDeferred(snapshot, id))
             val pending = snapshot["$id:pending"] as? Set<*> ?: emptySet<String>()
-            val restoreEligible = id != null && id == snapshot["current_session"] &&
-                (snapshot["$id:option:restore_source"] as? String)?.toIntOrNull() in ANDROID_D2D_RESTORE_SOURCES &&
-                (appDataRestore != null || snapshot["$id:start_acknowledged"] == true)
-            val restorePending = if (restoreEligible) {
-                (snapshot["$id:app_data_restore_pending"] as? Set<*>)?.filterIsInstance<String>().orEmpty().toSet()
-            } else emptySet()
+            val restoreEligible = id != null && isRestoreEligible(snapshot, id)
+            val restorePending = if (id != null) pendingRestoreSet(snapshot, id, restoreEligible) else emptySet()
             val statuses = ArrayList<String>(names.size)
             val errors = ArrayList<String>(names.size)
             val excludedFlags = BooleanArray(names.size)
@@ -412,16 +431,14 @@ internal class MigrationInstallQueue(private val context: Context,
                     !inSelection && rawStatus.isEmpty() -> "unavailable"
                     else -> rawStatus
                 }
-                // Hold Setup sign-in launch on Android-to-Android copies until post-install app-data restore settles,
-                // covering both pending restores already queued by summary() and newly installed APKs before summary()
-                // has run, so BackupManagerService.restorePackages(pkg) cannot force-stop and wipe a newly signed-in app.
-                val awaitingSummaryRestore = restoreEligible &&
-                    baseStatus !in TERMINAL &&
-                    snapshot["$id:$name:app_data_restore_done"] != true &&
-                    snapshot["$id:$name:preexisting"] != true &&
-                    (snapshot["$id:$name:install_dispatched"] == true || snapshot["$id:$name:observed_not_installed"] == true) &&
-                    isInstalledAtExpectedVersion(snapshot, id!!, name)
-                val status = if ((baseStatus == "installed" && name in restorePending) || awaitingSummaryRestore) {
+                val status = if (id != null && isAppRestoringData(
+                        snapshot, id, name,
+                        installed = baseStatus == "installed",
+                        baseStatus = baseStatus,
+                        restoreEligible = restoreEligible,
+                        restorePending = restorePending,
+                    )
+                ) {
                     "restoring_data"
                 } else {
                     baseStatus
@@ -435,6 +452,41 @@ internal class MigrationInstallQueue(private val context: Context,
             putBooleanArray("excluded", excludedFlags)
             putBooleanArray("recoverable", recoverableFlags)
         }
+    }
+
+    private fun isRestoreEligible(snapshot: Map<String, *>, id: String): Boolean =
+        id == snapshot["current_session"] &&
+            (snapshot["$id:option:restore_source"] as? String)?.toIntOrNull() in ANDROID_D2D_RESTORE_SOURCES &&
+            (appDataRestore != null || snapshot["$id:start_acknowledged"] == true)
+
+    private fun pendingRestoreSet(snapshot: Map<String, *>, id: String, restoreEligible: Boolean): Set<String> =
+        if (restoreEligible) {
+            (snapshot["$id:app_data_restore_pending"] as? Set<*>)?.filterIsInstance<String>().orEmpty().toSet()
+        } else {
+            emptySet()
+        }
+
+    /**
+     * Hold Setup sign-in and Transferred-apps Open on Android-to-Android copies until post-install app-data restore
+     * settles, covering both pending restores already queued by summary() and newly installed APKs before summary()
+     * has run, so BackupManagerService.restorePackages(pkg) cannot force-stop and wipe newly created app data.
+     */
+    private fun isAppRestoringData(
+        snapshot: Map<String, *>,
+        id: String,
+        name: String,
+        installed: Boolean,
+        baseStatus: String?,
+        restoreEligible: Boolean,
+        restorePending: Set<String>,
+    ): Boolean {
+        if (!restoreEligible) return false
+        if (installed && name in restorePending) return true
+        return baseStatus !in TERMINAL &&
+            snapshot["$id:$name:app_data_restore_done"] != true &&
+            snapshot["$id:$name:preexisting"] != true &&
+            (snapshot["$id:$name:install_dispatched"] == true || snapshot["$id:$name:observed_not_installed"] == true) &&
+            isInstalledAtExpectedVersion(snapshot, id, name)
     }
 
     private fun isInstalledAtExpectedVersion(snapshot: Map<String, *>, id: String, name: String): Boolean {
@@ -489,15 +541,21 @@ internal class MigrationInstallQueue(private val context: Context,
         if (prefs.getString("$id:transfer_outcome", null) != null) return null
         return id
     }
+    /**
+     * Switch's Pause (op 13) when its copy starts. A hand-off session Transfer Phone just began (beginHandoff) and nothing
+     * has been chosen or checked in yet is this copy's session: it is reused rather than replaced, which used to strand it
+     * as an empty transfer in the results screen's list (CYC-3525).
+     */
     fun startPausedTransfer(): String {
         val (id, created) = synchronized(LOCK) {
             val bound = activeUnclosedHandoffSession()
-            if (bound != null && prefs.getBoolean("$bound:selected", false)) {
+            val selected = bound != null && prefs.getBoolean("$bound:selected", false)
+            if (bound != null && (selected || untouched(bound))) {
                 val now = clock()
                 if (isBulkDeferred(bound, now)) {
                     check(prefs.edit().putLong("$bound:defer_bulk_at", now).commit())
                 }
-                bound to false
+                bound to (!selected && !prefs.getBoolean("$bound:start_acknowledged", false))
             } else {
                 currentSessionId()?.let { if (prefs.getBoolean("$it:pause_requested", false)) resume(it) }
                 newSession() to true
@@ -506,6 +564,9 @@ internal class MigrationInstallQueue(private val context: Context,
         if (created) acknowledgeTransferStart(id)
         return id
     }
+    /** No app chosen, left out or checked in [id] yet. */
+    private fun untouched(id: String): Boolean = !prefs.getBoolean("$id:selected", false) && selected(id).isEmpty() &&
+        prefs.getStringSet("$id:excluded", emptySet()).isNullOrEmpty()
     fun catalogSession(): String {
         val (id, created) = synchronized(LOCK) {
             val current = currentSessionId()
@@ -585,6 +646,7 @@ internal class MigrationInstallQueue(private val context: Context,
             edit.putBoolean("$id:$pkg:recoverable", doc.getInt("availability") != 1 && doc.getBoolean("recoverable"))
         }
         check(edit.commit())
+        bumpState()
     }
     private fun metadata(edit: android.content.SharedPreferences.Editor, id: String, doc: Bundle) {
         val name = requireNotNull(doc.getString("package_name"))
@@ -624,14 +686,14 @@ internal class MigrationInstallQueue(private val context: Context,
             roundSyncedPriority.remove(id)
         }
         for (doc in documents) metadata(edit, id, doc)
-        check(edit.commit()); changed(id); schedule()
+        check(edit.commit()); bumpState(); changed(id); schedule()
     }
     fun finishSelection(id: String) = synchronized(LOCK) {
         require(id in sessions())
         if (!prefs.getBoolean("$id:selection_closed", false)) {
             check(prefs.edit().putBoolean("$id:selected", true).putBoolean("$id:selection_closed", true)
                 .putBoolean("$id:defer_bulk", false).putBoolean("$id:bulk_released", true).commit())
-            changed(id); schedule()
+            bumpState(); changed(id); schedule()
         }
     }
     /** A trusted companion's wizard return closes input; it does not certify any app installation. */
@@ -651,7 +713,7 @@ internal class MigrationInstallQueue(private val context: Context,
         if (!prefs.contains("$id:transfer_outcome")) edit.putString("$id:transfer_outcome", outcome)
         if (recordHandoff) edit.putString("handoff_outcome", outcome)
         check(edit.commit())
-        changed(id); schedule()
+        bumpState(); changed(id); schedule()
         Bundle().apply {
             putBoolean("accepted", true); putString("session_id", id); putBoolean("selection_closed", true)
             putBoolean("already_closed", alreadyClosed)
@@ -704,6 +766,7 @@ internal class MigrationInstallQueue(private val context: Context,
                         .putBoolean("$id:$name:app_data_restore_done", true)
                         .commit(),
                 )
+                bumpState()
                 cleared = name in current
             } else {
                 val terminal = result.status in APP_DATA_RESTORE_TERMINAL
@@ -715,6 +778,7 @@ internal class MigrationInstallQueue(private val context: Context,
                     cleared = name in current
                 }
                 check(edit.commit())
+                if (cleared) bumpState()
             }
         }
         if (cleared) changed(id)
@@ -832,7 +896,8 @@ internal class MigrationInstallQueue(private val context: Context,
             check(edit.commit())
             // Only a change makes a status asked before it stale: a poll saving the same receipt again must not make
             // another summary drop the newer answer it just read (round 3: a failure lost at a transfer boundary).
-            if (row(id, name) != before) bump(id, name)
+            if (row(id, name) != before) { bump(id, name); bumpState() }
+            else if (triggerRestore) bumpState()
         }
         if (triggerRestore) {
             val restoreKey = key(id, name)
@@ -964,6 +1029,7 @@ internal class MigrationInstallQueue(private val context: Context,
             .putBoolean("$id:$name:all_accounts", false).remove("$id:$name:ownerVersion")
             .putInt("$id:$name:throttle_count", 0)
         check(edit.commit())
+        bumpState()
     }
     fun needsEnqueue(name: String, state: Bundle, id: String = session()): Boolean {
         if (prefs.getBoolean("$id:$name:ever_installed", false)) return false
@@ -1022,6 +1088,79 @@ internal class MigrationInstallQueue(private val context: Context,
         !prefs.getBoolean("$id:$name:install_dispatched", false) &&
         !prefs.getBoolean("$id:$name:acknowledged", false) &&
         !prefs.getBoolean("$id:$name:ever_installed", false)
+    /**
+     * [summary]'s receipt as last saved, read from one preferences snapshot: no Aurora call, no wait for [LOCK]. The results
+     * screen draws this at once and on every change while [summary] checks the open apps with Aurora in the background.
+     * An app waiting to be handed to Aurora (an owner Retry included) reads as pending, not as its previous attempt.
+     */
+    fun cachedSummary(id: String): Bundle {
+        // Sample stateVersion BEFORE reading prefs.all so a snapshot read before a concurrent commit can never claim
+        // a higher publication version than a post-commit read or live summary().
+        val stateVersion = STATE_VERSION.get()
+        val snapshot = prefs.all
+        fun set(key: String) = (snapshot[key] as? Set<*>)?.filterIsInstance<String>().orEmpty().toSet()
+        fun string(key: String) = snapshot[key] as? String
+        fun flag(key: String) = snapshot[key] == true
+        val selected = set("$id:packages")
+        val pendingSet = set("$id:pending")
+        val bulkDeferred = isBulkDeferred(snapshot, id)
+        val prioritySet = if (bulkDeferred) {
+            string("$id:priority_order")?.split(',')?.filter { it.isNotEmpty() }?.toSet() ?: set("$id:priority")
+        } else emptySet()
+        val restoreEligible = isRestoreEligible(snapshot, id)
+        val restorePending = pendingRestoreSet(snapshot, id, restoreEligible)
+        fun row(name: String, excluded: Boolean) = Bundle().apply {
+            putString("package_name", name)
+            for (key in listOf("title", "icon_url", "developer_name", "error", "errorCode")) putString(key, string("$id:$name:$key"))
+            putLong("version_code", snapshot["$id:$name:expectedVersion"] as? Long ?: 0L)
+            putLong("installed_version_code", snapshot["$id:$name:installedVersion"] as? Long ?: 0L)
+            putLong("install_size", snapshot["$id:$name:installSize"] as? Long ?: 0L)
+            val installed = flag("$id:$name:installed")
+            val pending = name in pendingSet
+            val rawStatus = string("$id:$name:status")
+            val status = when {
+                pending -> "pending"
+                rawStatus == "none" && installed -> "installed"
+                excluded && rawStatus.isNullOrEmpty() -> "unavailable"
+                else -> rawStatus
+            }
+            val effectiveInstalled = installed && !pending
+            val restoringData = !excluded && !pending && isAppRestoringData(
+                snapshot, id, name,
+                installed = effectiveInstalled,
+                baseStatus = status,
+                restoreEligible = restoreEligible,
+                restorePending = restorePending,
+            )
+            putString("status", status)
+            if (pending) { remove("error"); remove("errorCode") }
+            putBoolean("installed", effectiveInstalled)
+            if (restoringData) putBoolean("restoring_data", true)
+            putBoolean("terminal", excluded || (!pending && (installed || flag("$id:$name:terminal"))))
+            putBoolean("excluded", excluded)
+            putBoolean("recoverable", excluded && flag("$id:$name:recoverable"))
+        }
+        val results = selected.sorted().map { row(it, excluded = false) } +
+            set("$id:excluded").filter { it !in selected }.sorted().map { row(it, excluded = true) }
+        val activePending = if (bulkDeferred) pendingSet.any { it in prioritySet } else pendingSet.isNotEmpty()
+        val hasActiveWork = activePending || results.any { row ->
+            val pkg = row.getString("package_name").orEmpty()
+            !row.getBoolean("terminal") && !(bulkDeferred && pkg in pendingSet && pkg !in prioritySet)
+        }
+        return Bundle().apply {
+            putString("session_id", id); putParcelableArray("cyclon_app_results", results.toTypedArray())
+            putLong("state_version", stateVersion)
+            putString("transfer_outcome", string("$id:transfer_outcome"))
+            putBoolean("all_installed", results.all { it.getBoolean("installed") })
+            putBoolean("selection_closed", flag("$id:selection_closed"))
+            putBoolean("installs_settled", pendingSet.isEmpty() && results.all { it.getBoolean("terminal") })
+            putBoolean("bulk_deferred", bulkDeferred)
+            putBoolean("has_active_work", hasActiveWork)
+            putBoolean("complete", getBoolean("selection_closed") && getBoolean("installs_settled"))
+            putBundle("setup_options", options(id))
+            putString("cyclon_hold_state", if (getBoolean("complete")) "complete" else "installing")
+        }
+    }
     /**
      * Every app's state, asked of Aurora before taking [LOCK] (one call per open app): Switch's next chunk and its status
      * calls never wait for these round trips, only for the bookkeeping after them.
@@ -1135,6 +1274,20 @@ internal class MigrationInstallQueue(private val context: Context,
             document(id, name).apply { putBoolean("terminal", true); putBoolean("excluded", true) }
         }
         val pendingSet = pending(id)
+        val postSnapshot = prefs.all
+        val restoreEligible = isRestoreEligible(postSnapshot, id)
+        val restorePending = pendingRestoreSet(postSnapshot, id, restoreEligible)
+        for (row in results) {
+            val pkg = row.getString("package_name").orEmpty()
+            val restoringData = !row.getBoolean("excluded") && pkg !in pendingSet && isAppRestoringData(
+                postSnapshot, id, pkg,
+                installed = row.getBoolean("installed"),
+                baseStatus = row.getString("status"),
+                restoreEligible = restoreEligible,
+                restorePending = restorePending,
+            )
+            if (restoringData) row.putBoolean("restoring_data", true)
+        }
         val activePending = if (bulkDeferred) pendingSet.any { it in prioritySet } else pendingSet.isNotEmpty()
         val hasActiveWork = activePending || results.any { row ->
             val pkg = row.getString("package_name").orEmpty()
@@ -1142,6 +1295,7 @@ internal class MigrationInstallQueue(private val context: Context,
         }
         return Bundle().apply {
             putString("session_id", id); putParcelableArray("cyclon_app_results", results.toTypedArray())
+            putLong("state_version", STATE_VERSION.get())
             putString("transfer_outcome", prefs.getString("$id:transfer_outcome", null))
             putBoolean("all_installed", results.all { it.getBoolean("installed") })
             putBoolean("selection_closed", prefs.getBoolean("$id:selection_closed", false))
@@ -1467,7 +1621,10 @@ internal class MigrationInstallQueue(private val context: Context,
     fun control(operation: Int, options: Bundle = options(session())): Bundle = try {
         controlCall?.invoke(operation, options) ?: AuroraMigrationClient(context).use { it.control(operation, options) }
     } catch (_: Exception) { Bundle().apply { putBoolean("success", false); putBoolean("recoverable", true); putString("error", "store_unavailable") } }
-    fun changed(id: String) { context.sendBroadcast(Intent(ACTION_CHANGED).setPackage(context.packageName).putExtra("session_id", id)) }
+    fun changed(id: String) {
+        bumpState()
+        context.sendBroadcast(Intent(ACTION_CHANGED).setPackage(context.packageName).putExtra("session_id", id))
+    }
     /** Tests: optional override for JobScheduler.schedule to test wake/schedule ordering and failure recovery. */
     internal var jobSchedulerHook: ((JobScheduler, JobInfo) -> Int)? = null
     private fun scheduleJob(scheduler: JobScheduler, info: JobInfo): Int =
@@ -1547,8 +1704,11 @@ internal class MigrationInstallQueue(private val context: Context,
             runCatching { Settings.Global.getInt(context.contentResolver, Settings.Global.BOOT_COUNT, 0) }.getOrDefault(0)
         /** Per app, how often its records changed in this process: a status asked of Aurora before a change is stale. */
         private val REVISIONS = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        /** Process-wide monotonic counter bumped after committed queue mutations for receipt publication ordering. */
+        private val STATE_VERSION = java.util.concurrent.atomic.AtomicLong(0L)
         private fun key(id: String, name: String) = "$id:$name"
         private fun revision(id: String, name: String) = REVISIONS[key(id, name)] ?: 0L
+        private fun bumpState() { STATE_VERSION.incrementAndGet() }
         private fun bump(id: String, name: String) { REVISIONS.merge(key(id, name), 1L, Long::plus) }
         internal const val JOB = 700714
         internal const val DEFER_WAKE_JOB = 700715

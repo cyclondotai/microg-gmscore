@@ -380,6 +380,13 @@ class MigrationAppDataRestoreTest {
             applicationInfo = ApplicationInfo().apply { packageName = app }
         })
         assertEquals(listOf("restoring_data"), queue.handoff(run).getStringArrayList("statuses"))
+        fun appRow(receipt: Bundle) = receipt.getParcelableArray("cyclon_app_results")!!
+            .map { it as Bundle }.single { it.getString("package_name") == app }
+        // Cached results must hold the row out of Installed (no Open) while app-data restore has not run yet.
+        val preSummaryCachedRow = appRow(queue.cachedSummary(sessionId))
+        assertTrue(preSummaryCachedRow.getBoolean("restoring_data"))
+        assertEquals(MigrationResultGroups.Section.INSTALLING, MigrationResultGroups.section(preSummaryCachedRow, emptySet()))
+        assertEquals("Restoring app data", MigrationResultText.description(preSummaryCachedRow))
 
         installed = true
         val summary = queue.summary(sessionId, reschedule = false)
@@ -387,14 +394,27 @@ class MigrationAppDataRestoreTest {
         val restoring = queue.handoff(run)
         assertEquals(listOf(app), restoring.getStringArrayList("packages"))
         assertEquals(listOf("restoring_data"), restoring.getStringArrayList("statuses"))
+        for (receipt in listOf(summary, queue.cachedSummary(sessionId))) {
+            val row = appRow(receipt)
+            assertTrue(row.getBoolean("restoring_data"))
+            assertEquals(MigrationResultGroups.Section.INSTALLING, MigrationResultGroups.section(row, emptySet()))
+            assertTrue(MigrationResultGroups.active(row))
+            assertEquals("Restoring app data", MigrationResultText.description(row))
+        }
 
-        // Once Switch releases the backup transport lease and restore finishes, handoff flips to installed.
+        // Once Switch releases the backup transport lease and restore finishes, handoff and results flip to installed.
         replyStatus = "restored"
         assertTrue(queue.processPendingAppDataRestores())
         val settled = queue.handoff(run)
         assertEquals(listOf("installed"), settled.getStringArrayList("statuses"))
+        for (receipt in listOf(queue.summary(sessionId, reschedule = false), queue.cachedSummary(sessionId))) {
+            val row = appRow(receipt)
+            assertFalse(row.getBoolean("restoring_data"))
+            assertEquals(MigrationResultGroups.Section.INSTALLED, MigrationResultGroups.section(row, emptySet()))
+            assertEquals("Installed and verified", MigrationResultText.description(row))
+        }
 
-        // A superseded transfer's handoff must never remain stuck in restoring_data.
+        // A superseded transfer's handoff and results must never remain stuck in restoring_data.
         val run2 = "00000000-0000-0000-0000-00000000000a"
         replyStatus = "busy"
         installed = false
@@ -404,10 +424,14 @@ class MigrationAppDataRestoreTest {
         queue.select(listOf(Bundle().apply { putString("package_name", app); putLong("version_code", 12) }))
         queue.dispatch(app, s2)
         installed = true
-        queue.summary(s2, reschedule = false)
+        val s2Summary = queue.summary(s2, reschedule = false)
         assertEquals(listOf("restoring_data"), queue.handoff(run2).getStringArrayList("statuses"))
+        assertTrue(appRow(s2Summary).getBoolean("restoring_data"))
+        assertTrue(appRow(queue.cachedSummary(s2)).getBoolean("restoring_data"))
         queue.beginTransfer()
         assertEquals(listOf("installed"), queue.handoff(run2).getStringArrayList("statuses"))
+        assertFalse(appRow(queue.cachedSummary(s2)).getBoolean("restoring_data"))
+        assertFalse(appRow(queue.summary(s2, reschedule = false)).getBoolean("restoring_data"))
     }
 
     @Test fun concurrentRestoreCannotRunDuplicateAfterSettlementCommits() {
