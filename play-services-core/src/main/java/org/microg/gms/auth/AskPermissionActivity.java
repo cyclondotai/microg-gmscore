@@ -87,7 +87,7 @@ public class AskPermissionActivity extends AccountAuthenticatorActivity {
                 service = intent.getStringExtra(KEY_AUTHTOKEN);
                 callerUid = intent.getIntExtra(KEY_CALLER_UID, 0);
                 callerPid = intent.getIntExtra(KEY_CALLER_PID, 0);
-                fromAccountManager = intent.hasExtra(EXTRA_FROM_ACCOUNT_MANAGER);
+                fromAccountManager = intent.getBooleanExtra(EXTRA_FROM_ACCOUNT_MANAGER, false);
                 if (intent.hasExtra(EXTRA_CONSENT_DATA)) {
                     try {
                         consentData = ConsentData.ADAPTER.decode(intent.getByteArrayExtra(EXTRA_CONSENT_DATA));

@@ -7,7 +7,9 @@
 package org.microg.vending.ui;
 
 import android.app.Activity;
+import android.content.ComponentName;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.util.Log;
 import android.widget.Toast;
@@ -20,6 +22,26 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (isWorkAppStoreEnabled()) {
+            openWorkAppStore();
+        } else {
+            openMicrogSettings();
+        }
+
+        finish();
+    }
+
+    private boolean isWorkAppStoreEnabled() {
+        ComponentName workAppStore = new ComponentName(this, WorkAppsActivity.class);
+        int state = getPackageManager().getComponentEnabledSetting(workAppStore);
+        return state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED;
+    }
+
+    private void openWorkAppStore() {
+        startActivity(new Intent(this, WorkAppsActivity.class));
+    }
+
+    private void openMicrogSettings() {
         try {
             Intent intent = new Intent(Intent.ACTION_MAIN);
             intent.setPackage(GMS_PACKAGE_NAME);
@@ -35,6 +57,5 @@ public class MainActivity extends Activity {
             Log.w(TAG, "Failed launching microG Settings", e);
             Toast.makeText(this, R.string.cyclon_companion_missing, Toast.LENGTH_LONG).show();
         }
-        finish();
     }
 }
