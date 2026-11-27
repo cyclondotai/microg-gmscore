@@ -1174,7 +1174,7 @@ internal class MigrationInstallQueue(private val context: Context,
     fun bridge(operation: Int, name: String, options: Bundle? = null): Bundle = try {
         storeCall?.let { sentOptions?.invoke(operation, options); it(operation, name) }
             ?: AuroraMigrationClient(context).use { it.call(operation, name, options) }
-    } catch (_: Exception) { unavailable(name, "store_unavailable") }
+    } catch (_: Exception) { unavailable(name, "store_unavailable").apply { putBoolean("recoverable", true) } }
     fun control(operation: Int, options: Bundle = options(session())): Bundle = try {
         controlCall?.invoke(operation, options) ?: AuroraMigrationClient(context).use { it.control(operation, options) }
     } catch (_: Exception) { Bundle().apply { putBoolean("success", false); putBoolean("recoverable", true); putString("error", "store_unavailable") } }
