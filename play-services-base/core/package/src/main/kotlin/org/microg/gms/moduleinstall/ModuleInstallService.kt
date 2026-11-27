@@ -5,6 +5,7 @@
 
 package org.microg.gms.moduleinstall
 
+import android.os.Binder
 import android.os.Bundle
 import android.util.Log
 import com.google.android.gms.common.Feature
@@ -24,6 +25,7 @@ import com.google.android.gms.common.moduleinstall.internal.IModuleInstallServic
 import com.google.android.gms.common.moduleinstall.internal.IModuleInstallStatusListener
 import org.microg.gms.BaseService
 import org.microg.gms.common.GmsService
+import org.microg.gms.cyclon.UnsupportedApiRecorder
 
 private const val TAG = "ModuleInstall"
 
@@ -39,16 +41,19 @@ class ModuleInstallService : BaseService(TAG, GmsService.MODULE_INSTALL) {
 class ModuleInstallServiceImpl : IModuleInstallService.Stub() {
     override fun areModulesAvailable(callbacks: IModuleInstallCallbacks?, request: ApiFeatureRequest?) {
         Log.d(TAG, "Not yet implemented: areModulesAvailable $request")
+        UnsupportedApiRecorder.recordModuleInstallProbe(request?.callingPackage, request?.features, Binder.getCallingUid())
         runCatching { callbacks?.onModuleAvailabilityResponse(Status.SUCCESS, ModuleAvailabilityResponse(true, STATUS_ALREADY_AVAILABLE)) }
     }
 
     override fun installModules(callbacks: IModuleInstallCallbacks?, request: ApiFeatureRequest?, listener: IModuleInstallStatusListener?) {
         Log.d(TAG, "Not yet implemented: installModules $request")
+        UnsupportedApiRecorder.recordModuleInstallProbe(request?.callingPackage, request?.features, Binder.getCallingUid())
         runCatching { callbacks?.onModuleInstallResponse(Status.SUCCESS, ModuleInstallResponse(0, true)) }
     }
 
     override fun getInstallModulesIntent(callbacks: IModuleInstallCallbacks?, request: ApiFeatureRequest?) {
         Log.d(TAG, "Not yet implemented: getInstallModulesIntent $request")
+        UnsupportedApiRecorder.recordModuleInstallProbe(request?.callingPackage, request?.features, Binder.getCallingUid())
         runCatching { callbacks?.onModuleInstallIntentResponse(Status.CANCELED, ModuleInstallIntentResponse(null)) }
     }
 

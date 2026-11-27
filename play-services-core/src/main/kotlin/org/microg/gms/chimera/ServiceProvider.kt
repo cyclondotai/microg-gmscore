@@ -12,12 +12,14 @@ import android.content.Intent
 import android.database.Cursor
 import android.database.MatrixCursor
 import android.net.Uri
+import android.os.Binder
 import android.os.Bundle
 import android.util.Log
 import androidx.core.os.bundleOf
 import org.microg.gms.DummyService
 import org.microg.gms.common.GmsService
 import org.microg.gms.common.RemoteListenerProxy
+import org.microg.gms.cyclon.UnsupportedApiRecorder
 
 class ServiceProvider : ContentProvider() {
 
@@ -42,6 +44,7 @@ class ServiceProvider : ContentProvider() {
                 if (resolveInfo != null) {
                     intent.setClassName(resolveInfo.serviceInfo.packageName, resolveInfo.serviceInfo.name)
                 } else {
+                    UnsupportedApiRecorder.recordUnresolvedAction(serviceAction, Binder.getCallingUid())
                     intent.setClass(context, DummyService::class.java)
                 }
                 Log.d(TAG, "$method: $serviceAction -> $intent")
