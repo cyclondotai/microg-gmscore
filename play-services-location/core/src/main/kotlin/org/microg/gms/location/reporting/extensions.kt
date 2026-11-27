@@ -201,6 +201,17 @@ internal fun getLocalReportingConditions(context: Context): LocalReportingCondit
     )
 }
 
+private fun isHiddenCyclonDeviceAccount(context: Context, account: Account): Boolean {
+    if (account.type != AuthConstants.DEFAULT_ACCOUNT_TYPE) return false
+    val shown = runCatching {
+        Class.forName("android.os.SystemProperties").getMethod("get", String::class.java, String::class.java)
+            .invoke(null, "debug.cyclon.show_device_account", "") as String == "1"
+    }.getOrDefault(false)
+    if (shown) return false
+    if (account.name.trim().lowercase() == "cyclondevice@gmail.com") return true
+    return runCatching { AccountManager.get(context).getUserData(account, "cyclon_device_account") == "1" }.getOrDefault(false)
+}
+
 internal fun isGoogleAccountOnDevice(context: Context, account: Account?): Boolean {
     if (account?.type != AuthConstants.DEFAULT_ACCOUNT_TYPE) return false
     return runCatching { context.googleAccounts.contains(account) }.getOrDefault(false)
@@ -208,6 +219,8 @@ internal fun isGoogleAccountOnDevice(context: Context, account: Account?): Boole
 
 internal val Context.googleAccounts: Array<Account>
     get() = AccountManager.get(this).getAccountsByType(AuthConstants.DEFAULT_ACCOUNT_TYPE)
+        .filterNot { isHiddenCyclonDeviceAccount(this, it) }
+        .toTypedArray()
 
 internal val Context.reportingPreferences: SharedPreferences
     get() = getSharedPreferences(DEVICE_STATE_PREFERENCES, Context.MODE_PRIVATE)

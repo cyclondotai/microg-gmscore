@@ -54,8 +54,8 @@ class AuthServiceImpl(private val context: Context, override val lifecycle: Life
         Log.d(TAG, "getSpatulaHeader($packageName)")
         lifecycleScope.launchWhenStarted {
             val result = withContext(Dispatchers.IO) { AppCertManager(context).getSpatulaHeader(packageName) }
-            Log.d(TAG, "Result: $result")
-            runCatching { callbacks.onSpatulaHeader(result) }
+            Log.d(TAG, "Result present: ${result != null}")
+            runCatching { callbacks.onSpatulaHeader(result) }.onFailure { Log.w(TAG, "Failed to deliver spatula header", it) }
         }
     }
 

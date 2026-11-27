@@ -23,12 +23,15 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.microg.gms.auth.AskPermissionActivity
 import org.microg.gms.auth.AuthConstants
 import org.microg.gms.auth.blockstore.BlobstoreServiceImpl
 import org.microg.gms.auth.blockstore.BlockStoreImpl
+import org.microg.gms.location.reporting.fetchEffectiveAccountLocationSettings
+import org.microg.gms.location.reporting.fetchEffectiveTimelineEnabled
 import org.microg.gms.people.PeopleServiceImpl
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
@@ -120,8 +123,9 @@ class UpstreamCatchupRegressionTest {
         val appCtx = object : ContextWrapper(context) {
             override fun getCacheDir(): File = appCache
         }
-        val loaderClass = Class.forName("org.microg.gms.maps.mapbox.utils.MultiArchLoader")
-        val loader = loaderClass.getConstructor(Context::class.java, Context::class.java).newInstance(mapCtx, appCtx)
+        val loaderClass = runCatching { Class.forName("org.microg.gms.maps.mapbox.utils.MultiArchLoader") }.getOrNull()
+        Assume.assumeNotNull("Mapbox flavor required for MultiArchLoader test", loaderClass)
+        val loader = loaderClass!!.getConstructor(Context::class.java, Context::class.java).newInstance(mapCtx, appCtx)
         val target = File(appCache, ".gmscore/lib/arm64-v8a/${java.lang.Long.toHexString(crc)}-${payload.size}/libmapbox-gl.so")
 
         try {
@@ -134,17 +138,48 @@ class UpstreamCatchupRegressionTest {
             assertFalse("Extracted .so must be read-only for Android 17 (SDK 37+)", target.canWrite())
 
             // Simulate a writable copy extracted by an older build before #3883.
+            // Lock the parent directory so attempt 2 cannot re-extract: this proves loadExtracted()'s target.setReadOnly()
+            // flipped the pre-existing file rather than re-extracting a fresh copy.
             assertTrue(target.setWritable(true))
             assertTrue(target.canWrite())
+            assertTrue(target.parentFile!!.setWritable(false))
             val loadExtractedMethod = loaderClass.getDeclaredMethod("loadExtracted", String::class.java)
                 .apply { isAccessible = true }
             // System.load will fail on non-ELF payload, but loadExtracted must still flip the existing file read-only first.
             loadExtractedMethod.invoke(loader, "lib/arm64-v8a/libmapbox-gl.so")
             assertFalse("Pre-existing cached .so must be made read-only before System.load", target.canWrite())
         } finally {
+            target.parentFile?.setWritable(true)
             apkFile.delete()
             appCache.deleteRecursively()
         }
+    }
+
+    @Test
+    fun locationReportingHidesCyclonDeviceAccount() {
+        val am = AccountManager.get(context)
+        val owner = Account("owner@example.com", AuthConstants.DEFAULT_ACCOUNT_TYPE)
+        val device = Account("cyclondevice@gmail.com", AuthConstants.DEFAULT_ACCOUNT_TYPE)
+        val missing = Account("missing@example.com", AuthConstants.DEFAULT_ACCOUNT_TYPE)
+        shadowOf(am).addAccount(owner)
+        shadowOf(am).addAccount(device)
+        am.setUserData(device, DeviceAccount.MARKER, "1")
+
+        val missingSettings = fetchEffectiveAccountLocationSettings(
+            context, missing, allowRemoteAccountSettings = true, refreshRemoteAccountSettings = false
+        )
+        val deviceSettings = fetchEffectiveAccountLocationSettings(
+            context, device, allowRemoteAccountSettings = true, refreshRemoteAccountSettings = false
+        )
+        assertEquals(missingSettings.expectedOptInResult(), deviceSettings.expectedOptInResult())
+        assertFalse(deviceSettings.timelineEnabled)
+        assertFalse(deviceSettings.allowed)
+        assertFalse(fetchEffectiveTimelineEnabled(context, device, allowRemoteAccountSettings = true))
+
+        val ownerSettings = fetchEffectiveAccountLocationSettings(
+            context, owner, allowRemoteAccountSettings = false, refreshRemoteAccountSettings = false
+        )
+        assertTrue(ownerSettings.expectedOptInResult() != missingSettings.expectedOptInResult())
     }
 
     @Test

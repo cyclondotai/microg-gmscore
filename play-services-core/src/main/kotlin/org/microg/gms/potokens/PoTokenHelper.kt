@@ -315,7 +315,7 @@ class PoTokenHelper(val context: Context) {
             "buildPoToken -> token data is missing or empty"
         }
         val keySet = KeySet.ADAPTER.decode(Base64.decode(keySetStr, Base64.DEFAULT))
-        Log.d(TAG, "buildPoToken: keySetStr: $keySetStr tokenDesc: $tokenDesc tokenBackup: $tokenBackup")
+        Log.d(TAG, "buildPoToken: keySetLen=${keySetStr.length} tokenDescLen=${tokenDesc.length} tokenBackupLen=${tokenBackup.length}")
 
         val poTokenInfoData: ByteArray = PoTokenInfo(
             inputData = inputData.toByteString(),

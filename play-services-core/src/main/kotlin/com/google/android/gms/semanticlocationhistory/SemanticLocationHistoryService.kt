@@ -41,6 +41,7 @@ import org.microg.gms.BaseService
 import org.microg.gms.common.GmsService
 import org.microg.gms.common.GooglePackagePermission
 import org.microg.gms.common.PackageUtils
+import org.microg.gms.cyclon.DeviceAccount
 import org.microg.gms.location.reporting.fetchEffectiveAccountLocationSettings
 import org.microg.gms.location.reporting.fetchEffectiveTimelineEnabled
 import org.microg.gms.location.reporting.isTimelineEnabledOnDevice
@@ -91,6 +92,10 @@ class SemanticLocationHistoryServiceImpl(
     private val storageManager by lazy { OdlhStorageManager.getInstance(context) }
 
     private fun withTimelineAccess(account: Account?, onDenied: () -> Unit, action: suspend () -> Unit) {
+        if (!DeviceAccount.mayShow(context, account)) {
+            runCatching { onDenied() }.onFailure { Log.w(TAG, "Callback delivery failed", it) }
+            return
+        }
         val canAccessRemoteSettings = PackageUtils.callerHasGooglePackagePermission(
             context,
             GooglePackagePermission.REPORTING
@@ -352,7 +357,10 @@ class SemanticLocationHistoryServiceImpl(
             GooglePackagePermission.REPORTING
         )
         lifecycleScope.launch(Dispatchers.IO) {
-            val timelineEnabled = if (isTimelineEnabledOnDevice(context)) {
+            val allowedAccount = DeviceAccount.mayShow(context, account)
+            val timelineEnabled = if (!allowedAccount) {
+                false
+            } else if (isTimelineEnabledOnDevice(context)) {
                 fetchEffectiveTimelineEnabled(context, account, canAccessSettings)
             } else {
                 fetchEffectiveAccountLocationSettings(
@@ -362,7 +370,7 @@ class SemanticLocationHistoryServiceImpl(
                     refreshRemoteAccountSettings = false
                 ).timelineEnabled
             }
-            val accountName = account?.name
+            val accountName = if (allowedAccount) account?.name else null
             val deviceTag = if (!accountName.isNullOrEmpty()) storageManager.getDeviceTag(accountName) else 0
             val reportingState = ReportingState(
                 -1,
