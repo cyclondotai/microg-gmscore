@@ -804,12 +804,16 @@ private fun rememberAppAssets(name: String, installed: Boolean): AppAssets {
     val context = LocalContext.current
     val px = with(LocalDensity.current) { 44.dp.roundToPx() }
     val key = "$name@$px"
-    val assets by produceState(AppIconCache.icons.get(key) ?: NO_ASSETS, key, installed) {
-        if (AppIconCache.icons.get(key) == null || installed && value.icon == null) {
-            val loaded = withContext(Dispatchers.IO) { AppIconCache.load(context.packageManager, name, px) }
-            if (loaded.icon != null) AppIconCache.icons.put(key, loaded)
-            value = loaded
+    var assets by remember(key) { mutableStateOf(AppIconCache.icons.get(key) ?: NO_ASSETS) }
+    LaunchedEffect(key, installed) {
+        val cached = AppIconCache.icons.get(key)
+        if (cached != null) {
+            assets = cached
+            if (!installed || cached.icon != null) return@LaunchedEffect
         }
+        val loaded = withContext(Dispatchers.IO) { AppIconCache.load(context.packageManager, name, px) }
+        if (loaded.icon != null) AppIconCache.icons.put(key, loaded)
+        assets = loaded
     }
     return assets
 }
