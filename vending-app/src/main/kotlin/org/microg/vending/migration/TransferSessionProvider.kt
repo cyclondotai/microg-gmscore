@@ -20,7 +20,7 @@ class TransferSessionProvider : ContentProvider() {
         val context = requireNotNull(context)
         val uid = Binder.getCallingUid()
         val manager = context.packageManager
-        val caller = if (method == "getHandoff" || method == "cancelHandoff" || method == "prioritizeHandoff") CORE else COMPANION
+        val caller = if (method == "getHandoff" || method == "cancelHandoff" || method == "prioritizeHandoff" || method == "releaseBulkHandoff") CORE else COMPANION
         val app = try { manager.getApplicationInfo(caller, 0) }
         catch (_: PackageManager.NameNotFoundException) { throw SecurityException("Transfer caller is not installed") }
         checkCaller(app, uid, manager, caller)
@@ -32,14 +32,19 @@ class TransferSessionProvider : ContentProvider() {
             val identity = Binder.clearCallingIdentity()
             try { return MigrationInstallQueue(context).prioritize(run, packages) } finally { Binder.restoreCallingIdentity(identity) }
         }
-        if (method in setOf("beginHandoff", "getHandoff", "endHandoff", "cancelHandoff")) {
+        if (method in setOf("beginHandoff", "getHandoff", "endHandoff", "cancelHandoff", "releaseBulkHandoff")) {
             val run = requireNotNull(arg).also { require(RUN.matches(it)) { "Invalid transfer run" } }
             val identity = Binder.clearCallingIdentity()
             try {
                 val queue = MigrationInstallQueue(context)
                 return when (method) {
-                    "beginHandoff" -> queue.beginHandoff(run, extras?.getBoolean("resume_only") == true)
+                    "beginHandoff" -> queue.beginHandoff(
+                        run,
+                        extras?.getBoolean("resume_only") == true,
+                        extras?.getBoolean("defer_bulk") == true,
+                    )
                     "getHandoff" -> queue.handoff(run, (extras?.getInt("offset") ?: 0).also { require(it >= 0) })
+                    "releaseBulkHandoff" -> queue.releaseBulkHandoff(run)
                     "cancelHandoff" -> queue.endHandoff(run, "cancelled")
                     else -> {
                         val outcome = extras?.getString("outcome")
