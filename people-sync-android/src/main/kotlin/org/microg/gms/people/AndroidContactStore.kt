@@ -241,7 +241,7 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
             if (matches.size > 1) { checked[candidate.id] = candidate.version; unverified++; continue }
             val keeper = matches.singleOrNull()?.let(owned::get)
             if (keeper != null) {
-                if (!collapseImport(candidate, keeper)) { checked[candidate.id] = candidate.version; unverified++; continue }
+                if (!collapseImport(candidate, keeper, remote)) { checked[candidate.id] = candidate.version; unverified++; continue }
                 checked.remove(candidate.id)
                 val current = readContacts("${rawScope(keeper.id)} AND ${RawContacts.SYNC4}=?", args + backendOwner).single()
                 owned[current.id] = current; index(current)
@@ -279,15 +279,16 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
         prefs.importChecks(backendOwner, checked)
         return unverified
     }
-    private fun collapseImport(candidate: LocalContact, keeper: LocalContact): Boolean {
-        if (candidate.unsupported || candidate.deleted) return false
+    private fun collapseImport(candidate: LocalContact, keeper: LocalContact, remote: Person?): Boolean {
+        if (candidate.unsupported || candidate.deleted || keeper.deleted) return false
         val json = state(keeper.id)
         val signature = importSignature(candidate)
         val signatures = importSignatures(json)
         val sameFields = importFields(candidate.fields) in setOf(importFields(keeper.fields), importFields(keeper.baseline))
+        val remoteHasPhoto = remote != null && ContactPhotos.reference(remote) != null
         val copyPhoto = signature !in signatures && sameFields && candidate.hasPhoto && !keeper.hasPhoto &&
-            prefs.mode == SyncMode.TWO_WAY && photoBaseline(json)?.remote == null &&
-            (json.isNull("_photoRemote") || json.optString("_photoRemote").isEmpty())
+            prefs.mode == SyncMode.TWO_WAY && !remoteHasPhoto && !json.optBoolean("_photoDeleted") &&
+            photoBaseline(json)?.remote == null && (json.isNull("_photoRemote") || json.optString("_photoRemote").isEmpty())
         if (signature !in signatures && (!sameFields || candidate.hasPhoto && !copyPhoto && signature.split(':')[1] != importSignature(keeper).split(':')[1])) return false
         val operations = arrayListOf(assertImport(candidate), assertVersion(keeper))
         if (signature in signatures) {
@@ -299,6 +300,10 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
             return true
         }
         if (keeper.pending != null) return false
+        val candidateHasDisplayPhoto = copyPhoto && provider.query(Data.CONTENT_URI, arrayOf(Photo.PHOTO_FILE_ID),
+            "${Data.RAW_CONTACT_ID}=? AND ${Data.MIMETYPE}=?", arrayOf(candidate.id.toString(), Photo.CONTENT_ITEM_TYPE), null)!!.use {
+            it.moveToFirst() && !it.isNull(0) && it.getLong(0) > 0L
+        }
         val photo = if (copyPhoto) {
             val bytes = photoBytes(PhotoContact(candidate, photoToken(candidate.id), null, null)) ?: throw UnreadableContact()
             if (bytes.size > 256 * 1024) PhotoEncoding.providerBytes(bytes) else bytes
@@ -318,6 +323,13 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
                 .withSelection("${Data.RAW_CONTACT_ID}=? AND ${Data.MIMETYPE}=?", arrayOf(keeper.id.toString(), Photo.CONTENT_ITEM_TYPE)).build())
             operations.add(ContentProviderOperation.newInsert(syncUri(Data.CONTENT_URI))
                 .withValue(Data.RAW_CONTACT_ID, keeper.id).withValue(Data.MIMETYPE, Photo.CONTENT_ITEM_TYPE).withValue(Photo.PHOTO, photo).build())
+            // ContactsProvider2's photo handler can silently return ID 0 on decode failure or drop the display photo
+            // file on disk error. Assert the persisted row inside the same transaction before deleting candidate.
+            val persisted = "${Data.RAW_CONTACT_ID}=? AND ${Data.MIMETYPE}=? AND ${Photo.PHOTO} IS NOT NULL AND length(${Photo.PHOTO})>0" +
+                if (candidateHasDisplayPhoto) " AND ${Photo.PHOTO_FILE_ID} IS NOT NULL AND ${Photo.PHOTO_FILE_ID}>0" else ""
+            operations.add(ContentProviderOperation.newAssertQuery(syncUri(Data.CONTENT_URI))
+                .withSelection(persisted, arrayOf(keeper.id.toString(), Photo.CONTENT_ITEM_TYPE))
+                .withExpectedCount(1).build())
         }
         json.put("_imports", org.json.JSONArray((signatures + signature).toList()))
         val values = ContentValues().apply {
@@ -327,7 +339,15 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
         }
         operations.add(ContentProviderOperation.newUpdate(syncUri(RawContacts.CONTENT_URI)).withSelection(rawScope(keeper.id), args).withValues(values).withExpectedCount(1).build())
         operations.add(ContentProviderOperation.newDelete(syncUri(RawContacts.CONTENT_URI)).withSelection(rawScope(candidate.id), args).withExpectedCount(1).build())
-        provider.applyBatch(operations)
+        try {
+            provider.applyBatch(operations)
+        } catch (error: android.content.OperationApplicationException) {
+            if (photo == null) throw error
+            // Distinguish a failed photo persistence assertion from a concurrent row edit so a bad photo
+            // holds only this candidate as unverified while concurrent edits still abort cleanly.
+            val unchanged = runCatching { provider.applyBatch(arrayListOf(assertImport(candidate), assertVersion(keeper))); true }.getOrDefault(false)
+            if (unchanged) throw UnreadableContact() else throw error
+        }
         return true
     }
     private fun baseline(person: Person, existing: LocalContact?): String = JSONObject().apply {
@@ -336,6 +356,7 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
             val previous = state(it.id)
             previous.optJSONObject("_photo")?.let { put("_photo", it) }
             previous.optJSONArray("_imports")?.let { put("_imports", it) }
+            if (previous.optBoolean("_photoDeleted")) put("_photoDeleted", true)
         }
         put("_photoRemote", ContactPhotos.reference(person) ?: JSONObject.NULL)
         put("_photoRevision", ContactPhotos.revision(person))
@@ -507,7 +528,10 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
         return cleared
     }
     private fun photoState(json: JSONObject, token: String, remote: Person, hash: String?): JSONObject = json.apply {
+        val hadPhoto = photoBaseline(this)?.remote != null || (!isNull("_photoRemote") && optString("_photoRemote").isNotEmpty())
         val ref = ContactPhotos.reference(remote)
+        if (token == ContactPhotos.NONE && ref == null && hadPhoto) put("_photoDeleted", true)
+        else if (token != ContactPhotos.NONE || ref != null) remove("_photoDeleted")
         put("_photo", JSONObject().put("token", token).put("remote", ref ?: JSONObject.NULL).put("revision", ContactPhotos.revision(remote)).put("hash", hash ?: JSONObject.NULL))
         put("_photoRemote", ref ?: JSONObject.NULL); put("_photoRevision", ContactPhotos.revision(remote))
     }

@@ -121,10 +121,12 @@ object ContactFieldMapper {
                 value == null || value == "" || value is ByteArray && value.isEmpty() -> true
                 // Switch writes undefined name styles (0); unset flags also carry no preference.
                 column in defaults && row.getAsString(column) == "0" -> true
-                // Google FSA2 never reads IS_SUPER_PRIMARY, and ignores IS_PRIMARY on StructuredName/Note
-                // (Switch sets both on StructuredName from iOS ABPerson.IsPreferredName).
-                column == Data.IS_SUPER_PRIMARY -> true
-                column == Data.IS_PRIMARY && (mime == StructuredName.CONTENT_ITEM_TYPE || mime == Note.CONTENT_ITEM_TYPE) -> true
+                // Google FSA2 ignores IS_PRIMARY/IS_SUPER_PRIMARY on StructuredName/Note, and Switch sets both on
+                // StructuredName (iOS ABPerson.IsPreferredName) and Nickname (nameless contacts). Keep IS_SUPER_PRIMARY
+                // protected on Phone/Email/etc. so aggregate-contact defaults (e.g. Dialer default number) aren't dropped.
+                (column == Data.IS_PRIMARY || column == Data.IS_SUPER_PRIMARY) &&
+                    (mime == StructuredName.CONTENT_ITEM_TYPE || mime == Note.CONTENT_ITEM_TYPE) -> true
+                column == Data.IS_SUPER_PRIMARY && mime == Nickname.CONTENT_ITEM_TYPE -> true
                 // TYPE_CUSTOM (0) with no custom label carries no type information; Switch writes Organization.TYPE=0
                 // with null LABEL for iOS company fields, and Google FSA2 treats untyped 0 with empty label as unspecified/other.
                 spec != null && spec.typeColumn != null && spec.labelColumn != null && column == spec.typeColumn &&

@@ -255,8 +255,7 @@ class ContactExtrasProviderTest {
             .put("resourceName", "people/a")
             .put("metadata", JSONObject().put("sources", JSONArray().put(JSONObject().put("type", "CONTACT").put("etag", "person-etag"))))
             .put("names", JSONArray().put(JSONObject().put("givenName", "Synthetic").put("familyName", "Import")))
-            .put("phoneNumbers", JSONArray().put(JSONObject().put("value", "+14155550199").put("type", "mobile")
-                .put("metadata", JSONObject().put("sourcePrimary", true))))
+            .put("phoneNumbers", JSONArray().put(JSONObject().put("value", "+14155550199").put("type", "mobile")))
             .put("organizations", JSONArray().put(JSONObject().put("name", "Acme").put("type", "other")))
             .put("urls", JSONArray()
                 .put(JSONObject().put("value", "https://example.invalid/").put("type", "homePage"))
@@ -281,7 +280,7 @@ class ContactExtrasProviderTest {
         })
         resolver.insert(Data.CONTENT_URI, ContentValues().apply {
             put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Phone.CONTENT_ITEM_TYPE)
-            put(Phone.NUMBER, "+14155550199"); put(Phone.TYPE, Phone.TYPE_MOBILE); put(Data.IS_SUPER_PRIMARY, 1)
+            put(Phone.NUMBER, "+14155550199"); put(Phone.TYPE, Phone.TYPE_MOBILE)
         })
         resolver.insert(Data.CONTENT_URI, ContentValues().apply {
             put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Organization.CONTENT_ITEM_TYPE)
@@ -318,8 +317,16 @@ class ContactExtrasProviderTest {
             assertEquals(keeper, current.id)
             assertTrue(current.hasPhoto)
             assertFalse(current.dirty)
+            // Verify real ContactsProvider2 stored a full display_photo file (PHOTO_FILE_ID > 0), not thumbnail-only.
+            resolver.query(Data.CONTENT_URI, arrayOf(Photo.PHOTO_FILE_ID),
+                "${Data.RAW_CONTACT_ID}=? AND ${Data.MIMETYPE}=?", arrayOf(keeper.toString(), Photo.CONTENT_ITEM_TYPE), null)!!.use { c ->
+                assertTrue(c.moveToFirst()); assertTrue(c.getLong(0) > 0L)
+            }
             val bytes = contacts.photoBytes(contacts.photoContacts().single())!!
-            assertNotNull(BitmapFactory.decodeByteArray(bytes, 0, bytes.size))
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            assertNotNull(decoded)
+            assertEquals(256, decoded.width); assertEquals(256, decoded.height)
+            decoded.recycle()
         }
         // Second pass must be a clean no-op with zero extra uploads.
         val second = sync()
