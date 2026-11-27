@@ -12,8 +12,11 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.provider.ContactsContract
 import android.provider.ContactsContract.CommonDataKinds.GroupMembership
+import android.provider.ContactsContract.CommonDataKinds.Organization
+import android.provider.ContactsContract.CommonDataKinds.Phone
 import android.provider.ContactsContract.CommonDataKinds.Photo
 import android.provider.ContactsContract.CommonDataKinds.StructuredName
+import android.provider.ContactsContract.CommonDataKinds.Website
 import android.provider.ContactsContract.Data
 import android.provider.ContactsContract.Groups
 import android.provider.ContactsContract.RawContacts
@@ -245,5 +248,89 @@ class ContactExtrasProviderTest {
         sync()
         assertEquals(1, api.groupCreates); assertEquals(1, api.contactCreates)
         assertTrue(Memberships.resources(api.remote!!).contains("contactGroups/created1"))
+    }
+    @Test fun switchCopiedContactShapesAndMissingPhotoReconcileOnRealProvider() {
+        // Remote Google contact has org (type=other), website (homePage + ftp), phone, and no photo.
+        api.remote = Person.parse(JSONObject()
+            .put("resourceName", "people/a")
+            .put("metadata", JSONObject().put("sources", JSONArray().put(JSONObject().put("type", "CONTACT").put("etag", "person-etag"))))
+            .put("names", JSONArray().put(JSONObject().put("givenName", "Synthetic").put("familyName", "Import")))
+            .put("phoneNumbers", JSONArray().put(JSONObject().put("value", "+14155550199").put("type", "mobile")))
+            .put("organizations", JSONArray().put(JSONObject().put("name", "Acme").put("type", "other")))
+            .put("urls", JSONArray()
+                .put(JSONObject().put("value", "https://example.invalid/").put("type", "homePage"))
+                .put(JSONObject().put("value", "ftp://files.example.invalid/").put("type", "ftp")))
+            .put("memberships", Memberships.json(setOf(MY_CONTACTS))))
+        sync()
+        val keeper = id()
+        stores { contacts, _ -> assertFalse(contacts.contacts().single().hasPhoto) }
+
+        // Insert a copied-from-iOS unowned duplicate carrying all 4 CYC-3528 patterns against real ContactsProvider2:
+        // 1) StructuredName with IS_PRIMARY=1 & IS_SUPER_PRIMARY=1 (bumps DATA_VERSION=1 via setIsPrimary)
+        // 2) Organization with TYPE_CUSTOM (0) and null LABEL
+        // 3) Website with TYPE_HOMEPAGE (1) and TYPE_FTP (6)
+        // 4) Real JPEG photo (ContactsProvider2 creates PHOTO_FILE_ID + display_photo + thumbnail) while keeper has none.
+        val copied = ContentUris.parseId(resolver.insert(RawContacts.CONTENT_URI, ContentValues().apply {
+            put(RawContacts.ACCOUNT_NAME, account.name); put(RawContacts.ACCOUNT_TYPE, account.type)
+        })!!)
+        resolver.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, StructuredName.CONTENT_ITEM_TYPE)
+            put(StructuredName.GIVEN_NAME, "Synthetic"); put(StructuredName.FAMILY_NAME, "Import")
+            put(Data.IS_PRIMARY, 1); put(Data.IS_SUPER_PRIMARY, 1)
+        })
+        resolver.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Phone.CONTENT_ITEM_TYPE)
+            put(Phone.NUMBER, "+14155550199"); put(Phone.TYPE, Phone.TYPE_MOBILE)
+        })
+        resolver.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Organization.CONTENT_ITEM_TYPE)
+            put(Organization.COMPANY, "Acme"); put(Organization.TYPE, Organization.TYPE_CUSTOM)
+        })
+        resolver.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Website.CONTENT_ITEM_TYPE)
+            put(Website.URL, "https://example.invalid/"); put(Website.TYPE, Website.TYPE_HOMEPAGE)
+        })
+        resolver.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Website.CONTENT_ITEM_TYPE)
+            put(Website.URL, "ftp://files.example.invalid/"); put(Website.TYPE, Website.TYPE_FTP)
+        })
+        resolver.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Photo.CONTENT_ITEM_TYPE)
+            put(Photo.PHOTO, jpeg(Color.CYAN))
+        })
+
+        // Simulate a stale provider-v2 cache entry (like customer-11 upgrading after import_review).
+        context.getSharedPreferences(ContactSyncPreferences.PREFERENCES, android.content.Context.MODE_PRIVATE).edit()
+            .putString("${account.type}:${account.name}:importChecks:provider-v2:${AndroidContactStore.OWNER}",
+                JSONObject().put(copied.toString(), 99L).toString()).commit()
+
+        val report = sync()
+        assertEquals(0, report.unverifiedImports)
+        assertEquals(0, report.conflicts + report.uncertain + report.skipped)
+        assertEquals(0, api.contactCreates)
+        assertEquals(1, api.photoWrites)
+        val rawCount = resolver.query(RawContacts.CONTENT_URI, arrayOf(RawContacts._ID),
+            "${RawContacts.ACCOUNT_NAME}=? AND ${RawContacts.ACCOUNT_TYPE}=?", arrayOf(account.name, account.type), null)!!.use { it.count }
+        assertEquals(1, rawCount)
+        stores { contacts, _ ->
+            val current = contacts.contacts().single()
+            assertEquals(keeper, current.id)
+            assertTrue(current.hasPhoto)
+            assertFalse(current.dirty)
+            // Verify real ContactsProvider2 stored a full display_photo file (PHOTO_FILE_ID > 0), not thumbnail-only.
+            resolver.query(Data.CONTENT_URI, arrayOf(Photo.PHOTO_FILE_ID),
+                "${Data.RAW_CONTACT_ID}=? AND ${Data.MIMETYPE}=?", arrayOf(keeper.toString(), Photo.CONTENT_ITEM_TYPE), null)!!.use { c ->
+                assertTrue(c.moveToFirst()); assertTrue(c.getLong(0) > 0L)
+            }
+            val bytes = contacts.photoBytes(contacts.photoContacts().single())!!
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            assertNotNull(decoded)
+            assertEquals(256, decoded.width); assertEquals(256, decoded.height)
+            decoded.recycle()
+        }
+        // Second pass must be a clean no-op with zero extra uploads.
+        val second = sync()
+        assertEquals(0, second.unverifiedImports + second.conflicts + second.uncertain + second.skipped + second.uploaded)
+        assertEquals(1, api.photoWrites)
     }
 }

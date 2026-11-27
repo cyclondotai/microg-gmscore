@@ -18,7 +18,7 @@ interface ContactStore {
     // Imported rows have no trustworthy baseline. Reconcile against a complete,
     // account-scoped snapshot before a pull can insert a second raw contact.
     fun hasImportCandidates(): Boolean = false
-    fun reconcileImports(people: List<Person>, full: Boolean): Int = 0
+    fun reconcileImports(people: List<Person>, full: Boolean, fetch: ((String) -> Person?)? = null): Int = 0
     fun project(person: Person): Fields
     fun apply(person: Person, existing: LocalContact?, readOnly: Boolean)
     fun remove(existing: LocalContact)
@@ -78,7 +78,7 @@ class ContactsSync(private val api: ContactsApi, private val store: ContactStore
             if (saved != null && e.expired) download(null) else throw e
         }
         check(mode() != SyncMode.OFF) { "Contacts sync disabled" }
-        val unverifiedImports = if (snapshot.skipped == 0) store.reconcileImports(snapshot.people, snapshot.full) else 0
+        val unverifiedImports = if (snapshot.skipped == 0) store.reconcileImports(snapshot.people, snapshot.full, api::get) else 0
         var skipped = snapshot.skipped
         var downloaded = 0
         var uploaded = 0

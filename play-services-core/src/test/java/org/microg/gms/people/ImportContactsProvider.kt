@@ -67,6 +67,8 @@ internal class ImportContactsProvider : ContentProvider() {
     var completeNameAvailable = true
     var completeNameResponse: ((Map<String, String>) -> ContentValues)? = null
     val nameInputs = mutableListOf<Map<String, String>>()
+    /** Simulates ContactsProvider2's DataRowHandlerForPhoto returning ID 0 on decode failure without throwing. */
+    var dropPhotoInsert = false
 
     override fun onCreate() = true
     override fun getType(uri: Uri): String? = null
@@ -144,6 +146,9 @@ internal class ImportContactsProvider : ContentProvider() {
         val table = table(uri)
         writes.add(Write(table, syncAdapter(uri)))
         val inserted = ContentValues(requireNotNull(values))
+        if (dropPhotoInsert && table == "data" && inserted.getAsString(Data.MIMETYPE) == ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE) {
+            return ContentUris.withAppendedId(uri, 0L)
+        }
         if (table == "raw_contacts" && !syncAdapter(uri) && !inserted.containsKey(RawContacts.DIRTY)) inserted.put(RawContacts.DIRTY, 1)
         val id = if (table == "syncstate") database.insertWithOnConflict(table, null, inserted, SQLiteDatabase.CONFLICT_REPLACE)
             else database.insertOrThrow(table, null, inserted)
