@@ -29,7 +29,7 @@ class DeviceContacts(private val provider: ContentProviderClient, context: andro
 
     fun list(): List<Entry> = provider.query(RawContacts.CONTENT_URI, arrayOf(RawContacts._ID, RawContacts.DISPLAY_NAME_PRIMARY),
         LOCAL, null, "${RawContacts.DISPLAY_NAME_PRIMARY} COLLATE LOCALIZED")?.use { c ->
-        buildList { while (c.moveToNext()) add(Entry(c.getLong(0), c.getString(1), rows(c.getLong(0)).all(::uploadable))) }
+        buildList { while (c.moveToNext()) add(Entry(c.getLong(0), c.getString(1), uploadable(rows(c.getLong(0))))) }
     } ?: emptyList()
 
     fun count(): Int = provider.query(RawContacts.CONTENT_URI, arrayOf(RawContacts._ID), LOCAL, null, null)?.use { it.count } ?: 0
@@ -58,7 +58,10 @@ class DeviceContacts(private val provider: ContentProviderClient, context: andro
     private fun copied(row: ContentValues) = row.getAsString(Data.MIMETYPE) !in setOf(GroupMembership.CONTENT_ITEM_TYPE, Photo.CONTENT_ITEM_TYPE)
     // The same rule the sync applies to new, never-synced rows (imports): every value must survive the upload,
     // else the contact would never be uploaded. Such contacts stay on the phone.
-    private fun uploadable(row: ContentValues) = !copied(row) || ContactFieldMapper.losslessImport(row, normalization::reconstruct)
+    private fun uploadable(rows: List<ContentValues>): Boolean {
+        val counts = rows.groupingBy { it.getAsString(Data.MIMETYPE) }.eachCount()
+        return rows.all { !copied(it) || ContactFieldMapper.losslessImport(it, normalization::reconstruct, (counts[it.getAsString(Data.MIMETYPE)] ?: 0) <= 1) }
+    }
 
     private fun rows(id: Long): List<ContentValues> =
         provider.query(Data.CONTENT_URI, DATA_COLUMNS, "${Data.RAW_CONTACT_ID}=?", arrayOf(id.toString()), null)?.use { c ->
@@ -68,7 +71,7 @@ class DeviceContacts(private val provider: ContentProviderClient, context: andro
     private fun move(account: Account, id: Long): Outcome {
         var unsupported = false
         val moved = transfer(id, LOCAL, null, account.name, account.type, deleteAsSyncAdapter = false) { rows ->
-            rows.all(::uploadable).also { unsupported = !it }
+            uploadable(rows).also { unsupported = !it }
         }
         return if (moved) Outcome.MOVED else if (unsupported) Outcome.UNSUPPORTED else Outcome.SKIPPED
     }

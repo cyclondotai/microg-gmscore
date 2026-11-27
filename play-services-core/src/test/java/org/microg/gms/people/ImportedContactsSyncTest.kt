@@ -935,4 +935,71 @@ class ImportedContactsSyncTest {
         assertEquals(listOf(keeper), provider.rawIds)
         assertTrue(store.contacts().single().hasPhoto)
     }
+
+    @Test fun collapseImportChecksKeeperRemoteWhenCloudEditsTextAndAddsPhotoTogether() = fixture {
+        val remote = person(); api.remote[remote.resource] = remote
+        sync() // Keeper caches _photoRemote=null and old phone "123".
+        val keeper = store.contacts().single().id
+        // Google changes BOTH phone ("123" -> "999") AND adds a photo in the same snapshot.
+        val cloudPhoto = "fsa2-photo:17:${ContactPhotos.hash(byteArrayOf(8, 8, 8))}"
+        api.remote[remote.resource] = Person.parse(JSONObject(person(phone = "999", etag = "e2").json.toString()).apply {
+            put("photos", JSONArray().put(JSONObject().put("url", cloudPhoto)
+                .put("metadata", JSONObject().put("source", JSONObject().put("type", "CONTACT")))))
+        })
+        // Source-less copy still has the old phone ("123") + a photo -> misses remoteByFields, matches local keeper.
+        val copied = nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+            put(ContactsContract.CommonDataKinds.Photo.PHOTO, byteArrayOf(1, 2, 3))
+        })
+        val report = sync()
+        assertEquals(1, report.unverifiedImports)
+        assertEquals(listOf(keeper, copied), provider.rawIds)
+        assertNull(raw(copied, RawContacts.SYNC4))
+        assertFalse(store.contacts().single().hasPhoto)
+    }
+
+    @Test fun preUpgradeDeletedPhotoBaselineDoesNotResurrectOnNewCopiedPhoto() = fixture {
+        val remote = person(); api.remote[remote.resource] = remote
+        sync()
+        val keeper = store.contacts().single().id
+        // Simulate a pre-upgrade confirmed photo deletion: _photo={token:"none", remote:null} with NO _photoDeleted key.
+        val legacyState = JSONObject(raw(keeper, RawContacts.SYNC2)!!).apply {
+            put("_photo", JSONObject().put("token", ContactPhotos.NONE).put("remote", JSONObject.NULL)
+                .put("revision", "old-rev").put("hash", JSONObject.NULL))
+            remove("_photoDeleted")
+        }
+        val syncRawUri = RawContacts.CONTENT_URI.buildUpon().appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true").build()
+        provider.update(syncRawUri, ContentValues().apply { put(RawContacts.SYNC2, legacyState.toString()) }, "_id=?", arrayOf(keeper.toString()))
+
+        val copied = nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+            put(ContactsContract.CommonDataKinds.Photo.PHOTO, byteArrayOf(4, 5, 6))
+        })
+        val report = sync()
+        assertEquals(1, report.unverifiedImports)
+        assertEquals(listOf(keeper, copied), provider.rawIds)
+        assertFalse(store.contacts().single().hasPhoto)
+    }
+
+    @Test fun multipleStructuredNamesWithPrimarySelectionStayUnowned() = fixture {
+        val remote = person().also {
+            it.json.put("names", JSONArray()
+                .put(JSONObject().put("givenName", "Synthetic"))
+                .put(JSONObject().put("givenName", "Alt")))
+        }
+        api.remote[remote.resource] = remote
+        sync()
+        val keeper = store.contacts().single().id
+        // Two StructuredName rows on one raw contact with IS_PRIMARY=1 choosing display name must remain unowned.
+        val copied = nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, StructuredName.CONTENT_ITEM_TYPE)
+            put(StructuredName.GIVEN_NAME, "Alt"); put(StructuredName.DISPLAY_NAME, "Alt")
+            put(StructuredName.FULL_NAME_STYLE, 1); put(StructuredName.PHONETIC_NAME_STYLE, 0)
+            put(Data.IS_PRIMARY, 1); put(Data.IS_SUPER_PRIMARY, 1)
+        })
+        val report = sync()
+        assertEquals(1, report.unverifiedImports)
+        assertEquals(listOf(keeper, copied), provider.rawIds)
+        assertNull(raw(copied, RawContacts.SYNC4))
+    }
 }

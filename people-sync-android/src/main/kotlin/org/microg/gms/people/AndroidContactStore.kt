@@ -158,9 +158,10 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
                     rows.any { it.getAsString(Data.MIMETYPE) == GroupMembership.CONTENT_ITEM_TYPE })
                 var unreadablePhoto = false
                 val hasPhoto = try { photoToken(id) != ContactPhotos.NONE } catch (error: UnreadableContact) { unreadablePhoto = true; true }
+                val mimeCounts = if (imported) rows.groupingBy { it.getAsString(Data.MIMETYPE) }.eachCount() else emptyMap()
                 val unsupported = legacyNeedsReview || unreadablePhoto || rows.any { !ContactFieldMapper.supported(it) && it.getAsString(Data.MIMETYPE) != Photo.CONTENT_ITEM_TYPE &&
                     !(groupStore != null && it.getAsString(Data.MIMETYPE) == GroupMembership.CONTENT_ITEM_TYPE) } || membership.any { it.startsWith("localGroup:") } ||
-                    imported && rows.any { !ContactFieldMapper.losslessImport(it, normalization::reconstruct) }
+                    imported && rows.any { !ContactFieldMapper.losslessImport(it, normalization::reconstruct, (mimeCounts[it.getAsString(Data.MIMETYPE)] ?: 0) <= 1) }
                 val fields = ContactFieldMapper.fields(rows).toMutableMap().apply { if (groupStore != null) put("memberships", Memberships.field(membership)) }
                 add(LocalContact(id, number(RawContacts.VERSION), text(RawContacts.SOURCE_ID), text(RawContacts.SYNC1),
                     fields, text(RawContacts.SYNC2)?.let { baselineFields(JSONObject(it)) }.orEmpty(),
@@ -215,6 +216,7 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
             (setOf(person.resource) + listOfNotNull(person.source?.optString("id")?.takeIf { it.isNotEmpty() }))
                 .map { it to person }
         }.groupBy({ it.first }, { it.second })
+        val remoteByResource = people.associateBy { it.resource }
         val remoteByFields = people.filter { !it.deleted }.groupBy { importFields(project(it)) }
         var unverified = 0
         for (candidate in candidates) try {
@@ -241,7 +243,8 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
             if (matches.size > 1) { checked[candidate.id] = candidate.version; unverified++; continue }
             val keeper = matches.singleOrNull()?.let(owned::get)
             if (keeper != null) {
-                if (!collapseImport(candidate, keeper, remote)) { checked[candidate.id] = candidate.version; unverified++; continue }
+                val keeperRemote = remote ?: keeper.resource?.let(remoteByResource::get)
+                if (!collapseImport(candidate, keeper, keeperRemote)) { checked[candidate.id] = candidate.version; unverified++; continue }
                 checked.remove(candidate.id)
                 val current = readContacts("${rawScope(keeper.id)} AND ${RawContacts.SYNC4}=?", args + backendOwner).single()
                 owned[current.id] = current; index(current)
@@ -285,10 +288,10 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
         val signature = importSignature(candidate)
         val signatures = importSignatures(json)
         val sameFields = importFields(candidate.fields) in setOf(importFields(keeper.fields), importFields(keeper.baseline))
-        val remoteHasPhoto = remote != null && ContactPhotos.reference(remote) != null
+        val remoteBlocksPhoto = remote != null && (remote.deleted || ContactPhotos.reference(remote) != null)
         val copyPhoto = signature !in signatures && sameFields && candidate.hasPhoto && !keeper.hasPhoto &&
-            prefs.mode == SyncMode.TWO_WAY && !remoteHasPhoto && !json.optBoolean("_photoDeleted") &&
-            photoBaseline(json)?.remote == null && (json.isNull("_photoRemote") || json.optString("_photoRemote").isEmpty())
+            prefs.mode == SyncMode.TWO_WAY && !remoteBlocksPhoto && !json.optBoolean("_photoDeleted") &&
+            photoBaseline(json) == null && (json.isNull("_photoRemote") || json.optString("_photoRemote").isEmpty())
         if (signature !in signatures && (!sameFields || candidate.hasPhoto && !copyPhoto && signature.split(':')[1] != importSignature(keeper).split(':')[1])) return false
         val operations = arrayListOf(assertImport(candidate), assertVersion(keeper))
         if (signature in signatures) {
