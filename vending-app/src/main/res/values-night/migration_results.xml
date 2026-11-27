@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- SPDX-FileCopyrightText: 2026 Cyclon
+     SPDX-License-Identifier: Apache-2.0 -->
+<resources>
+    <bool name="migration_results_light_bars">false</bool>
+
+    <style name="Theme.Cyclon.MigrationResults" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/migration_results_ground</item>
+        <item name="android:colorBackground">@color/migration_results_ground</item>
+        <item name="android:windowSplashScreenBackground">@color/migration_results_ground</item>
+        <item name="android:statusBarColor">@color/migration_results_ground</item>
+        <item name="android:navigationBarColor">@color/migration_results_ground</item>
+        <item name="android:windowLightStatusBar">@bool/migration_results_light_bars</item>
+        <item name="android:windowLightNavigationBar">@bool/migration_results_light_bars</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+    </style>
+</resources>

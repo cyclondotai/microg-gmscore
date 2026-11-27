@@ -123,9 +123,11 @@ class TransferSessionProviderTest {
         val coreUid = companionUid + 1
         install("ai.cyclon.core", coreUid, ApplicationInfo.FLAG_SYSTEM, platform)
         assertTrue(provider.call("beginHandoff", run, null).getBoolean("accepted"))
-        assertTrue(runCatching { provider.call("getHandoff", run, null) }.exceptionOrNull() is SecurityException)
+        // Transfer Phone reads the same receipt for its App installs card (CYC-3525).
+        val companionRead = provider.call("getHandoff", run, null)
         ShadowBinder.setCallingUid(coreUid)
         val armed = provider.call("getHandoff", run, null)
+        assertEquals(armed.getString("session_id"), companionRead.getString("session_id"))
         assertNotEquals(oldId, armed.getString("session_id"))
         assertTrue(armed.getStringArrayList("packages")!!.isEmpty())
         assertTrue(runCatching { provider.call("endHandoff", run, null) }.exceptionOrNull() is SecurityException)
@@ -592,5 +594,57 @@ class TransferSessionProviderTest {
         assertEquals(pausedId, receipt.getString("session_id"))
         assertTrue(receipt.getBoolean("bulk_deferred"))
         assertEquals(listOf(pausedId to "org.example.signin"), q.dispatchOrder())
+    }
+
+    /** CYC-3525: Transfer Phone and Core both read the hand-off receipt; anything else is still refused. */
+    @Test fun getHandoffAcceptsPlatformCoreAndTransferPhoneButNoOtherCaller() {
+        val run = "00000000-0000-0000-0000-000000003525"
+        val coreUid = companionUid + 1
+        install("ai.cyclon.core", coreUid, ApplicationInfo.FLAG_SYSTEM, platform)
+        assertTrue(provider.call("beginHandoff", run, null).getBoolean("accepted"))
+        MigrationInstallQueue(context).select(listOf(Bundle().apply {
+            putString("package_name", "org.example.app"); putString("title", "Example"); putString("icon_url", "https://example.org/icon.png")
+        }))
+
+        val fromCompanion = provider.call("getHandoff", run, null)
+        assertEquals(listOf("org.example.app"), fromCompanion.getStringArrayList("packages"))
+        assertEquals(listOf("https://example.org/icon.png"), fromCompanion.getStringArrayList("icon_urls"))
+        ShadowBinder.setCallingUid(coreUid)
+        assertEquals(listOf("org.example.app"), provider.call("getHandoff", run, null).getStringArrayList("packages"))
+
+        // A caller claiming neither UID, a non-system Core and an unsigned Transfer Phone are refused before any read.
+        val clearsBefore = TransferSessionBinderIdentityShadow.clears
+        ShadowBinder.setCallingUid(companionUid + 7)
+        assertThrows(SecurityException::class.java) { provider.call("getHandoff", run, null) }
+        install("ai.cyclon.core", coreUid, 0, platform)
+        ShadowBinder.setCallingUid(coreUid)
+        assertThrows(SecurityException::class.java) { provider.call("getHandoff", run, null) }
+        install(companion, companionUid, ApplicationInfo.FLAG_SYSTEM, untrusted)
+        ShadowBinder.setCallingUid(companionUid)
+        assertThrows(SecurityException::class.java) { provider.call("getHandoff", run, null) }
+        assertEquals(clearsBefore, TransferSessionBinderIdentityShadow.clears)
+    }
+
+    /** CYC-3525: reading the receipt is shared; changing the hand-off stays with its one owner. */
+    @Test fun transferPhoneStillCannotUseCoreOnlyHandoffMethods() {
+        val run = "00000000-0000-0000-0000-000000003526"
+        install("ai.cyclon.core", companionUid + 1, ApplicationInfo.FLAG_SYSTEM, platform)
+        assertTrue(provider.call("beginHandoff", run, null).getBoolean("accepted"))
+        assertThrows(SecurityException::class.java) { provider.call("cancelHandoff", run, null) }
+        assertThrows(SecurityException::class.java) { provider.call("releaseBulkHandoff", run, null) }
+        assertThrows(SecurityException::class.java) {
+            provider.call("prioritizeHandoff", run, Bundle().apply { putStringArrayList("packages", arrayListOf("org.example.app")) })
+        }
+        ShadowBinder.setCallingUid(companionUid + 1)
+        assertThrows(SecurityException::class.java) { provider.call("endHandoff", run, Bundle().apply { putString("outcome", "success") }) }
+        assertThrows(SecurityException::class.java) { provider.call("getCurrentSession", null, null) }
+    }
+
+    @Test fun getHandoffWithNeitherCallerInstalledSaysSo() {
+        shadowOf(context.packageManager).removePackage(companion)
+        val error = assertThrows(SecurityException::class.java) {
+            provider.call("getHandoff", "00000000-0000-0000-0000-000000003527", null)
+        }
+        assertEquals("Transfer caller is not installed", error.message)
     }
 }

@@ -2,4 +2,6 @@
 <resources>
     <color name="colorBackground">#01875f</color>
     <color name="colorForeground">@android:color/white</color>
+    <!-- Transferred apps (CYC-3525): Transfer Phone v3's ground, so the window never flashes another colour. -->
+    <color name="migration_results_ground">#FAF9F6</color>
 </resources>

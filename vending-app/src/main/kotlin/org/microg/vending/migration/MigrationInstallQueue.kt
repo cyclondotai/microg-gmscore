@@ -236,6 +236,28 @@ internal class MigrationInstallQueue(private val context: Context,
     private fun legacy() = !prefs.contains("sessions") && prefs.contains("packages")
     fun currentSessionId(): String? = prefs.getString("current_session", null)
     fun sessions(): List<String> = prefs.getString("sessions", "").orEmpty().split(',').filter { it.isNotEmpty() }
+    /** Whether [id] lists any app, chosen or left out. */
+    fun hasApps(id: String): Boolean = selected(id).isNotEmpty() || prefs.getStringSet("$id:excluded", null)?.isNotEmpty() == true
+    /**
+     * The transfer the results screen opens on: [requestedId] when it names a known transfer, else the current one when it
+     * lists apps, else the latest that does. An empty transfer (a hand-off cancelled before any app was chosen) never hides
+     * an earlier one with apps; with none, the current transfer.
+     */
+    fun resultsSession(requestedId: String? = null): String? {
+        val ids = sessions()
+        requestedId?.takeIf { it in ids }?.let { return it }
+        val current = currentSessionId()
+        if (current != null && hasApps(current)) return current
+        return ids.firstOrNull(::hasApps) ?: current
+    }
+    /** How many apps [id] lists, chosen or left out. */
+    fun appCount(id: String): Int {
+        val selected = selected(id)
+        return selected.size + prefs.getStringSet("$id:excluded", emptySet()).orEmpty().count { it !in selected }
+    }
+    /** Transfers worth offering in the results screen's picker, newest first: those with apps, and [requestedId]. */
+    fun visibleSessions(requestedId: String? = null): List<String> =
+        sessions().filter { it == requestedId || hasApps(it) }
     fun beginTransfer(): String {
         val id = synchronized(LOCK) { newSession() }
         acknowledgeTransferStart(id)
@@ -382,6 +404,7 @@ internal class MigrationInstallQueue(private val context: Context,
             if (offset + names.size < selected.size) putInt("next_offset", offset + names.size)
             putStringArrayList("packages", ArrayList(names))
             putStringArrayList("titles", ArrayList(names.map { name -> (snapshot["$id:$name:title"] as? String)?.take(80) ?: name }))
+            putStringArrayList("icon_urls", ArrayList(names.map { name -> (snapshot["$id:$name:icon_url"] as? String).orEmpty() }))
             putLongArray("install_sizes", LongArray(names.size) { i -> (snapshot["$id:${names[i]}:installSize"] as? Long)?.takeIf { it > 0L } ?: 0L })
             putBoolean("bulk_deferred", id != null && isBulkDeferred(snapshot, id))
             val pending = snapshot["$id:pending"] as? Set<*> ?: emptySet<String>()
@@ -489,15 +512,21 @@ internal class MigrationInstallQueue(private val context: Context,
         if (prefs.getString("$id:transfer_outcome", null) != null) return null
         return id
     }
+    /**
+     * Switch's Pause (op 13) when its copy starts. A hand-off session Transfer Phone just began (beginHandoff) and nothing
+     * has been chosen or checked in yet is this copy's session: it is reused rather than replaced, which used to strand it
+     * as an empty transfer in the results screen's list (CYC-3525).
+     */
     fun startPausedTransfer(): String {
         val (id, created) = synchronized(LOCK) {
             val bound = activeUnclosedHandoffSession()
-            if (bound != null && prefs.getBoolean("$bound:selected", false)) {
+            val selected = bound != null && prefs.getBoolean("$bound:selected", false)
+            if (bound != null && (selected || untouched(bound))) {
                 val now = clock()
                 if (isBulkDeferred(bound, now)) {
                     check(prefs.edit().putLong("$bound:defer_bulk_at", now).commit())
                 }
-                bound to false
+                bound to (!selected && !prefs.getBoolean("$bound:start_acknowledged", false))
             } else {
                 currentSessionId()?.let { if (prefs.getBoolean("$it:pause_requested", false)) resume(it) }
                 newSession() to true
@@ -506,6 +535,9 @@ internal class MigrationInstallQueue(private val context: Context,
         if (created) acknowledgeTransferStart(id)
         return id
     }
+    /** No app chosen, left out or checked in [id] yet. */
+    private fun untouched(id: String): Boolean = !prefs.getBoolean("$id:selected", false) && selected(id).isEmpty() &&
+        prefs.getStringSet("$id:excluded", emptySet()).isNullOrEmpty()
     fun catalogSession(): String {
         val (id, created) = synchronized(LOCK) {
             val current = currentSessionId()
@@ -1022,6 +1054,64 @@ internal class MigrationInstallQueue(private val context: Context,
         !prefs.getBoolean("$id:$name:install_dispatched", false) &&
         !prefs.getBoolean("$id:$name:acknowledged", false) &&
         !prefs.getBoolean("$id:$name:ever_installed", false)
+    /**
+     * [summary]'s receipt as last saved, read from one preferences snapshot: no Aurora call, no wait for [LOCK]. The results
+     * screen draws this at once and on every change while [summary] checks the open apps with Aurora in the background.
+     * An app waiting to be handed to Aurora (an owner Retry included) reads as pending, not as its previous attempt.
+     */
+    fun cachedSummary(id: String): Bundle {
+        val snapshot = prefs.all
+        fun set(key: String) = (snapshot[key] as? Set<*>)?.filterIsInstance<String>().orEmpty().toSet()
+        fun string(key: String) = snapshot[key] as? String
+        fun flag(key: String) = snapshot[key] == true
+        val selected = set("$id:packages")
+        val pendingSet = set("$id:pending")
+        val bulkDeferred = isBulkDeferred(snapshot, id)
+        val prioritySet = if (bulkDeferred) {
+            string("$id:priority_order")?.split(',')?.filter { it.isNotEmpty() }?.toSet() ?: set("$id:priority")
+        } else emptySet()
+        fun row(name: String, excluded: Boolean) = Bundle().apply {
+            putString("package_name", name)
+            for (key in listOf("title", "icon_url", "developer_name", "error", "errorCode")) putString(key, string("$id:$name:$key"))
+            putLong("version_code", snapshot["$id:$name:expectedVersion"] as? Long ?: 0L)
+            putLong("installed_version_code", snapshot["$id:$name:installedVersion"] as? Long ?: 0L)
+            putLong("install_size", snapshot["$id:$name:installSize"] as? Long ?: 0L)
+            val installed = flag("$id:$name:installed")
+            val pending = name in pendingSet
+            val rawStatus = string("$id:$name:status")
+            val status = when {
+                pending -> "pending"
+                rawStatus == "none" && installed -> "installed"
+                excluded && rawStatus.isNullOrEmpty() -> "unavailable"
+                else -> rawStatus
+            }
+            putString("status", status)
+            if (pending) { remove("error"); remove("errorCode") }
+            putBoolean("installed", installed && !pending)
+            putBoolean("terminal", excluded || (!pending && (installed || flag("$id:$name:terminal"))))
+            putBoolean("excluded", excluded)
+            putBoolean("recoverable", excluded && flag("$id:$name:recoverable"))
+        }
+        val results = selected.sorted().map { row(it, excluded = false) } +
+            set("$id:excluded").filter { it !in selected }.sorted().map { row(it, excluded = true) }
+        val activePending = if (bulkDeferred) pendingSet.any { it in prioritySet } else pendingSet.isNotEmpty()
+        val hasActiveWork = activePending || results.any { row ->
+            val pkg = row.getString("package_name").orEmpty()
+            !row.getBoolean("terminal") && !(bulkDeferred && pkg in pendingSet && pkg !in prioritySet)
+        }
+        return Bundle().apply {
+            putString("session_id", id); putParcelableArray("cyclon_app_results", results.toTypedArray())
+            putString("transfer_outcome", string("$id:transfer_outcome"))
+            putBoolean("all_installed", results.all { it.getBoolean("installed") })
+            putBoolean("selection_closed", flag("$id:selection_closed"))
+            putBoolean("installs_settled", pendingSet.isEmpty() && results.all { it.getBoolean("terminal") })
+            putBoolean("bulk_deferred", bulkDeferred)
+            putBoolean("has_active_work", hasActiveWork)
+            putBoolean("complete", getBoolean("selection_closed") && getBoolean("installs_settled"))
+            putBundle("setup_options", options(id))
+            putString("cyclon_hold_state", if (getBoolean("complete")) "complete" else "installing")
+        }
+    }
     /**
      * Every app's state, asked of Aurora before taking [LOCK] (one call per open app): Switch's next chunk and its status
      * calls never wait for these round trips, only for the bookkeeping after them.

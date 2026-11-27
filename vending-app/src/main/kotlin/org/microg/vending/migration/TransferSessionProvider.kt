@@ -20,10 +20,14 @@ class TransferSessionProvider : ContentProvider() {
         val context = requireNotNull(context)
         val uid = Binder.getCallingUid()
         val manager = context.packageManager
-        val caller = if (method == "getHandoff" || method == "cancelHandoff" || method == "prioritizeHandoff" || method == "releaseBulkHandoff") CORE else COMPANION
-        val app = try { manager.getApplicationInfo(caller, 0) }
-        catch (_: PackageManager.NameNotFoundException) { throw SecurityException("Transfer caller is not installed") }
-        checkCaller(app, uid, manager, caller)
+        // getHandoff is a read-only receipt: Core reads it for Setup, and Transfer Phone reads it for its App installs card
+        // (CYC-3525). Every other method keeps exactly one trusted caller.
+        val callers = when (method) {
+            "getHandoff" -> listOf(CORE, COMPANION)
+            "cancelHandoff", "prioritizeHandoff", "releaseBulkHandoff" -> listOf(CORE)
+            else -> listOf(COMPANION)
+        }
+        checkCaller(callers, uid, manager)
         if (method == "prioritizeHandoff") {
             // Setup's sign-in apps go to Aurora first (Core's setup.transfer.handoff.prioritize).
             val run = requireNotNull(arg).also { require(RUN.matches(it)) { "Invalid transfer run" } }
@@ -80,10 +84,21 @@ class TransferSessionProvider : ContentProvider() {
         } finally { Binder.restoreCallingIdentity(identity) }
     }
 
-    private fun checkCaller(app: ApplicationInfo, uid: Int, manager: PackageManager, caller: String) {
+    /** The calling UID must be one of [callers], installed as a platform-signed system app. */
+    private fun checkCaller(callers: List<String>, uid: Int, manager: PackageManager) {
+        var installed = false
+        for (caller in callers) {
+            val app = try { manager.getApplicationInfo(caller, 0) } catch (_: PackageManager.NameNotFoundException) { continue }
+            installed = true
+            if (trusted(app, uid, manager, caller)) return
+        }
+        throw SecurityException(if (installed) "Untrusted transfer caller" else "Transfer caller is not installed")
+    }
+
+    private fun trusted(app: ApplicationInfo, uid: Int, manager: PackageManager, caller: String): Boolean {
         val system = app.flags and (ApplicationInfo.FLAG_SYSTEM or ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
         val platform = uid == Process.SYSTEM_UID || manager.checkSignatures("android", caller) == PackageManager.SIGNATURE_MATCH
-        if (app.uid != uid || !system || !platform) throw SecurityException("Untrusted transfer caller")
+        return app.uid == uid && system && platform
     }
 
     override fun query(uri: Uri, projection: Array<out String>?, selection: String?, selectionArgs: Array<out String>?, sortOrder: String?): Cursor? = unsupported()

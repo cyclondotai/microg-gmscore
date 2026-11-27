@@ -381,7 +381,10 @@ class MigrationPriorityTest {
         assertEquals(listOf("com.tiny.util", "com.large.game"), handed)
     }
 
-    /** R1 + R4: Switch Pause (op 13) rebinds handoff_session A -> B without dropping defer_bulk or rolling-window order. */
+    /**
+     * R1 + R4: Switch Pause (op 13) keeps defer_bulk and the rolling-window order. Since CYC-3525 it reuses the hand-off
+     * session Transfer Phone began (nothing chosen yet) instead of rebinding it to a new one.
+     */
     @Test fun r1DeferBulkSurvivesSwitchPauseRebindAndRollingWindowOrder() {
         val handed = mutableListOf<String>()
         val queue = MigrationInstallQueue(context) { operation, name ->
@@ -392,7 +395,8 @@ class MigrationPriorityTest {
         assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
         val sessionA = queue.currentSessionId()!!
         val sessionB = queue.startPausedTransfer()
-        assertNotEquals(sessionA, sessionB)
+        assertEquals(sessionA, sessionB)
+        assertEquals(listOf(sessionB), queue.sessions())
         assertEquals(sessionB, queue.catalogSession())
 
         queue.select(listOf(
@@ -412,7 +416,6 @@ class MigrationPriorityTest {
         assertEquals(sessionB, receipt.getString("session_id"))
         assertTrue(receipt.getBoolean("bulk_deferred"))
         assertTrue(queue.isBulkDeferred(sessionB))
-        assertFalse(queue.isBulkDeferred(sessionA))
         assertTrue(queue.dispatchOrder().isEmpty())
 
         // Rolling ≤5 lookahead: admit [a,b,c,d,e], dispatch a, then send full ordered window [b,c,d,e,f].
