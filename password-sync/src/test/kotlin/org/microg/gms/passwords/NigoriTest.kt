@@ -70,20 +70,26 @@ class NigoriTest {
         val shared = bytes("synthetic trusted vault shared key")
         val trusted = NigoriKey.derive(Base64.getEncoder().encode(shared))
         val trustedMeta = Proto.field(3, Proto.field(1, trusted.encrypt(Proto.field(2, trusted.export()))) + Proto.integer(2, 5))
-        assertThrows(VaultLockedException::class.java) { VaultKeys.unlock(trustedMeta) }
+        val trustedError = assertThrows(VaultLockedException::class.java) { VaultKeys.unlock(trustedMeta) }
+        assertFalse("trusted vault must not throw PassphraseRequiredException", trustedError is PassphraseRequiredException)
         VaultKeys.unlock(trustedMeta, listOf(shared)).destroy()
         val password = bytes("synthetic custom sync passphrase")
-        for (scrypt in listOf(false, true)) {
-            val key = if (scrypt) NigoriKey.deriveScrypt(password, bytes("synthetic salt")) else NigoriKey.derive(password)
-            val specifics = Proto.field(1, key.encrypt(Proto.field(2, key.export()))) + Proto.integer(2, 4) +
-                Proto.integer(5, if (scrypt) 2 else 1) +
-                if (scrypt) Proto.field(6, Base64.getEncoder().encode(bytes("synthetic salt"))) else byteArrayOf()
-            val metadata = Proto.field(3, specifics)
-            VaultKeys.unlock(metadata, customPassphrase = password).destroy()
-            val imported = VaultKeys.keyForPassphrase(metadata, password)
-            VaultKeys.unlock(metadata, customKey = imported.export()).destroy()
-            assertThrows(VaultLockedException::class.java) { VaultKeys.unlock(metadata, customPassphrase = bytes("wrong")) }
-            imported.destroy(); key.destroy()
+        for (passphraseType in listOf(1L, 3L, 4L)) {
+            for (scrypt in listOf(false, true)) {
+                val key = if (scrypt) NigoriKey.deriveScrypt(password, bytes("synthetic salt")) else NigoriKey.derive(password)
+                val specifics = Proto.field(1, key.encrypt(Proto.field(2, key.export()))) + Proto.integer(2, passphraseType) +
+                    Proto.integer(5, if (scrypt) 2 else 1) +
+                    if (scrypt) Proto.field(6, Base64.getEncoder().encode(bytes("synthetic salt"))) else byteArrayOf()
+                val metadata = Proto.field(3, specifics)
+                assertThrows(PassphraseRequiredException::class.java) { VaultKeys.unlock(metadata) }
+                VaultKeys.unlock(metadata, customPassphrase = password).destroy()
+                val imported = VaultKeys.keyForPassphrase(metadata, password)
+                VaultKeys.unlock(metadata, customKey = imported.export()).destroy()
+                assertThrows(PassphraseRequiredException::class.java) { VaultKeys.unlock(metadata, customPassphrase = bytes("wrong")) }
+                val wrongKey = NigoriKey.derive(bytes("wrong"))
+                assertThrows(PassphraseRequiredException::class.java) { VaultKeys.unlock(metadata, customKey = wrongKey.export()) }
+                wrongKey.destroy(); imported.destroy(); key.destroy()
+            }
         }
     }
 

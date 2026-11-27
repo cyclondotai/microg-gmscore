@@ -130,4 +130,5 @@ class Proto private constructor(private val parts: List<Part>) {
 }
 
 class ProtocolException : Exception("Invalid password protocol data")
-class VaultLockedException : Exception("Password vault requires owner authentication")
+open class VaultLockedException(message: String = "Password vault requires owner authentication") : Exception(message)
+class PassphraseRequiredException : VaultLockedException("Password vault requires explicit sync passphrase")

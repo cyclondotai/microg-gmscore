@@ -107,6 +107,64 @@ object VaultRecovery {
         return replacement?.id
     }
 
+    /**
+     * Validates explicit passphrase key material ([exported]) against cached Nigori metadata, or synchronously fetches
+     * fresh metadata when local metadata is missing (cold vault) or stale (passphrase change/reset). Never overwrites
+     * [VaultState.metadata] before an authenticated snapshot sync; fresh metadata is stored in [VaultState.pendingMetadata].
+     */
+    fun acceptCustomKey(
+        store: VaultStore,
+        exported: ByteArray,
+        expectedVaultParent: String? = null,
+        authorize: () -> Unit = {},
+        fetchMetadata: () -> ByteArray
+    ) {
+        val unlockedLocally = store.locked { session ->
+            authorize()
+            val state = session.load()
+            val cached = state.pendingMetadata ?: state.metadata ?: return@locked false
+            if (expectedVaultParent != null && Proto.decode(cached).string(1) != expectedVaultParent) throw VaultResetException()
+            try {
+                VaultKeys.unlock(cached, customKey = exported).destroy()
+            } catch (_: VaultLockedException) {
+                return@locked false
+            }
+            state.customKey = exported.copyOf()
+            session.save(state)
+            true
+        }
+        if (unlockedLocally) return
+        val fetched = fetchMetadata()
+        val newParent = PasswordApi.checkedParent(Proto.decode(fetched).string(1))
+        if (expectedVaultParent != null && newParent != expectedVaultParent) throw VaultResetException()
+        store.locked { session ->
+            authorize()
+            val state = session.load()
+            VaultKeys.unlock(fetched, customKey = exported).destroy()
+            val oldParent = state.metadata?.let { Proto.decode(it).string(1) }
+            if (oldParent != null && oldParent != newParent) {
+                state.versionedTrustedVaultKeys?.destroy(); state.versionedTrustedVaultKeys = null
+            }
+            if (state.metadata == null || !state.metadata!!.contentEquals(fetched)) {
+                state.pendingMetadata = fetched
+            }
+            state.customKey = exported.copyOf()
+            session.save(state)
+        }
+    }
+
+    /** True when [state] has no authenticated metadata yet, or has newer explicit-passphrase [VaultState.pendingMetadata] unlocked by [VaultState.customKey] without blocking a pending remote-reset outbox. */
+    fun needsCustomKeyRefresh(state: VaultState): Boolean {
+        val current = state.metadata ?: return true
+        val pending = state.pendingMetadata ?: return false
+        val customKey = state.customKey ?: return false
+        if (current.contentEquals(pending)) return false
+        if (Proto.decode(current).string(1) != Proto.decode(pending).string(1) && state.mutations.isNotEmpty()) return false
+        val pendingType = Proto.decode(Proto.decode(pending).one(3)).integer(2)
+        if (pendingType !in setOf(1L, 3L, 4L)) return false
+        return try { VaultKeys.unlock(pending, customKey = customKey).destroy(); true } catch (_: VaultLockedException) { false }
+    }
+
     /** Keeps no stale outbox eligible for the replacement vault. Never resets Google's vault. */
     fun acceptRemoteReset(session: VaultSession) {
         val state = session.load()

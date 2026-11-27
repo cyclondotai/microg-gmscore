@@ -99,10 +99,10 @@ class PasswordRepository private constructor(context: Context, val account: Acco
 
     override fun list(ensureInitialSync: Boolean): List<PasswordView> {
         checkEnabled()
-        if (ensureInitialSync && store.locked { it.load().metadata == null }) refresh()
+        if (ensureInitialSync && store.locked { VaultRecovery.needsCustomKeyRefresh(it.load()) }) refresh()
         return store.locked { session ->
             val state = session.load()
-            val metadata = state.metadata ?: throw VaultLockedException()
+            val metadata = requireMetadata(state)
             checkSnapshotParent(metadata)
             val keys = unlock(metadata, state.customKey, state.trustedVaultKeys)
             try {
@@ -142,7 +142,7 @@ class PasswordRepository private constructor(context: Context, val account: Acco
         val tag = data.tag()
         store.locked { session ->
             val state = session.load()
-            val keys = unlock(state.metadata ?: throw VaultLockedException(), state.customKey, state.trustedVaultKeys)
+            val keys = unlock(requireMetadata(state), state.customKey, state.trustedVaultKeys)
             try {
                 if (automatic) for (raw in visibleRecords(state).values) {
                     val existing = PasswordResourceCodec.read(raw, keys)
@@ -254,18 +254,21 @@ class PasswordRepository private constructor(context: Context, val account: Acco
     override fun acceptRemoteReset() { checkEnabled(); store.locked(VaultRecovery::acceptRemoteReset); schedule() }
 
     override fun setCustomKey(encryption: ByteArray, mac: ByteArray) {
-        checkEnabled()
-        val candidate = NigoriKey(encryption, mac)
-        val exported = candidate.export()
-        candidate.destroy()
-        try {
-            store.locked { session ->
-                val state = session.load()
-                VaultKeys.unlock(state.pendingMetadata ?: state.metadata ?: throw VaultLockedException(), customKey = exported).destroy()
-                state.customKey = exported.copyOf()
-                session.save(state)
-            }
-        } finally { exported.fill(0) }
+        LocalKeyManager.getInstance(context).withRecoveryAuthority(account.name, userId) {
+            checkEnabled()
+            val candidate = NigoriKey(encryption, mac)
+            val exported = candidate.export()
+            candidate.destroy()
+            try {
+                VaultRecovery.acceptCustomKey(
+                    store = store,
+                    exported = exported,
+                    expectedVaultParent = expectedVaultParent,
+                    authorize = ::checkEnabled,
+                    fetchMetadata = { PasswordApi(authenticatedTransport()).metadata() }
+                )
+            } finally { exported.fill(0) }
+        }
         schedule()
     }
 
@@ -428,6 +431,12 @@ class PasswordRepository private constructor(context: Context, val account: Acco
     private fun checkAccount() {
         if (!accounts.getAccountsByType("com.google").contains(account) || accounts.getUserData(account, "GoogleUserId") != userId ||
             !DeviceAccount.mayShow(context, account)) throw VaultLockedException()
+    }
+    private fun requireMetadata(state: VaultState): ByteArray = state.metadata ?: run {
+        state.pendingMetadata?.let { pending ->
+            if (Proto.decode(Proto.decode(pending).one(3)).integer(2) in setOf(1L, 3L, 4L)) throw PassphraseRequiredException()
+        }
+        throw VaultLockedException()
     }
     private fun checkSnapshotParent(metadata: ByteArray) {
         if (expectedVaultParent != null && Proto.decode(metadata).string(1) != expectedVaultParent) throw VaultResetException()

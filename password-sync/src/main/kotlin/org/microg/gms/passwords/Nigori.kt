@@ -125,9 +125,11 @@ class VaultKeys private constructor(private val keys: Map<String, NigoriKey>, va
             val meta = Proto.decode(metadata)
             val specifics = Proto.decode(meta.one(3))
             val bag = specifics.one(1)
+            val passphraseType = specifics.integer(2)
+            val explicitPassphrase = passphraseType in setOf(1L, 3L, 4L)
             val candidates = ArrayList<NigoriKey>()
             try {
-                when (specifics.integer(2)) {
+                when (passphraseType) {
                     2L -> {
                         val token = specifics.one(3)
                         for (raw in meta.bytes(2)) {
@@ -145,14 +147,15 @@ class VaultKeys private constructor(private val keys: Map<String, NigoriKey>, va
                         if (customKey != null) {
                             candidates.add(NigoriKey.fromProto(customKey))
                         } else {
-                        val password = customPassphrase ?: throw VaultLockedException()
-                        candidates.add(keyForPassphrase(metadata, password))
+                            val password = customPassphrase ?: throw PassphraseRequiredException()
+                            candidates.add(keyForPassphrase(metadata, password))
                         }
                     }
                     else -> throw VaultLockedException()
                 }
                 val defaultName = Proto.decode(bag).string(1)
-                val wrapping = candidates.firstOrNull { Proto.utf8(it.name()) == defaultName } ?: throw VaultLockedException()
+                val wrapping = candidates.firstOrNull { Proto.utf8(it.name()) == defaultName }
+                    ?: throw if (explicitPassphrase) PassphraseRequiredException() else VaultLockedException()
                 val plain = wrapping.decrypt(bag)
                 val imported = try { Proto.decode(plain).bytes(2).map { NigoriKey.fromProto(it) } } finally { plain.fill(0) }
                 val keyMap = imported.associateBy { Proto.utf8(it.name()) }

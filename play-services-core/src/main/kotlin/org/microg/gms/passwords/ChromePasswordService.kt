@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.os.IBinder
 import android.os.Parcel
 import android.os.Parcelable
+import android.util.Log
 import androidx.lifecycle.lifecycleScope
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.Feature
@@ -27,7 +28,12 @@ import org.microg.gms.common.GooglePackagePermission
 import org.microg.gms.common.PackageUtils
 
 /** Independently implemented Chrome first-party wire contract (GMS 26.11, service 303). */
-class ChromePasswordService : BaseService("ChromePasswordService", GmsService.CHROME_SYNC_FIRST_PARTY) {
+open class ChromePasswordService : BaseService("ChromePasswordService", GmsService.CHROME_SYNC_FIRST_PARTY) {
+    internal open fun openVault(account: Account?): PasswordVault =
+        account?.let { PasswordRepository(this, it) } ?: DevicePasswordVault(this)
+
+    internal fun createBinder(uid: Int, account: Account?): Binder = ChromeBinder(uid, account)
+
     override fun handleServiceRequest(callback: IGmsCallbacks, request: GetServiceRequest, service: GmsService) {
         val caller = PackageUtils.getAndCheckCallingPackage(this, request.packageName)
         if (android.os.Build.VERSION.SDK_INT < 26 || caller == null ||
@@ -36,7 +42,7 @@ class ChromePasswordService : BaseService("ChromePasswordService", GmsService.CH
             return
         }
         callback.onPostInitCompleteWithConnectionInfo(ConnectionResult.SUCCESS,
-            ChromeBinder(Binder.getCallingUid(), request.account), ConnectionInfo().apply {
+            createBinder(Binder.getCallingUid(), request.account), ConnectionInfo().apply {
                 features = arrayOf(Feature("FIRSTPARTY_CHROME", 1),
                     Feature("FIRSTPARTY_SET_CUSTOM_PASSPHRASE_DECRYPTION_KEY_MATERIAL", 1))
             })
@@ -82,8 +88,7 @@ class ChromePasswordService : BaseService("ChromePasswordService", GmsService.CH
                 var values: List<ByteArray>? = null
                 var setting: String? = null
                 try {
-                    val repository: PasswordVault = account?.let { PasswordRepository(this@ChromePasswordService, it) }
-                        ?: DevicePasswordVault(this@ChromePasswordService)
+                    val repository: PasswordVault = openVault(account)
                     when (code) {
                         2 -> values = repository.list(true).filter { selected!!.accepts(it.data) }.map { it.chromeBytes }
                         3 -> repository.upsert(payload!!)
@@ -115,10 +120,10 @@ class ChromePasswordService : BaseService("ChromePasswordService", GmsService.CH
                         }
                         9 -> repository.setCustomKey(encKey ?: throw ProtocolException(), macKey ?: throw ProtocolException())
                     }
-                } catch (_: VaultLockedException) { status = Status(4) }
-                catch (_: ConflictException) { status = Status(13) }
-                catch (_: PendingMutationException) { status = Status(13) }
-                catch (_: Exception) { status = Status.INTERNAL_ERROR }
+                } catch (failure: Exception) {
+                    status = statusForError(code, failure)
+                    Log.w(LOG_TAG, "onTransact failed: code=$code status=${status.statusCode} error=${failure::class.simpleName}")
+                }
                 finally { payload?.fill(0); encKey?.fill(0); macKey?.fill(0) }
                 try {
                     when (code) {
@@ -138,11 +143,21 @@ class ChromePasswordService : BaseService("ChromePasswordService", GmsService.CH
     }
 
     companion object {
+        private const val LOG_TAG = "ChromePasswordService"
+        /** Chromium AndroidBackendAPIErrorCode::kPassphraseRequired — triggers SendExplicitPassphraseToPlatformClient(). */
+        internal const val STATUS_PASSPHRASE_REQUIRED = 11000
         const val DESCRIPTOR = "com.google.android.gms.chromesync.firstparty.internal.IChromeSyncApiService"
         private const val LIST_CALLBACK = "com.google.android.gms.chromesync.firstparty.internal.IListPasswordsResultCallback"
         private const val DATA_CALLBACK = "com.google.android.gms.chromesync.common.internal.IDataHolderResultCallback"
         private const val SETTINGS_CALLBACK = "com.google.android.gms.chromesync.firstparty.internal.ISettingsCallback"
         private const val STATUS_CALLBACK = "com.google.android.gms.common.api.internal.IStatusCallback"
+
+        internal fun statusForError(code: Int, failure: Throwable): Status = when (failure) {
+            is PassphraseRequiredException -> Status(if (code == 9) 4 else STATUS_PASSPHRASE_REQUIRED)
+            is VaultLockedException -> Status(4)
+            is ConflictException, is PendingMutationException -> Status(13)
+            else -> Status.INTERNAL_ERROR
+        }
         private fun sendRows(callback: IBinder, descriptor: String, status: Status, values: List<ByteArray>?, listInfo: Boolean) {
             val rows = values?.let { entries -> DataHolder.builder(arrayOf("value")).apply {
                 entries.forEach { value -> withRow(ContentValues().apply { put("value", value) }) }
