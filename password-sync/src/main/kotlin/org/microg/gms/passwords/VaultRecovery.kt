@@ -153,6 +153,19 @@ object VaultRecovery {
         }
     }
 
+    /**
+     * Throws [PassphraseRequiredException] when newer server metadata in [VaultState.pendingMetadata] requires an
+     * explicit sync passphrase that [VaultState.customKey] does not satisfy, so Chrome receives 11000 and sends the key
+     * instead of silently reading or writing against an older cached snapshot.
+     */
+    fun checkPendingPassphrase(state: VaultState) {
+        val pending = state.pendingMetadata ?: return
+        val pendingType = Proto.decode(Proto.decode(pending).one(3)).integer(2)
+        if (pendingType !in setOf(1L, 3L, 4L)) return
+        val customKey = state.customKey ?: throw PassphraseRequiredException()
+        VaultKeys.unlock(pending, customKey = customKey).destroy()
+    }
+
     /** True when [state] has no authenticated metadata yet, or has newer explicit-passphrase [VaultState.pendingMetadata] unlocked by [VaultState.customKey] without blocking a pending remote-reset outbox. */
     fun needsCustomKeyRefresh(state: VaultState): Boolean {
         val current = state.metadata ?: return true

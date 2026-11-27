@@ -143,6 +143,31 @@ class VaultRecoveryTest {
             val pendingOutbox = Mutation("m1", MutationKind.DELETE, "tag1", "name1", byteArrayOf(1), null)
             val withOutbox = VaultState(metadata = meta1, pendingMetadata = meta2, customKey = key2.copyOf(), mutations = mutableListOf(pendingOutbox))
             assertFalse(VaultRecovery.needsCustomKeyRefresh(withOutbox))
+
+            // 6) Warm keystore snapshot receiving explicit-passphrase pendingMetadata: requires 11000 until Chrome sends the key.
+            val rawKeystore = "synthetic keystore key".toByteArray()
+            val ksWrap = NigoriKey.derive(Base64.getEncoder().encode(rawKeystore))
+            val ksData = NigoriKey.derive("synthetic data key".toByteArray())
+            val ksMeta = Proto.field(1, "users/me/birthdays/fixture1") + Proto.field(2, rawKeystore) +
+                Proto.field(3, Proto.field(1, ksData.encrypt(Proto.field(2, ksData.export()))) + Proto.integer(2, 2) + Proto.field(3, ksWrap.encrypt(ksData.export())))
+            ksWrap.destroy(); ksData.destroy()
+            val upgraded = MemoryStore(VaultState(metadata = ksMeta, pendingMetadata = meta1))
+            assertFalse("without customKey, refresh would still fail; checkPendingPassphrase must surface 11000", VaultRecovery.needsCustomKeyRefresh(upgraded.current()))
+            assertThrows(PassphraseRequiredException::class.java) { VaultRecovery.checkPendingPassphrase(upgraded.current()) }
+            val wrongUpgraded = VaultState(metadata = ksMeta, pendingMetadata = meta1, customKey = wrongKey.copyOf())
+            assertThrows(PassphraseRequiredException::class.java) { VaultRecovery.checkPendingPassphrase(wrongUpgraded) }
+            val fetchesBefore = fetches
+            VaultRecovery.acceptCustomKey(upgraded, key1) { fetches++; meta1 }
+            assertEquals("uses cached pendingMetadata without network fetch", fetchesBefore, fetches)
+            VaultRecovery.checkPendingPassphrase(upgraded.current())
+            assertTrue("once key1 is saved, list(true) triggers refresh from keystore to custom passphrase", VaultRecovery.needsCustomKeyRefresh(upgraded.current()))
+
+            // Trusted-vault pendingMetadata is not an explicit passphrase and must not throw PassphraseRequiredException.
+            val trustedKey = NigoriKey.derive(Base64.getEncoder().encode(ByteArray(32) { 7 }))
+            val trustedPending = Proto.field(1, "users/me/birthdays/trusted") + Proto.field(3,
+                Proto.field(1, trustedKey.encrypt(Proto.field(2, trustedKey.export()))) + Proto.integer(2, 5))
+            trustedKey.destroy()
+            VaultRecovery.checkPendingPassphrase(VaultState(metadata = ksMeta, pendingMetadata = trustedPending))
         } finally {
             key1.fill(0); key2.fill(0); wrongKey.fill(0)
         }

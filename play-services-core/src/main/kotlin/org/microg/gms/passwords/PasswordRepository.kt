@@ -432,11 +432,9 @@ class PasswordRepository private constructor(context: Context, val account: Acco
         if (!accounts.getAccountsByType("com.google").contains(account) || accounts.getUserData(account, "GoogleUserId") != userId ||
             !DeviceAccount.mayShow(context, account)) throw VaultLockedException()
     }
-    private fun requireMetadata(state: VaultState): ByteArray = state.metadata ?: run {
-        state.pendingMetadata?.let { pending ->
-            if (Proto.decode(Proto.decode(pending).one(3)).integer(2) in setOf(1L, 3L, 4L)) throw PassphraseRequiredException()
-        }
-        throw VaultLockedException()
+    private fun requireMetadata(state: VaultState): ByteArray {
+        VaultRecovery.checkPendingPassphrase(state)
+        return state.metadata ?: throw VaultLockedException()
     }
     private fun checkSnapshotParent(metadata: ByteArray) {
         if (expectedVaultParent != null && Proto.decode(metadata).string(1) != expectedVaultParent) throw VaultResetException()
