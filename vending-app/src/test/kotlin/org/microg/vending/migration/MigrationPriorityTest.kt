@@ -1047,4 +1047,125 @@ class MigrationPriorityTest {
         assertEquals(pendingHints.take(190) + queued, batch)
         assertTrue("overflowing pending hints must keep priority_dirty set", prefs.getBoolean("$id:priority_dirty", false))
     }
+
+    /** Round-3 Opus P2: stopping DEFER_WAKE_JOB must never cancel a concurrently started primary JOB. */
+    @Test fun perJobIdCancellationIsolatesDeferredWakeStopFromPrimaryJob() {
+        val controller = Robolectric.buildService(MigrationInstallJob::class.java).create()
+        try {
+            val job = controller.get()
+            val wakeFlag = job.registerJobForTests(MigrationInstallQueue.DEFER_WAKE_JOB)
+            val primaryFlag = job.registerJobForTests(MigrationInstallQueue.JOB)
+
+            assertTrue(job.stopJobById(MigrationInstallQueue.DEFER_WAKE_JOB))
+            assertTrue("stopping DEFER_WAKE_JOB must cancel DEFER_WAKE_JOB", wakeFlag.get())
+            assertFalse("stopping DEFER_WAKE_JOB must not cancel primary JOB", primaryFlag.get())
+
+            // Primary JOB still runs to completion using its uncancelled flag.
+            val handed = mutableListOf<String>()
+            val queue = MigrationInstallQueue(context) { operation, name ->
+                if (operation == 2) { handed += name; state(name, "queued") } else state(name, "none")
+            }
+            assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = false).getBoolean("accepted"))
+            queue.select(listOf(doc("com.primary.app")))
+            var finishedReschedule: Boolean? = null
+            job.runJob(MigrationInstallQueue.JOB, cancelled = primaryFlag, queue = queue, deadlineNanos = System.nanoTime()) {
+                finishedReschedule = it
+            }
+            assertEquals(listOf("com.primary.app"), handed)
+            assertNotNull(finishedReschedule)
+
+            // Destroying the service cancels all remaining active job flags.
+            job.onDestroy()
+            assertTrue(primaryFlag.get())
+        } finally {
+            controller.destroy()
+        }
+    }
+
+    /** Round-3 Sol P2: repeated Switch Pause heartbeat extends 12h cap, and runJob uses one clock sample at finish. */
+    @Test fun repeatedSwitchPauseRefreshesDeferralHeartbeatAndRunJobFinishUsesSingleClockSample() {
+        val scheduler = context.getSystemService(Context.JOB_SCHEDULER_SERVICE) as JobScheduler
+        val startMs = 1_700_000_000_000L
+        var nowMs = startMs
+        val queue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, _ ->
+                when (operation) {
+                    4, 5 -> Bundle().apply { putBoolean("success", true) }
+                    7 -> Bundle().apply { putBoolean("automatic_update_hold", true) }
+                    else -> Bundle()
+                }
+            },
+            storeCall = { _, name -> state(name, "none") },
+        ).apply { clock = { nowMs } }
+
+        assertTrue(queue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
+        val sessionId = queue.startPausedTransfer()
+        assertTrue(queue.pause(sessionId).getBoolean("success"))
+        queue.select(listOf(doc("com.bulk.app")))
+
+        // Switch Pause heartbeat at +8h refreshes defer_bulk_at so the active copy stays deferred until +20h.
+        nowMs = startMs + 8L * 60L * 60_000L
+        assertEquals(sessionId, queue.startPausedTransfer())
+        nowMs = startMs + 19L * 60L * 60_000L
+        assertTrue("Switch Pause heartbeat must keep >12h active copy deferred", queue.isBulkDeferred(sessionId))
+        nowMs = startMs + 20L * 60L * 60_000L
+        assertFalse(queue.isBulkDeferred(sessionId))
+
+        // Late Pause after expiry must not resurrect deferral.
+        assertEquals(sessionId, queue.startPausedTransfer())
+        assertFalse(queue.isBulkDeferred(sessionId))
+
+        // Single clock sample at end of runJob: even if a second clock() read after finishNowMs would cross 12h,
+        // dispatchOrder(finishNowMs) and syncDeferredWake(finishNowMs) share one sample and schedule DEFER_WAKE_JOB cleanly.
+        clear()
+        val baseMs = 1_800_000_000_000L
+        var armedForFinish = false
+        var finishClockReads = 0
+        val tickingQueue = MigrationInstallQueue(
+            context,
+            controlCall = { operation, _ ->
+                when (operation) {
+                    4 -> {
+                        if (armedForFinish) finishClockReads = 1
+                        Bundle().apply { putBoolean("success", true) }
+                    }
+                    5 -> Bundle().apply { putBoolean("success", true) }
+                    7 -> Bundle().apply { putBoolean("automatic_update_hold", true) }
+                    else -> Bundle()
+                }
+            },
+            storeCall = { _, name -> state(name, "none") },
+        ).apply {
+            clock = {
+                when (finishClockReads) {
+                    0 -> baseMs
+                    1 -> {
+                        finishClockReads = 2
+                        baseMs + MigrationInstallQueue.MAX_DEFER_BULK_MS - 10_000L
+                    }
+                    else -> baseMs + MigrationInstallQueue.MAX_DEFER_BULK_MS + 10_000L
+                }
+            }
+        }
+        assertTrue(tickingQueue.beginHandoff(run, resumeOnly = false, deferBulk = true).getBoolean("accepted"))
+        val id2 = tickingQueue.currentSessionId()!!
+        assertTrue(tickingQueue.pause(id2).getBoolean("success"))
+        tickingQueue.select(listOf(doc("com.bulk.app")))
+        scheduler.cancelAll()
+        armedForFinish = true
+        val controller = Robolectric.buildService(MigrationInstallJob::class.java).create()
+        try {
+            var rescheduled: Boolean? = null
+            controller.get().runJob(MigrationInstallQueue.JOB, queue = tickingQueue, deadlineNanos = System.nanoTime()) {
+                rescheduled = it
+            }
+            assertEquals(false, rescheduled)
+            assertEquals("finish check must sample clock only once", 2, finishClockReads)
+            val wake = scheduler.allPendingJobs.single { it.id == MigrationInstallQueue.DEFER_WAKE_JOB }
+            assertEquals(10_000L, wake.minLatencyMillis)
+        } finally {
+            controller.destroy()
+        }
+    }
 }

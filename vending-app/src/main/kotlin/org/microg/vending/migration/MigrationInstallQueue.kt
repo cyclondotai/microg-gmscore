@@ -83,11 +83,11 @@ internal class MigrationInstallQueue(private val context: Context,
     private fun isSmallestFirstBulk(id: String): Boolean =
         prefs.getBoolean("$id:defer_opted_in", false) || prefs.getBoolean("$id:defer_bulk", false)
     /** Pending installs across sessions. Apps Play refused most recently go last, so one cannot block the rest. */
-    fun dispatchOrder(): List<Pair<String, String>> = sessions().flatMap { id ->
+    fun dispatchOrder(nowMs: Long = clock()): List<Pair<String, String>> = sessions().flatMap { id ->
         // Each app's sort keys are read once, not on every comparison (a stable sort on the same keys: the same order).
         val ordered = priorityOrder(id)
         val priority = ordered.toSet()
-        val deferred = isBulkDeferred(id)
+        val deferred = isBulkDeferred(id, nowMs)
         val smallestFirst = isSmallestFirstBulk(id)
         val rank = if (prefs.contains("$id:priority_order")) ordered.withIndex().associate { (i, name) -> name to i } else emptyMap()
         pending(id).asSequence()
@@ -487,6 +487,10 @@ internal class MigrationInstallQueue(private val context: Context,
         val (id, created) = synchronized(LOCK) {
             val bound = activeUnclosedHandoffSession()
             if (bound != null && prefs.getBoolean("$bound:selected", false)) {
+                val now = clock()
+                if (isBulkDeferred(bound, now)) {
+                    check(prefs.edit().putLong("$bound:defer_bulk_at", now).commit())
+                }
                 bound to false
             } else {
                 currentSessionId()?.let { if (prefs.getBoolean("$it:pause_requested", false)) resume(it) }
@@ -1561,17 +1565,25 @@ internal class MigrationInstallQueue(private val context: Context,
 
 class MigrationInstallJob : JobService() {
     private val executor = Executors.newSingleThreadExecutor()
-    private var stopped = AtomicBoolean(false)
+    private val jobCancellation = java.util.concurrent.ConcurrentHashMap<Int, AtomicBoolean>()
     override fun onStartJob(params: JobParameters): Boolean {
-        val cancelled = AtomicBoolean(false).also { stopped = it }
+        val cancelled = AtomicBoolean(false)
+        jobCancellation.put(params.jobId, cancelled)?.set(true)
         activeRuns.incrementAndGet()
         executor.execute {
             try {
                 runJob(params.jobId, cancelled) { reschedule -> runCatching { jobFinished(params, reschedule) } }
             } finally {
+                jobCancellation.remove(params.jobId, cancelled)
                 activeRuns.decrementAndGet()
             }
         }
+        return true
+    }
+    internal fun registerJobForTests(jobId: Int): AtomicBoolean =
+        AtomicBoolean(false).also { jobCancellation.put(jobId, it)?.set(true) }
+    internal fun stopJobById(jobId: Int): Boolean {
+        jobCancellation[jobId]?.set(true)
         return true
     }
     internal fun runJob(
@@ -1617,8 +1629,9 @@ class MigrationInstallJob : JobService() {
         }
         if (!cancelled.get()) {
             val fromDeferredWake = jobId == MigrationInstallQueue.DEFER_WAKE_JOB
-            // Re-check ready work after the loop in case a deferral expired or released between summary() and exit.
-            val readyNow = retry || queue.dispatchOrder().isNotEmpty()
+            // Sample clock once so expiry cannot slip between dispatchOrder() and syncDeferredWake().
+            val finishNowMs = queue.clock()
+            val readyNow = retry || queue.dispatchOrder(finishNowMs).isNotEmpty()
             val reschedule = if (readyNow) {
                 if (fromDeferredWake) {
                     // Hand back to the primary install job first; if scheduling fails, retry this wake with backoff.
@@ -1628,13 +1641,18 @@ class MigrationInstallJob : JobService() {
                 }
             } else {
                 // Secure the next delayed wake (or cancel when settled) BEFORE finishing; on failure, back off & retry.
-                runCatching { queue.syncDeferredWake() }.isFailure
+                runCatching { queue.syncDeferredWake(finishNowMs) }.isFailure
             }
             onFinished(reschedule)
         }
     }
-    override fun onStopJob(params: JobParameters): Boolean { stopped.set(true); return true }
-    override fun onDestroy() { stopped.set(true); executor.shutdownNow(); super.onDestroy() }
+    override fun onStopJob(params: JobParameters): Boolean = stopJobById(params.jobId)
+    override fun onDestroy() {
+        jobCancellation.values.forEach { it.set(true) }
+        jobCancellation.clear()
+        executor.shutdownNow()
+        super.onDestroy()
+    }
 
     companion object {
         private val activeRuns = java.util.concurrent.atomic.AtomicInteger(0)
