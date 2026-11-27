@@ -17,6 +17,7 @@
 package org.microg.gms;
 
 import android.accounts.Account;
+import android.os.Binder;
 import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Parcel;
@@ -28,6 +29,7 @@ import com.google.android.gms.common.internal.*;
 
 import org.microg.gms.auth.AuthConstants;
 import org.microg.gms.common.GmsService;
+import org.microg.gms.cyclon.UnsupportedApiRecorder;
 
 import java.util.EnumSet;
 
@@ -252,9 +254,12 @@ public abstract class AbstractGmsServiceBroker extends IGmsServiceBroker.Stub {
     @Override
     public void getService(IGmsCallbacks callback, GetServiceRequest request) throws RemoteException {
         GmsService gmsService = GmsService.byServiceId(request.serviceId);
+        int callingUid = Binder.getCallingUid();
         if ((supportedServices.contains(gmsService)) || supportedServices.contains(GmsService.ANY)) {
-            handleServiceRequest(callback, request, gmsService);
+            IGmsCallbacks wrapped = UnsupportedApiRecorder.wrapCallback(callback, request, gmsService, callingUid);
+            handleServiceRequest(wrapped, request, gmsService);
         } else {
+            UnsupportedApiRecorder.recordUnsupportedService(request, gmsService, callingUid);
             Log.d(TAG, "Service not supported: " + request);
             throw new IllegalArgumentException("Service not supported: " + request.serviceId);
         }

@@ -5,6 +5,7 @@ import androidx.multidex.MultiDexApplication
 import androidx.work.Configuration
 import android.os.Build
 import okhttp3.OkHttp
+import org.microg.gms.cyclon.UnsupportedApiRecorder
 import org.microg.gms.fido.core.AccountPasskeyBackend
 import org.microg.gms.fido.core.AccountPasskeyBackendProvider
 import org.microg.gms.passwords.LegacySyncedPasskeyBackend
@@ -16,6 +17,7 @@ class ServicesApplication : MultiDexApplication(), Configuration.Provider, Accou
         // The default-process Startup provider does not run in :ui or other
         // secondary app processes. PSL and cookie handling need this context.
         OkHttp.initialize(this)
+        UnsupportedApiRecorder.init(this)
     }
 
     override val accountPasskeyBackend: AccountPasskeyBackend?
