@@ -23,8 +23,10 @@ import org.json.JSONObject
 import org.microg.gms.common.GmsService
 import java.io.File
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Pure feature descriptor (platform-free for host tests).
@@ -98,6 +100,30 @@ data class UnsupportedApiEntry(
 }
 
 /**
+ * Snapshot representation of a store slot, preserving undelivered [dirty] and [lastDrainedAt] state
+ * across process restarts.
+ */
+data class PersistedUnsupportedApiSlot(
+    val entry: UnsupportedApiEntry,
+    val dirty: Boolean = true,
+    val lastDrainedAt: Long = 0L,
+) {
+    fun toJson(): JSONObject = entry.toJson().apply {
+        put("dirty", dirty)
+        put("lastDrainedAt", lastDrainedAt)
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject?): PersistedUnsupportedApiSlot? {
+            val entry = UnsupportedApiEntry.fromJson(obj) ?: return null
+            val dirty = if (obj != null && obj.has("dirty")) obj.optBoolean("dirty", true) else true
+            val lastDrainedAt = obj?.optLong("lastDrainedAt", 0L)?.coerceAtLeast(0L) ?: 0L
+            return PersistedUnsupportedApiSlot(entry = entry, dirty = dirty, lastDrainedAt = lastDrainedAt)
+        }
+    }
+}
+
+/**
  * Bounded, synchronized in-memory store for [UnsupportedApiEntry] records with per-key re-report throttling.
  * Separated from Android APIs so all deduplication, feature-diff and drain logic is directly unit-testable.
  */
@@ -115,8 +141,9 @@ class UnsupportedApiStore(
     private val slots = LinkedHashMap<String, Slot>()
 
     /**
-     * Records an observation. Returns true if the entry is newly created or became newly dirty
-     * (so the caller should schedule a best-effort disk snapshot for cross-process readers).
+     * Records an observation. Returns true whenever the observation was accepted and mutated the store
+     * (new entry or updated timestamp/count), so callers can persist changes for cross-process readers
+     * independently of the re-report throttle.
      */
     @Synchronized
     fun record(
@@ -157,7 +184,7 @@ class UnsupportedApiStore(
             )
             if (reDirty) existing.dirty = true
             slots[candidate.key] = existing
-            return reDirty
+            return true
         }
         slots[candidate.key] = Slot(candidate, dirty = true, lastDrainedAt = 0L)
         while (slots.size > maxEntries) {
@@ -195,9 +222,52 @@ class UnsupportedApiStore(
         return dirtySlots.map { it.entry }
     }
 
-    /** Merges persisted entries (e.g. from a sibling process file or prior run). */
+    /**
+     * Restores slots persisted by this same process prior to restart, preserving undelivered [dirty]
+     * and [lastDrainedAt] state while merging any observations recorded before restoration completed.
+     */
     @Synchronized
-    fun mergeExternal(entries: List<UnsupportedApiEntry>, markDirtyIfNewer: Boolean) {
+    fun restoreOwn(persisted: List<PersistedUnsupportedApiSlot>) {
+        for (saved in persisted) {
+            val cleanPkg = cleanPackage(saved.entry.packageName) ?: continue
+            val cleanService = clip(saved.entry.service, MAX_SERVICE_LENGTH) ?: continue
+            val normalized = saved.entry.copy(
+                packageName = cleanPkg,
+                service = cleanService,
+                features = saved.entry.features.mapNotNull { clip(it, MAX_FEATURE_LENGTH) }.distinct().sorted().take(MAX_FEATURES),
+            )
+            val existing = slots[normalized.key]
+            if (existing == null) {
+                slots[normalized.key] = Slot(normalized, dirty = saved.dirty, lastDrainedAt = saved.lastDrainedAt)
+            } else {
+                val mergedLastDrainedAt = maxOf(existing.lastDrainedAt, saved.lastDrainedAt)
+                val mergedDirty = when {
+                    existing.lastDrainedAt > 0L -> existing.dirty
+                    saved.dirty -> true
+                    existing.entry.lastSeenAt > normalized.lastSeenAt ->
+                        saved.lastDrainedAt <= 0L || (existing.entry.lastSeenAt - saved.lastDrainedAt) !in 0 until reReportWindowMs
+                    else -> existing.dirty
+                }
+                existing.entry = existing.entry.copy(
+                    gmsVersion = existing.entry.gmsVersion ?: normalized.gmsVersion,
+                    count = maxOf(existing.entry.count, normalized.count),
+                    firstSeenAt = if (existing.entry.firstSeenAt > 0L && normalized.firstSeenAt > 0L)
+                        minOf(existing.entry.firstSeenAt, normalized.firstSeenAt) else maxOf(existing.entry.firstSeenAt, normalized.firstSeenAt),
+                    lastSeenAt = maxOf(existing.entry.lastSeenAt, normalized.lastSeenAt),
+                )
+                existing.lastDrainedAt = mergedLastDrainedAt
+                existing.dirty = mergedDirty
+            }
+        }
+        while (slots.size > maxEntries) {
+            val oldestKey = slots.entries.minByOrNull { it.value.entry.lastSeenAt }?.key ?: break
+            slots.remove(oldestKey)
+        }
+    }
+
+    /** Merges persisted entries from a sibling process file. */
+    @Synchronized
+    fun mergeExternal(entries: List<UnsupportedApiEntry>, markDirtyIfNewer: Boolean = true) {
         val now = clock()
         for (incoming in entries) {
             val cleanPkg = cleanPackage(incoming.packageName) ?: continue
@@ -211,7 +281,6 @@ class UnsupportedApiStore(
             if (existing == null) {
                 slots[normalized.key] = Slot(normalized, dirty = markDirtyIfNewer, lastDrainedAt = if (markDirtyIfNewer) 0L else now)
             } else if (normalized.lastSeenAt > existing.entry.lastSeenAt || normalized.count > existing.entry.count) {
-                val newer = normalized.lastSeenAt > existing.entry.lastSeenAt
                 existing.entry = existing.entry.copy(
                     gmsVersion = normalized.gmsVersion ?: existing.entry.gmsVersion,
                     count = maxOf(existing.entry.count, normalized.count),
@@ -219,7 +288,7 @@ class UnsupportedApiStore(
                         minOf(existing.entry.firstSeenAt, normalized.firstSeenAt) else maxOf(existing.entry.firstSeenAt, normalized.firstSeenAt),
                     lastSeenAt = maxOf(existing.entry.lastSeenAt, normalized.lastSeenAt),
                 )
-                if (markDirtyIfNewer && newer && (existing.lastDrainedAt <= 0L || now - existing.lastDrainedAt !in 0 until reReportWindowMs)) {
+                if (markDirtyIfNewer && (existing.lastDrainedAt <= 0L || now - existing.lastDrainedAt !in 0 until reReportWindowMs)) {
                     existing.dirty = true
                 }
             }
@@ -229,6 +298,10 @@ class UnsupportedApiStore(
             slots.remove(oldestKey)
         }
     }
+
+    @Synchronized
+    fun snapshotSlots(): List<PersistedUnsupportedApiSlot> =
+        slots.values.map { PersistedUnsupportedApiSlot(it.entry, it.dirty, it.lastDrainedAt) }
 
     @Synchronized
     fun snapshotAll(): List<UnsupportedApiEntry> = slots.values.map { it.entry }
@@ -330,14 +403,22 @@ class UnsupportedApiStore(
  */
 object UnsupportedApiRecorder {
     private const val TAG = "CyclonUnsupportedApi"
-    private const val DIR_NAME = "cyclon-unsupported-api"
-    private const val MAX_FILE_BYTES = 128 * 1024
+    const val DIR_NAME = "cyclon-unsupported-api"
+    const val MAX_FILE_BYTES = 512 * 1024
 
     @Volatile
     private var appContext: Context? = null
 
     @Volatile
     private var processTag: String = "default"
+
+    private val loadLock = Any()
+
+    @Volatile
+    private var ownSnapshotLoaded = false
+
+    private val persistPending = AtomicBoolean(false)
+    private val persistScheduled = AtomicBoolean(false)
 
     val store = UnsupportedApiStore()
 
@@ -350,10 +431,13 @@ object UnsupportedApiRecorder {
     @JvmStatic
     fun init(context: Context) {
         val app = context.applicationContext ?: context
-        appContext = app
-        processTag = sanitizeProcessTag(currentProcessName(app))
+        synchronized(loadLock) {
+            appContext = app
+            processTag = sanitizeProcessTag(currentProcessName(app))
+            ownSnapshotLoaded = false
+        }
         io.execute {
-            runCatching { loadOwnSnapshot(app) }
+            runCatching { ensureOwnSnapshotLoaded(app) }
         }
     }
 
@@ -468,13 +552,21 @@ object UnsupportedApiRecorder {
     }
 
     fun recentFor(context: Context, packageName: String?, windowMs: Long, limit: Int): List<UnsupportedApiEntry> {
-        mergeSiblingSnapshots(context, markDirtyIfNewer = false)
+        val app = context.applicationContext ?: context
+        if (appContext == null) appContext = app
+        ensureOwnSnapshotLoaded(app)
+        mergeSiblingSnapshots(app)
         return store.recentFor(packageName, windowMs, limit)
     }
 
     fun drainDirty(context: Context, limit: Int): List<UnsupportedApiEntry> {
-        mergeSiblingSnapshots(context, markDirtyIfNewer = true)
-        return store.drainDirty(limit)
+        val app = context.applicationContext ?: context
+        if (appContext == null) appContext = app
+        ensureOwnSnapshotLoaded(app)
+        mergeSiblingSnapshots(app)
+        val drained = store.drainDirty(limit)
+        if (drained.isNotEmpty()) schedulePersist()
+        return drained
     }
 
     private fun recordPostInit(
@@ -551,11 +643,73 @@ object UnsupportedApiRecorder {
 
     private fun schedulePersist() {
         val ctx = appContext ?: return
-        io.execute {
-            runCatching { writeOwnSnapshot(ctx) }.onFailure {
-                Log.w(TAG, "Persist skipped: ${it.javaClass.simpleName}")
+        persistPending.set(true)
+        if (!persistScheduled.compareAndSet(false, true)) return
+        try {
+            io.execute {
+                try {
+                    while (persistPending.getAndSet(false)) {
+                        runCatching {
+                            ensureOwnSnapshotLoaded(ctx)
+                            writeOwnSnapshot(ctx)
+                        }.onFailure {
+                            Log.w(TAG, "Persist skipped: ${it.javaClass.simpleName}")
+                        }
+                    }
+                } finally {
+                    persistScheduled.set(false)
+                    if (persistPending.get()) schedulePersist()
+                }
             }
+        } catch (_: Throwable) {
+            persistScheduled.set(false)
         }
+    }
+
+    fun flushPersist(timeoutMs: Long = 5_000L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (true) {
+            val latch = CountDownLatch(1)
+            io.execute { latch.countDown() }
+            val remaining = (deadline - System.currentTimeMillis()).coerceAtLeast(1L)
+            if (!latch.await(remaining, TimeUnit.MILLISECONDS)) return false
+            if (!persistScheduled.get() && !persistPending.get()) return true
+            if (System.currentTimeMillis() >= deadline) return false
+        }
+    }
+
+    fun serializeSnapshot(slots: List<PersistedUnsupportedApiSlot>, maxBytes: Int = MAX_FILE_BYTES): String {
+        val prefix = """{"version":1,"entries":["""
+        val suffix = "]}"
+        val overhead = prefix.toByteArray(Charsets.UTF_8).size + suffix.toByteArray(Charsets.UTF_8).size
+        val sb = StringBuilder(prefix)
+        var usedBytes = overhead
+        var written = 0
+        val ordered = slots.sortedWith(
+            compareByDescending<PersistedUnsupportedApiSlot> { it.dirty }
+                .thenByDescending { it.entry.lastSeenAt },
+        )
+        for (slot in ordered) {
+            val serialized = slot.toJson().toString()
+            val itemBytes = serialized.toByteArray(Charsets.UTF_8).size
+            val sepBytes = if (written > 0) 1 else 0
+            if (usedBytes + sepBytes + itemBytes > maxBytes) continue
+            if (written > 0) sb.append(',')
+            sb.append(serialized)
+            usedBytes += sepBytes + itemBytes
+            written++
+        }
+        sb.append(suffix)
+        return sb.toString()
+    }
+
+    fun parseSnapshot(text: String): List<PersistedUnsupportedApiSlot> {
+        val arr = JSONObject(text).optJSONArray("entries") ?: return emptyList()
+        val out = ArrayList<PersistedUnsupportedApiSlot>(minOf(arr.length(), UnsupportedApiStore.MAX_ENTRIES))
+        for (i in 0 until minOf(arr.length(), UnsupportedApiStore.MAX_ENTRIES)) {
+            PersistedUnsupportedApiSlot.fromJson(arr.optJSONObject(i))?.let { out.add(it) }
+        }
+        return out
     }
 
     private fun storageDir(context: Context): File = File(context.noBackupFilesDir, DIR_NAME)
@@ -563,12 +717,10 @@ object UnsupportedApiRecorder {
     private fun writeOwnSnapshot(context: Context) {
         val dir = storageDir(context)
         if (!dir.exists() && !dir.mkdirs()) return
-        val entries = store.snapshotAll()
-        val arr = JSONArray()
-        for (entry in entries) arr.put(entry.toJson())
-        val payload = JSONObject().put("version", 1).put("entries", arr).toString()
-        val tmp = File(dir, "$processTag.json.tmp")
-        val target = File(dir, "$processTag.json")
+        val tag = processTag
+        val payload = serializeSnapshot(store.snapshotSlots(), MAX_FILE_BYTES)
+        val tmp = File(dir, "$tag.json.tmp")
+        val target = File(dir, "$tag.json")
         tmp.writeText(payload, Charsets.UTF_8)
         if (!tmp.renameTo(target)) {
             target.writeText(payload, Charsets.UTF_8)
@@ -576,14 +728,22 @@ object UnsupportedApiRecorder {
         }
     }
 
-    private fun loadOwnSnapshot(context: Context) {
-        val file = File(storageDir(context), "$processTag.json")
-        if (!file.isFile || file.length() > MAX_FILE_BYTES) return
-        val parsed = readSnapshotFile(file)
-        if (parsed.isNotEmpty()) store.mergeExternal(parsed, markDirtyIfNewer = false)
+    private fun ensureOwnSnapshotLoaded(context: Context) {
+        if (ownSnapshotLoaded) return
+        synchronized(loadLock) {
+            if (ownSnapshotLoaded) return
+            val file = File(storageDir(context), "$processTag.json")
+            if (file.isFile && file.length() <= MAX_FILE_BYTES) {
+                runCatching {
+                    val parsed = readSnapshotFile(file)
+                    if (parsed.isNotEmpty()) store.restoreOwn(parsed)
+                }
+            }
+            ownSnapshotLoaded = true
+        }
     }
 
-    private fun mergeSiblingSnapshots(context: Context, markDirtyIfNewer: Boolean) {
+    private fun mergeSiblingSnapshots(context: Context) {
         val dir = storageDir(context)
         val ownName = "$processTag.json"
         val files = dir.listFiles { f -> f.isFile && f.name.endsWith(".json") && f.name != ownName } ?: return
@@ -591,20 +751,13 @@ object UnsupportedApiRecorder {
             if (file.length() > MAX_FILE_BYTES) continue
             runCatching {
                 val parsed = readSnapshotFile(file)
-                if (parsed.isNotEmpty()) store.mergeExternal(parsed, markDirtyIfNewer = markDirtyIfNewer)
+                if (parsed.isNotEmpty()) store.mergeExternal(parsed.map { it.entry }, markDirtyIfNewer = true)
             }
         }
     }
 
-    private fun readSnapshotFile(file: File): List<UnsupportedApiEntry> {
-        val text = file.readText(Charsets.UTF_8)
-        val arr = JSONObject(text).optJSONArray("entries") ?: return emptyList()
-        val out = ArrayList<UnsupportedApiEntry>(arr.length())
-        for (i in 0 until minOf(arr.length(), UnsupportedApiStore.MAX_ENTRIES)) {
-            UnsupportedApiEntry.fromJson(arr.optJSONObject(i))?.let { out.add(it) }
-        }
-        return out
-    }
+    private fun readSnapshotFile(file: File): List<PersistedUnsupportedApiSlot> =
+        parseSnapshot(file.readText(Charsets.UTF_8))
 
     private fun currentProcessName(context: Context): String {
         if (Build.VERSION.SDK_INT >= 28) {

@@ -37,6 +37,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.shadows.ShadowBinder
+import java.io.File
 import java.util.EnumSet
 
 @RunWith(RobolectricTestRunner::class)
@@ -57,8 +58,11 @@ class UnsupportedApiRecorderTest {
         }
         installPackage(corePkg, coreUid, system = true)
         installPackage(chromePkg, chromeUid, system = false)
+        UnsupportedApiRecorder.flushPersist()
+        snapshotDir().deleteRecursively()
         UnsupportedApiRecorder.store.clear()
         UnsupportedApiRecorder.init(context)
+        UnsupportedApiRecorder.flushPersist()
         ShadowBinder.setCallingUid(coreUid)
         provider = UnsupportedApiProvider().also {
             it.attachInfo(context, ProviderInfo().apply {
@@ -70,9 +74,13 @@ class UnsupportedApiRecorderTest {
 
     @After
     fun tearDown() {
+        UnsupportedApiRecorder.flushPersist()
         UnsupportedApiRecorder.store.clear()
+        snapshotDir().deleteRecursively()
         ShadowBinder.reset()
     }
+
+    private fun snapshotDir(): File = File(context.noBackupFilesDir, UnsupportedApiRecorder.DIR_NAME)
 
     private fun installPackage(pkg: String, uid: Int, system: Boolean, sharedPkg: String? = null) {
         val spm = shadowOf(context.packageManager)
@@ -112,9 +120,9 @@ class UnsupportedApiRecorderTest {
         val store = UnsupportedApiStore(maxEntries = 3, reReportWindowMs = 60_000L, clock = { now })
 
         assertTrue(store.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED", listOf("feature_standalone_safe_browsing@1")))
-        // Duplicate while still dirty increments count and does not trigger new dirty state.
+        // Duplicate while still dirty increments count and returns true so cross-process snapshots persist.
         now = 11_000L
-        assertFalse(store.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED", listOf("feature_standalone_safe_browsing@1")))
+        assertTrue(store.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED", listOf("feature_standalone_safe_browsing@1")))
 
         // Recent sees it without clearing dirty.
         val recent = store.recentFor(chromePkg, windowMs = 10_000L)
@@ -126,9 +134,9 @@ class UnsupportedApiRecorderTest {
         assertEquals(1, drained1.size)
         assertEquals(0, store.drainDirty().size)
 
-        // Repeat inside re-report window does not re-dirty, but recent still updates.
+        // Repeat inside re-report window persists updated timestamp/count without re-dirtying.
         now = 20_000L
-        assertFalse(store.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED", listOf("feature_standalone_safe_browsing@1")))
+        assertTrue(store.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED", listOf("feature_standalone_safe_browsing@1")))
         assertEquals(0, store.drainDirty().size)
         assertEquals(3L, store.recentFor(chromePkg, windowMs = 5_000L)[0].count)
 
@@ -136,6 +144,144 @@ class UnsupportedApiRecorderTest {
         now = 90_000L
         assertTrue(store.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED", listOf("feature_standalone_safe_browsing@1")))
         assertEquals(1, store.drainDirty().size)
+    }
+
+    @Test
+    fun recentBeforeDrainDoesNotHideSiblingRecords() {
+        val now = System.currentTimeMillis()
+        val siblingEntry = UnsupportedApiEntry(
+            packageName = chromePkg,
+            kind = UnsupportedApiStore.KIND_MISSING_FEATURES,
+            service = "CHROME_SYNC_FIRST_PARTY",
+            serviceId = 204,
+            gmsVersion = 264380000,
+            features = listOf("FIRSTPARTY_PASSWORD_DELETE@1"),
+            count = 1L,
+            firstSeenAt = now,
+            lastSeenAt = now,
+        )
+        val dir = snapshotDir().apply { mkdirs() }
+        File(dir, "persistent.json").writeText(
+            UnsupportedApiRecorder.serializeSnapshot(listOf(PersistedUnsupportedApiSlot(siblingEntry))),
+            Charsets.UTF_8,
+        )
+
+        ShadowBinder.setCallingUid(coreUid)
+        val recent = JSONArray(provider.call(UnsupportedApiProvider.METHOD_RECENT, chromePkg, null).getString(UnsupportedApiProvider.KEY_ENTRIES))
+        assertEquals(1, recent.length())
+        assertEquals("CHROME_SYNC_FIRST_PARTY", recent.getJSONObject(0).getString("service"))
+
+        // Drain after recent must still deliver the sibling record once.
+        val drained = JSONArray(provider.call(UnsupportedApiProvider.METHOD_DRAIN, null, null).getString(UnsupportedApiProvider.KEY_ENTRIES))
+        assertEquals(1, drained.length())
+        assertEquals("CHROME_SYNC_FIRST_PARTY", drained.getJSONObject(0).getString("service"))
+        val drainedAgain = JSONArray(provider.call(UnsupportedApiProvider.METHOD_DRAIN, null, null).getString(UnsupportedApiProvider.KEY_ENTRIES))
+        assertEquals(0, drainedAgain.length())
+    }
+
+    @Test
+    fun repeatedFailurePersistsUpdatedCountAndReTriggersAfterWindow() {
+        val dummyBroker = object : AbstractGmsServiceBroker(EnumSet.of(GmsService.ANY)) {
+            override fun handleServiceRequest(callback: IGmsCallbacks, request: GetServiceRequest, service: GmsService) {
+                callback.onPostInitComplete(ConnectionResult.API_DISABLED, null, null)
+            }
+        }
+        val req = GetServiceRequest(GmsService.SAFE_BROWSING.SERVICE_ID).apply {
+            packageName = chromePkg
+            gmsVersion = 264380000
+            apiFeatures = arrayOf(Feature("feature_standalone_safe_browsing", 1))
+        }
+        ShadowBinder.setCallingUid(chromeUid)
+        dummyBroker.getService(RecordingCallback(), req)
+        assertTrue(UnsupportedApiRecorder.flushPersist())
+        val ownFile = snapshotDir().listFiles { f -> f.name.endsWith(".json") }!!.single()
+        val firstSaved = UnsupportedApiRecorder.parseSnapshot(ownFile.readText(Charsets.UTF_8)).single()
+        assertEquals(1L, firstSaved.entry.count)
+
+        // Repeat while entry is still dirty in this process (like :persistent before Core drains default).
+        dummyBroker.getService(RecordingCallback(), req)
+        assertTrue(UnsupportedApiRecorder.flushPersist())
+        val secondSaved = UnsupportedApiRecorder.parseSnapshot(ownFile.readText(Charsets.UTF_8)).single()
+        assertEquals(2L, secondSaved.entry.count)
+        assertTrue(secondSaved.entry.lastSeenAt >= firstSaved.entry.lastSeenAt)
+
+        // Cross-process default store sees repeat after re-report window and drains it again.
+        var now = 10_000L
+        val defaultStore = UnsupportedApiStore(reReportWindowMs = 60_000L, clock = { now })
+        val persistentStore = UnsupportedApiStore(reReportWindowMs = 60_000L, clock = { now })
+        persistentStore.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED")
+        defaultStore.mergeExternal(persistentStore.snapshotAll(), markDirtyIfNewer = true)
+        assertEquals(1, defaultStore.drainDirty().size)
+
+        now = 90_000L
+        assertTrue(persistentStore.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED"))
+        defaultStore.mergeExternal(persistentStore.snapshotAll(), markDirtyIfNewer = true)
+        val reDrained = defaultStore.drainDirty()
+        assertEquals(1, reDrained.size)
+        assertEquals(2L, reDrained[0].count)
+    }
+
+    @Test
+    fun restartPreservesUndeliveredAndDrainedState() {
+        val dummyBroker = object : AbstractGmsServiceBroker(EnumSet.of(GmsService.ANY)) {
+            override fun handleServiceRequest(callback: IGmsCallbacks, request: GetServiceRequest, service: GmsService) {
+                callback.onPostInitComplete(ConnectionResult.API_DISABLED, null, null)
+            }
+        }
+        ShadowBinder.setCallingUid(chromeUid)
+        dummyBroker.getService(RecordingCallback(), GetServiceRequest(GmsService.SAFE_BROWSING.SERVICE_ID).apply {
+            packageName = chromePkg
+            gmsVersion = 264380000
+        })
+        assertTrue(UnsupportedApiRecorder.flushPersist())
+
+        // Simulate process restart before Core calls drain.
+        UnsupportedApiRecorder.store.clear()
+        UnsupportedApiRecorder.init(context)
+        assertTrue(UnsupportedApiRecorder.flushPersist())
+
+        ShadowBinder.setCallingUid(coreUid)
+        val drainedAfterCrash = JSONArray(provider.call(UnsupportedApiProvider.METHOD_DRAIN, null, null).getString(UnsupportedApiProvider.KEY_ENTRIES))
+        assertEquals(1, drainedAfterCrash.length())
+        assertEquals("SAFE_BROWSING", drainedAfterCrash.getJSONObject(0).getString("service"))
+        assertTrue(UnsupportedApiRecorder.flushPersist())
+
+        // Simulate second restart after drain: already-delivered record stays clean.
+        UnsupportedApiRecorder.store.clear()
+        UnsupportedApiRecorder.init(context)
+        assertTrue(UnsupportedApiRecorder.flushPersist())
+
+        val drainedAfterCleanRestart = JSONArray(provider.call(UnsupportedApiProvider.METHOD_DRAIN, null, null).getString(UnsupportedApiProvider.KEY_ENTRIES))
+        assertEquals(0, drainedAfterCleanRestart.length())
+    }
+
+    @Test
+    fun snapshotSerializationStaysWithinMaxFileBytes() {
+        val longFeatures = (1..UnsupportedApiStore.MAX_FEATURES).map { idx ->
+            "feature_${idx}_" + "a".repeat(100) + "@1"
+        }
+        val slots = (1..UnsupportedApiStore.MAX_ENTRIES).map { idx ->
+            PersistedUnsupportedApiSlot(
+                entry = UnsupportedApiEntry(
+                    packageName = chromePkg,
+                    kind = UnsupportedApiStore.KIND_MISSING_FEATURES,
+                    service = "SVC_$idx",
+                    serviceId = idx,
+                    gmsVersion = 264380000,
+                    features = longFeatures,
+                    count = 1L,
+                    firstSeenAt = idx.toLong(),
+                    lastSeenAt = idx.toLong(),
+                ),
+                dirty = idx == UnsupportedApiStore.MAX_ENTRIES,
+                lastDrainedAt = if (idx == UnsupportedApiStore.MAX_ENTRIES) 0L else 100L,
+            )
+        }
+        val payload = UnsupportedApiRecorder.serializeSnapshot(slots, UnsupportedApiRecorder.MAX_FILE_BYTES)
+        assertTrue(payload.toByteArray(Charsets.UTF_8).size <= UnsupportedApiRecorder.MAX_FILE_BYTES)
+        val parsed = UnsupportedApiRecorder.parseSnapshot(payload)
+        assertTrue(parsed.isNotEmpty())
+        assertTrue(parsed.any { it.entry.service == "SVC_${UnsupportedApiStore.MAX_ENTRIES}" && it.dirty })
     }
 
     @Test
