@@ -21,6 +21,7 @@ import com.google.android.gms.common.internal.GetServiceRequest
 import com.google.android.gms.common.internal.IGmsCallbacks
 import com.google.android.gms.common.moduleinstall.internal.ApiFeatureRequest
 import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -56,8 +57,9 @@ class UnsupportedApiRecorderTest {
         context = object : ContextWrapper(app) {
             override fun getPackageName(): String = "com.google.android.gms"
         }
-        installPackage(corePkg, coreUid, system = true)
-        installPackage(chromePkg, chromeUid, system = false)
+        installPackage(corePkg, coreUid, system = true, versionCode = 500L, versionName = "1.0-core")
+        installPackage(chromePkg, chromeUid, system = false, versionCode = 812709204L, versionName = "158.0.8127.92")
+        installPackage("com.google.android.gms", Process.myUid(), system = true, versionCode = 264531136L, versionName = "0.3.18.264531")
         UnsupportedApiRecorder.flushPersist()
         snapshotDir().deleteRecursively()
         UnsupportedApiRecorder.store.clear()
@@ -82,7 +84,14 @@ class UnsupportedApiRecorderTest {
 
     private fun snapshotDir(): File = File(context.noBackupFilesDir, UnsupportedApiRecorder.DIR_NAME)
 
-    private fun installPackage(pkg: String, uid: Int, system: Boolean, sharedPkg: String? = null) {
+    private fun installPackage(
+        pkg: String,
+        uid: Int,
+        system: Boolean,
+        sharedPkg: String? = null,
+        versionCode: Long = 1L,
+        versionName: String = "1.0",
+    ) {
         val spm = shadowOf(context.packageManager)
         val appInfo = ApplicationInfo().apply {
             packageName = pkg
@@ -92,6 +101,8 @@ class UnsupportedApiRecorderTest {
         spm.installPackage(PackageInfo().apply {
             packageName = pkg
             applicationInfo = appInfo
+            longVersionCode = versionCode
+            this.versionName = versionName
         })
         spm.setPackagesForUid(uid, *(if (sharedPkg == null) arrayOf(pkg) else arrayOf(pkg, sharedPkg)))
     }
@@ -282,6 +293,98 @@ class UnsupportedApiRecorderTest {
         val parsed = UnsupportedApiRecorder.parseSnapshot(payload)
         assertTrue(parsed.isNotEmpty())
         assertTrue(parsed.any { it.entry.service == "SVC_${UnsupportedApiStore.MAX_ENTRIES}" && it.dirty })
+    }
+
+    @Test
+    fun peekAndAckPreserveUndeliveredAndRespectNewerObservations() {
+        var now = 10_000L
+        val store = UnsupportedApiStore(clock = { now })
+        store.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED", appVersionCode = 100L, microgVersionCode = 264531136L)
+
+        val (peek1, hasMore1) = store.peekDirty()
+        assertEquals(1, peek1.size)
+        assertFalse(hasMore1)
+        // Peek leaves the entry dirty if delivery fails before ack.
+        assertEquals(1, store.peekDirty().first.size)
+
+        // Newer observation arrives after peek: stale ack must NOT clear the entry.
+        now = 20_000L
+        store.record(chromePkg, UnsupportedApiStore.KIND_SERVICE_ERROR, "SAFE_BROWSING", 45, 264380000, ConnectionResult.API_DISABLED, "API_DISABLED", appVersionCode = 100L, microgVersionCode = 264531136L)
+        assertEquals(0, store.ackDrained(listOf(peek1[0].key to peek1[0].lastSeenAt)))
+        assertEquals(1, store.peekDirty().first.size)
+
+        // Matching ack clears it.
+        val (peek2, _) = store.peekDirty()
+        assertEquals(1, store.ackDrained(listOf(peek2[0].key to peek2[0].lastSeenAt)))
+        assertEquals(0, store.peekDirty().first.size)
+    }
+
+    @Test
+    fun ipcReplyStaysBoundedByMaxBytesAndPaginates() {
+        var now = 10_000L
+        val store = UnsupportedApiStore(clock = { now })
+        val longFeatures = (1..UnsupportedApiStore.MAX_FEATURES).map { idx -> "feature_${idx}_" + "x".repeat(80) + "@1" }
+        for (i in 1..40) {
+            now += 10L
+            store.record(chromePkg, UnsupportedApiStore.KIND_MISSING_FEATURES, "SVC_$i", i, 264380000, features = longFeatures)
+        }
+        val cap = 16 * 1024
+        val seenServices = HashSet<String>()
+        var pages = 0
+        while (pages < 10) {
+            val (batch, hasMore) = store.peekDirty(limit = 64, maxBytes = cap)
+            if (batch.isEmpty()) break
+            val arr = JSONArray()
+            for (e in batch) {
+                arr.put(e.toJson())
+                seenServices.add(e.service)
+            }
+            assertTrue(arr.toString().toByteArray(Charsets.UTF_8).size <= cap)
+            assertEquals(batch.size, store.ackDrained(batch.map { it.key to it.lastSeenAt }))
+            pages++
+            if (!hasMore) break
+        }
+        assertTrue(pages > 1)
+        assertEquals(40, seenServices.size)
+        assertEquals(0, store.peekDirty().first.size)
+    }
+
+    @Test
+    fun observationTimeVersionsSurviveAppUpdateViaProviderPeekAndAck() {
+        val dummyBroker = object : AbstractGmsServiceBroker(EnumSet.of(GmsService.ANY)) {
+            override fun handleServiceRequest(callback: IGmsCallbacks, request: GetServiceRequest, service: GmsService) {
+                callback.onPostInitComplete(ConnectionResult.API_DISABLED, null, null)
+            }
+        }
+        ShadowBinder.setCallingUid(chromeUid)
+        dummyBroker.getService(RecordingCallback(), GetServiceRequest(GmsService.SAFE_BROWSING.SERVICE_ID).apply {
+            packageName = chromePkg
+            gmsVersion = 264380000
+        })
+
+        // App updates to a newer version before Core drains.
+        installPackage(chromePkg, chromeUid, system = false, versionCode = 812709999L, versionName = "159.0.0.1")
+
+        ShadowBinder.setCallingUid(coreUid)
+        val peekedBundle = provider.call(UnsupportedApiProvider.METHOD_PEEK, null, null)
+        val entries = JSONArray(peekedBundle.getString(UnsupportedApiProvider.KEY_ENTRIES))
+        assertEquals(1, entries.length())
+        val first = entries.getJSONObject(0)
+        assertEquals(812709204L, first.getLong("appVersionCode"))
+        assertEquals("158.0.8127.92", first.getString("appVersionName"))
+        assertEquals(264531136L, first.getLong("microgVersionCode"))
+
+        val ackPayload = JSONArray().put(
+            JSONObject().put("key", first.getString("key")).put("lastSeenAt", first.getLong("lastSeenAt")),
+        ).toString()
+        val ackedBundle = provider.call(
+            UnsupportedApiProvider.METHOD_ACK,
+            null,
+            Bundle().apply { putString(UnsupportedApiProvider.KEY_ACKS, ackPayload) },
+        )
+        assertEquals(1, ackedBundle.getInt(UnsupportedApiProvider.KEY_ACKED))
+        val afterAck = JSONArray(provider.call(UnsupportedApiProvider.METHOD_PEEK, null, null).getString(UnsupportedApiProvider.KEY_ENTRIES))
+        assertEquals(0, afterAck.length())
     }
 
     @Test

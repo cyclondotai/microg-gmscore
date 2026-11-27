@@ -46,6 +46,10 @@ data class UnsupportedApiEntry(
     val service: String,
     val serviceId: Int? = null,
     val gmsVersion: Int? = null,
+    val appVersionCode: Long? = null,
+    val appVersionName: String? = null,
+    val microgVersionCode: Long? = null,
+    val microgVersionName: String? = null,
     val statusCode: Int? = null,
     val statusName: String? = null,
     val features: List<String> = emptyList(),
@@ -54,14 +58,27 @@ data class UnsupportedApiEntry(
     val lastSeenAt: Long = 0L,
 ) {
     val key: String
-        get() = listOf(packageName, kind, service, statusCode?.toString() ?: "", features.joinToString(",")).joinToString("|")
+        get() = listOf(
+            packageName,
+            appVersionCode?.toString() ?: "",
+            microgVersionCode?.toString() ?: "",
+            kind,
+            service,
+            statusCode?.toString() ?: "",
+            features.joinToString(","),
+        ).joinToString("|")
 
     fun toJson(): JSONObject = JSONObject().apply {
+        put("key", key)
         put("packageName", packageName)
         put("kind", kind)
         put("service", service)
         serviceId?.let { put("serviceId", it) }
         gmsVersion?.let { put("gmsVersion", it) }
+        appVersionCode?.let { put("appVersionCode", it) }
+        appVersionName?.let { put("appVersionName", it) }
+        microgVersionCode?.let { put("microgVersionCode", it) }
+        microgVersionName?.let { put("microgVersionName", it) }
         statusCode?.let { put("statusCode", it) }
         statusName?.let { put("statusName", it) }
         if (features.isNotEmpty()) put("features", JSONArray(features))
@@ -88,6 +105,10 @@ data class UnsupportedApiEntry(
                 service = service,
                 serviceId = if (obj.has("serviceId") && !obj.isNull("serviceId")) obj.optInt("serviceId") else null,
                 gmsVersion = if (obj.has("gmsVersion") && !obj.isNull("gmsVersion")) obj.optInt("gmsVersion") else null,
+                appVersionCode = if (obj.has("appVersionCode") && !obj.isNull("appVersionCode")) obj.optLong("appVersionCode") else null,
+                appVersionName = obj.optString("appVersionName").takeIf { it.isNotEmpty() },
+                microgVersionCode = if (obj.has("microgVersionCode") && !obj.isNull("microgVersionCode")) obj.optLong("microgVersionCode") else null,
+                microgVersionName = obj.optString("microgVersionName").takeIf { it.isNotEmpty() },
                 statusCode = if (obj.has("statusCode") && !obj.isNull("statusCode")) obj.optInt("statusCode") else null,
                 statusName = obj.optString("statusName").takeIf { it.isNotEmpty() },
                 features = features,
@@ -155,11 +176,17 @@ class UnsupportedApiStore(
         statusCode: Int? = null,
         statusName: String? = null,
         features: List<String> = emptyList(),
+        appVersionCode: Long? = null,
+        appVersionName: String? = null,
+        microgVersionCode: Long? = null,
+        microgVersionName: String? = null,
     ): Boolean {
         val cleanPkg = cleanPackage(packageName) ?: return false
         val cleanService = clip(service, MAX_SERVICE_LENGTH) ?: return false
         val cleanFeatures = features.mapNotNull { clip(it, MAX_FEATURE_LENGTH) }.distinct().sorted().take(MAX_FEATURES)
         val cleanGmsVersion = gmsVersion?.takeIf { it > 0 }
+        val cleanAppVersionName = clip(appVersionName, MAX_VERSION_NAME_LENGTH)
+        val cleanMicrogVersionName = clip(microgVersionName, MAX_VERSION_NAME_LENGTH)
         val now = clock()
         val candidate = UnsupportedApiEntry(
             packageName = cleanPkg,
@@ -167,6 +194,10 @@ class UnsupportedApiStore(
             service = cleanService,
             serviceId = serviceId,
             gmsVersion = cleanGmsVersion,
+            appVersionCode = appVersionCode,
+            appVersionName = cleanAppVersionName,
+            microgVersionCode = microgVersionCode,
+            microgVersionName = cleanMicrogVersionName,
             statusCode = statusCode,
             statusName = statusName,
             features = cleanFeatures,
@@ -179,6 +210,8 @@ class UnsupportedApiStore(
             val reDirty = !existing.dirty && (existing.lastDrainedAt <= 0L || now - existing.lastDrainedAt !in 0 until reReportWindowMs)
             existing.entry = existing.entry.copy(
                 gmsVersion = cleanGmsVersion ?: existing.entry.gmsVersion,
+                appVersionName = cleanAppVersionName ?: existing.entry.appVersionName,
+                microgVersionName = cleanMicrogVersionName ?: existing.entry.microgVersionName,
                 count = existing.entry.count + 1L,
                 lastSeenAt = maxOf(existing.entry.lastSeenAt, now),
             )
@@ -194,32 +227,81 @@ class UnsupportedApiStore(
         return true
     }
 
-    /** Returns entries seen for [packageName] within [windowMs], newest first, without clearing dirty bits. */
+    /** Returns entries seen for [packageName] within [windowMs], newest first, bounded by [maxBytes], without clearing dirty bits. */
     @Synchronized
-    fun recentFor(packageName: String?, windowMs: Long, limit: Int = DEFAULT_RECENT_LIMIT): List<UnsupportedApiEntry> {
+    fun recentFor(
+        packageName: String?,
+        windowMs: Long,
+        limit: Int = DEFAULT_RECENT_LIMIT,
+        maxBytes: Int = MAX_IPC_REPLY_BYTES,
+    ): List<UnsupportedApiEntry> {
         val cleanPkg = cleanPackage(packageName) ?: return emptyList()
         val now = clock()
         val boundedWindow = windowMs.coerceIn(1_000L, MAX_RECENT_WINDOW_MS)
         val boundedLimit = limit.coerceIn(1, MAX_RECENT_LIMIT)
-        return slots.values.asSequence()
+        val candidates = slots.values.asSequence()
             .map { it.entry }
             .filter { it.packageName == cleanPkg && now - it.lastSeenAt in 0..boundedWindow }
             .sortedByDescending { it.lastSeenAt }
             .take(boundedLimit)
             .toList()
+        return fitWithinBytes(candidates, maxBytes).first
     }
 
-    /** Returns newly dirty entries (newest first, up to [limit]) and marks them drained. */
+    /**
+     * Returns newly dirty entries (newest first, up to [limit] and [maxBytes]) WITHOUT clearing dirty flags.
+     * The second element is true when additional dirty entries remain after this batch.
+     */
     @Synchronized
-    fun drainDirty(limit: Int = DEFAULT_DRAIN_LIMIT): List<UnsupportedApiEntry> {
+    fun peekDirty(
+        limit: Int = DEFAULT_DRAIN_LIMIT,
+        maxBytes: Int = MAX_IPC_REPLY_BYTES,
+    ): Pair<List<UnsupportedApiEntry>, Boolean> {
+        val boundedLimit = limit.coerceIn(1, MAX_DRAIN_LIMIT)
+        val allDirty = slots.values.filter { it.dirty }.sortedByDescending { it.entry.lastSeenAt }
+        val capped = allDirty.take(boundedLimit).map { it.entry }
+        val (fitted, overflowedBytes) = fitWithinBytes(capped, maxBytes)
+        val hasMore = overflowedBytes || allDirty.size > fitted.size
+        return fitted to hasMore
+    }
+
+    /**
+     * Marks previously peeked entries clean only if no newer observation has arrived since [ackedLastSeenAt].
+     * Returns the number of slots transitioned from dirty to clean.
+     */
+    @Synchronized
+    fun ackDrained(acks: List<Pair<String, Long>>): Int {
+        val now = clock()
+        var acked = 0
+        for ((key, ackedLastSeenAt) in acks) {
+            val slot = slots[key] ?: continue
+            if (slot.dirty && slot.entry.lastSeenAt <= ackedLastSeenAt) {
+                slot.dirty = false
+                slot.lastDrainedAt = now
+                acked++
+            }
+        }
+        return acked
+    }
+
+    /** Returns newly dirty entries (newest first, up to [limit] and [maxBytes]) and marks only the returned entries drained. */
+    @Synchronized
+    fun drainDirty(
+        limit: Int = DEFAULT_DRAIN_LIMIT,
+        maxBytes: Int = MAX_IPC_REPLY_BYTES,
+    ): List<UnsupportedApiEntry> {
         val now = clock()
         val boundedLimit = limit.coerceIn(1, MAX_DRAIN_LIMIT)
         val dirtySlots = slots.values.filter { it.dirty }.sortedByDescending { it.entry.lastSeenAt }.take(boundedLimit)
+        val fitted = fitWithinBytes(dirtySlots.map { it.entry }, maxBytes).first
+        val fittedKeys = fitted.mapTo(HashSet(fitted.size)) { it.key }
         for (slot in dirtySlots) {
-            slot.dirty = false
-            slot.lastDrainedAt = now
+            if (slot.entry.key in fittedKeys) {
+                slot.dirty = false
+                slot.lastDrainedAt = now
+            }
         }
-        return dirtySlots.map { it.entry }
+        return fitted
     }
 
     /**
@@ -323,6 +405,8 @@ class UnsupportedApiStore(
         const val MAX_PACKAGE_LENGTH = 200
         const val MAX_SERVICE_LENGTH = 160
         const val MAX_FEATURE_LENGTH = 120
+        const val MAX_VERSION_NAME_LENGTH = 100
+        const val MAX_IPC_REPLY_BYTES = 128 * 1024
         const val DEFAULT_RECENT_LIMIT = 16
         const val MAX_RECENT_LIMIT = 32
         const val MAX_RECENT_WINDOW_MS = 10 * 60 * 1000L
@@ -393,6 +477,36 @@ class UnsupportedApiStore(
                 val name = f.name.trim()
                 if (name.isEmpty()) null else "$name@${f.version}"
             }.distinct().sorted().take(MAX_FEATURES)
+
+        /**
+         * Selects the longest prefix of [entries] whose serialized JSON array stays within [maxBytes] UTF-8 bytes
+         * (keeping Binder ContentProvider replies safely below Android's TransactionTooLargeException ceiling).
+         */
+        fun fitWithinBytes(
+            entries: List<UnsupportedApiEntry>,
+            maxBytes: Int = MAX_IPC_REPLY_BYTES,
+        ): Pair<List<UnsupportedApiEntry>, Boolean> {
+            if (entries.isEmpty() || maxBytes <= 2) return emptyList<UnsupportedApiEntry>() to entries.isNotEmpty()
+            val out = ArrayList<UnsupportedApiEntry>(entries.size)
+            var usedBytes = 2 // "[]"
+            var overflowed = false
+            for (entry in entries) {
+                val itemBytes = entry.toJson().toString().toByteArray(Charsets.UTF_8).size
+                val sepBytes = if (out.isNotEmpty()) 1 else 0
+                if (usedBytes + sepBytes + itemBytes > maxBytes) {
+                    if (out.isEmpty()) {
+                        // Single entry exceeds cap on its own: skip rather than wedging Binder forever.
+                        overflowed = true
+                        continue
+                    }
+                    overflowed = true
+                    break
+                }
+                out.add(entry)
+                usedBytes += sepBytes + itemBytes
+            }
+            return out to overflowed
+        }
     }
 }
 
@@ -411,6 +525,12 @@ object UnsupportedApiRecorder {
 
     @Volatile
     private var processTag: String = "default"
+
+    @Volatile
+    private var microgVersionCode: Long? = null
+
+    @Volatile
+    private var microgVersionName: String? = null
 
     private val loadLock = Any()
 
@@ -431,9 +551,13 @@ object UnsupportedApiRecorder {
     @JvmStatic
     fun init(context: Context) {
         val app = context.applicationContext ?: context
+        val (verCode, verName) = resolvePackageVersion(context, "com.google.android.gms")
+            .let { if (it.first != null) it else resolvePackageVersion(app, app.packageName) }
         synchronized(loadLock) {
             appContext = app
             processTag = sanitizeProcessTag(currentProcessName(app))
+            microgVersionCode = verCode
+            microgVersionName = verName
             ownSnapshotLoaded = false
         }
         io.execute {
@@ -505,6 +629,7 @@ object UnsupportedApiRecorder {
         if (request == null) return
         runCatching {
             val pkg = resolveCallerPackage(request.packageName, callingUid) ?: return
+            val (appVerCode, appVerName) = resolvePackageVersion(appContext, pkg)
             val requested = UnsupportedApiStore.formatFeatureSpecs(extractRequestedFeatures(request))
             val changed = store.record(
                 packageName = pkg,
@@ -513,6 +638,10 @@ object UnsupportedApiRecorder {
                 serviceId = request.serviceId,
                 gmsVersion = request.gmsVersion,
                 features = requested,
+                appVersionCode = appVerCode,
+                appVersionName = appVerName,
+                microgVersionCode = microgVersionCode,
+                microgVersionName = microgVersionName,
             )
             if (changed) schedulePersist()
         }
@@ -523,10 +652,15 @@ object UnsupportedApiRecorder {
         if (serviceAction.isNullOrBlank()) return
         runCatching {
             val pkg = resolveCallerPackage(null, callingUid) ?: return
+            val (appVerCode, appVerName) = resolvePackageVersion(appContext, pkg)
             val changed = store.record(
                 packageName = pkg,
                 kind = UnsupportedApiStore.KIND_UNRESOLVED_ACTION,
                 service = serviceAction,
+                appVersionCode = appVerCode,
+                appVersionName = appVerName,
+                microgVersionCode = microgVersionCode,
+                microgVersionName = microgVersionName,
             )
             if (changed) schedulePersist()
         }
@@ -540,31 +674,67 @@ object UnsupportedApiRecorder {
             val specs = features.mapNotNull { toSpec(it) }
             val formatted = UnsupportedApiStore.formatFeatureSpecs(specs)
             if (formatted.isEmpty()) return
+            val (appVerCode, appVerName) = resolvePackageVersion(appContext, pkg)
             val changed = store.record(
                 packageName = pkg,
                 kind = UnsupportedApiStore.KIND_MODULE_INSTALL,
                 service = GmsService.MODULE_INSTALL.name,
                 serviceId = GmsService.MODULE_INSTALL.SERVICE_ID,
                 features = formatted,
+                appVersionCode = appVerCode,
+                appVersionName = appVerName,
+                microgVersionCode = microgVersionCode,
+                microgVersionName = microgVersionName,
             )
             if (changed) schedulePersist()
         }
     }
 
-    fun recentFor(context: Context, packageName: String?, windowMs: Long, limit: Int): List<UnsupportedApiEntry> {
+    fun recentFor(
+        context: Context,
+        packageName: String?,
+        windowMs: Long,
+        limit: Int,
+        maxBytes: Int = UnsupportedApiStore.MAX_IPC_REPLY_BYTES,
+    ): List<UnsupportedApiEntry> {
         val app = context.applicationContext ?: context
         if (appContext == null) appContext = app
         ensureOwnSnapshotLoaded(app)
         mergeSiblingSnapshots(app)
-        return store.recentFor(packageName, windowMs, limit)
+        return store.recentFor(packageName, windowMs, limit, maxBytes)
     }
 
-    fun drainDirty(context: Context, limit: Int): List<UnsupportedApiEntry> {
+    fun peekDirty(
+        context: Context,
+        limit: Int,
+        maxBytes: Int = UnsupportedApiStore.MAX_IPC_REPLY_BYTES,
+    ): Pair<List<UnsupportedApiEntry>, Boolean> {
         val app = context.applicationContext ?: context
         if (appContext == null) appContext = app
         ensureOwnSnapshotLoaded(app)
         mergeSiblingSnapshots(app)
-        val drained = store.drainDirty(limit)
+        return store.peekDirty(limit, maxBytes)
+    }
+
+    fun ackDrained(context: Context, acks: List<Pair<String, Long>>): Int {
+        val app = context.applicationContext ?: context
+        if (appContext == null) appContext = app
+        ensureOwnSnapshotLoaded(app)
+        val acked = store.ackDrained(acks)
+        if (acked > 0) schedulePersist()
+        return acked
+    }
+
+    fun drainDirty(
+        context: Context,
+        limit: Int,
+        maxBytes: Int = UnsupportedApiStore.MAX_IPC_REPLY_BYTES,
+    ): List<UnsupportedApiEntry> {
+        val app = context.applicationContext ?: context
+        if (appContext == null) appContext = app
+        ensureOwnSnapshotLoaded(app)
+        mergeSiblingSnapshots(app)
+        val drained = store.drainDirty(limit, maxBytes)
         if (drained.isNotEmpty()) schedulePersist()
         return drained
     }
@@ -582,6 +752,7 @@ object UnsupportedApiRecorder {
         val errorName = UnsupportedApiStore.unsupportedStatusName(statusCode)
         if (errorName != null) {
             val pkg = resolveCallerPackage(requestedPkg, callingUid) ?: return
+            val (appVerCode, appVerName) = resolvePackageVersion(appContext, pkg)
             val changed = store.record(
                 packageName = pkg,
                 kind = UnsupportedApiStore.KIND_SERVICE_ERROR,
@@ -591,6 +762,10 @@ object UnsupportedApiRecorder {
                 statusCode = statusCode,
                 statusName = errorName,
                 features = UnsupportedApiStore.formatFeatureSpecs(requestedFeatures),
+                appVersionCode = appVerCode,
+                appVersionName = appVerName,
+                microgVersionCode = microgVersionCode,
+                microgVersionName = microgVersionName,
             )
             if (changed) schedulePersist()
             return
@@ -599,6 +774,7 @@ object UnsupportedApiRecorder {
             val missing = UnsupportedApiStore.missingFeatures(requestedFeatures, advertisedFeatures)
             if (missing.isEmpty()) return
             val pkg = resolveCallerPackage(requestedPkg, callingUid) ?: return
+            val (appVerCode, appVerName) = resolvePackageVersion(appContext, pkg)
             val changed = store.record(
                 packageName = pkg,
                 kind = UnsupportedApiStore.KIND_MISSING_FEATURES,
@@ -606,9 +782,22 @@ object UnsupportedApiRecorder {
                 serviceId = serviceId,
                 gmsVersion = gmsVersion,
                 features = missing,
+                appVersionCode = appVerCode,
+                appVersionName = appVerName,
+                microgVersionCode = microgVersionCode,
+                microgVersionName = microgVersionName,
             )
             if (changed) schedulePersist()
         }
+    }
+
+    private fun resolvePackageVersion(ctx: Context?, pkg: String): Pair<Long?, String?> {
+        if (ctx == null) return null to null
+        return runCatching {
+            val info = ctx.packageManager.getPackageInfo(pkg, 0)
+            val code = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else @Suppress("DEPRECATION") info.versionCode.toLong()
+            code.takeIf { it > 0L } to info.versionName
+        }.getOrElse { null to null }
     }
 
     private fun extractRequestedFeatures(request: GetServiceRequest): List<FeatureSpec> {
