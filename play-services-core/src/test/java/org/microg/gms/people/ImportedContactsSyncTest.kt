@@ -405,14 +405,12 @@ class ImportedContactsSyncTest {
             native(StructuredName.CONTENT_ITEM_TYPE) { put(StructuredName.GIVEN_NAME, "Synthetic"); put(StructuredName.FULL_NAME_STYLE, 3) },
             native(StructuredName.CONTENT_ITEM_TYPE) { put(StructuredName.GIVEN_NAME, "Synthetic"); put(StructuredName.PHONETIC_NAME_STYLE, 3) },
             native(StructuredName.CONTENT_ITEM_TYPE) { put(StructuredName.GIVEN_NAME, "Synthetic"); put(StructuredName.DISPLAY_NAME, "Custom display") },
-            native(StructuredName.CONTENT_ITEM_TYPE) { put(StructuredName.GIVEN_NAME, "Synthetic"); put(Data.IS_PRIMARY, 1) },
+            native(Organization.CONTENT_ITEM_TYPE) { put(Organization.COMPANY, "Fixture Co"); put(Organization.TYPE, Organization.TYPE_CUSTOM); put(Organization.LABEL, "work") },
             native(Nickname.CONTENT_ITEM_TYPE) { put(Nickname.NAME, "Nickname"); put(Nickname.TYPE, Nickname.TYPE_DEFAULT) },
             native(Nickname.CONTENT_ITEM_TYPE) { put(Nickname.NAME, "Nickname"); put(Nickname.LABEL, "Custom nickname") },
-            native(Nickname.CONTENT_ITEM_TYPE) { put(Nickname.NAME, "Nickname"); put(Data.IS_SUPER_PRIMARY, 1) },
             native(Phone.CONTENT_ITEM_TYPE) { put(Phone.NUMBER, "123"); put(Phone.TYPE, Phone.TYPE_CAR) },
             native(Phone.CONTENT_ITEM_TYPE) { put(Phone.NUMBER, "123"); put(Phone.NORMALIZED_NUMBER, "+1123") },
-            native(Website.CONTENT_ITEM_TYPE) { put(Website.URL, "https://example.invalid"); put(Website.TYPE, Website.TYPE_HOMEPAGE) },
-            native(Website.CONTENT_ITEM_TYPE) { put(Website.URL, "ftp://example.invalid"); put(Website.TYPE, Website.TYPE_FTP) },
+            native(Website.CONTENT_ITEM_TYPE) { put(Website.URL, "https://example.invalid"); put(Website.TYPE, 99) },
             native(Email.CONTENT_ITEM_TYPE) { put(Email.ADDRESS, "native@invalid"); put(Email.TYPE, Email.TYPE_HOME); put(Email.LABEL, "Extra label") },
             native(Email.CONTENT_ITEM_TYPE) { put(Email.ADDRESS, "native@invalid"); put(Email.TYPE, Email.TYPE_CUSTOM); put(Email.LABEL, "home") },
             native(Im.CONTENT_ITEM_TYPE) { put(Im.DATA, "Native"); put(Im.PROTOCOL, 42) },
@@ -573,5 +571,199 @@ class ImportedContactsSyncTest {
         val first = nativeImported(null, photo(7)); sync()
         nativeImported(null, photo(8)); sync()
         assertEquals(1, api.creates); assertEquals(listOf(first), provider.rawIds)
+    }
+
+    @Test fun websiteHomepageAndFtpTypesRoundTripAndCollapse() = fixture {
+        val remote = person().also {
+            it.json.put("urls", JSONArray()
+                .put(JSONObject().put("value", "https://example.invalid").put("type", "homePage"))
+                .put(JSONObject().put("value", "ftp://files.example.invalid").put("type", "ftp")))
+        }
+        api.remote[remote.resource] = remote
+        sync()
+        val keeper = store.contacts().single().id
+        val copied = nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, Website.CONTENT_ITEM_TYPE)
+            put(Website.URL, "https://example.invalid"); put(Website.TYPE, Website.TYPE_HOMEPAGE)
+        })
+        provider.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Website.CONTENT_ITEM_TYPE)
+            put(Website.URL, "ftp://files.example.invalid"); put(Website.TYPE, Website.TYPE_FTP)
+        })
+        val report = sync()
+        assertEquals(0, report.unverifiedImports)
+        assertEquals(listOf(keeper), provider.rawIds)
+        assertEquals(0, api.creates + api.updates)
+        // Fresh download also stores native TYPE_HOMEPAGE (1) and TYPE_FTP (6).
+        val types = provider.query(Data.CONTENT_URI, arrayOf(Website.TYPE),
+            "${Data.RAW_CONTACT_ID}=? AND ${Data.MIMETYPE}=?", arrayOf(keeper.toString(), Website.CONTENT_ITEM_TYPE), "${Website.TYPE} ASC").use { c ->
+            buildList { while (c.moveToNext()) add(c.getInt(0)) }
+        }
+        assertEquals(listOf(Website.TYPE_HOMEPAGE, Website.TYPE_FTP), types)
+    }
+
+    @Test fun untypedCustomOrganizationAndPrimaryNameFlagsAdoptAndCollapse() = fixture {
+        val remote = person().also {
+            it.json.put("organizations", JSONArray().put(JSONObject().put("name", "Acme").put("type", "other")))
+        }
+        api.remote[remote.resource] = remote
+        sync()
+        val keeper = store.contacts().single().id
+        val copied = provider.addRaw(account, null)
+        provider.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, StructuredName.CONTENT_ITEM_TYPE)
+            put(StructuredName.GIVEN_NAME, "Synthetic"); put(StructuredName.DISPLAY_NAME, "Synthetic")
+            put(StructuredName.FULL_NAME_STYLE, 1); put(StructuredName.PHONETIC_NAME_STYLE, 0)
+            put(Data.IS_PRIMARY, 1); put(Data.IS_SUPER_PRIMARY, 1)
+        })
+        provider.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Phone.CONTENT_ITEM_TYPE)
+            put(Phone.NUMBER, "123"); put(Phone.TYPE, Phone.TYPE_MOBILE); put(Data.IS_SUPER_PRIMARY, 1)
+        })
+        provider.insert(Data.CONTENT_URI, ContentValues().apply {
+            put(Data.RAW_CONTACT_ID, copied); put(Data.MIMETYPE, Organization.CONTENT_ITEM_TYPE)
+            put(Organization.COMPANY, "Acme"); put(Organization.TYPE, Organization.TYPE_CUSTOM)
+        })
+        val report = sync()
+        assertEquals(0, report.unverifiedImports)
+        assertEquals(listOf(keeper), provider.rawIds)
+        assertEquals(0, api.creates + api.updates)
+
+        // Note IS_PRIMARY / IS_SUPER_PRIMARY and untyped Event TYPE_CUSTOM=0 also pass losslessImport.
+        val note = ContentValues().apply {
+            put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Note.CONTENT_ITEM_TYPE)
+            put(ContactsContract.CommonDataKinds.Note.NOTE, "Memo")
+            put(Data.IS_PRIMARY, 1); put(Data.IS_SUPER_PRIMARY, 1)
+        }
+        assertTrue(ContactFieldMapper.losslessImport(note))
+        val event = ContentValues().apply {
+            put(Data.MIMETYPE, Event.CONTENT_ITEM_TYPE)
+            put(Event.START_DATE, "2020-05-01"); put(Event.TYPE, Event.TYPE_CUSTOM)
+        }
+        assertTrue(ContactFieldMapper.losslessImport(event))
+    }
+
+    @Test fun collapseImportCopiesMissingPhotoOntoKeeperAndUploadsIt() = fixture {
+        val remote = person(); api.remote[remote.resource] = remote
+        sync()
+        val keeper = store.contacts().single().id
+        assertFalse(store.contacts().single().hasPhoto)
+
+        val photoBytes = byteArrayOf(10, 20, 30, 40)
+        val copied = nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+            put(ContactsContract.CommonDataKinds.Photo.PHOTO, photoBytes)
+        })
+        val report = sync()
+        assertEquals(0, report.unverifiedImports)
+        assertEquals(listOf(keeper), provider.rawIds)
+        assertEquals(0, api.creates + api.updates)
+        assertTrue(store.contacts().single().hasPhoto)
+        assertTrue(store.contacts().single().dirty)
+
+        // Next phase (PhotosSync) uploads the adopted photo onto the existing Google contact and clears dirty.
+        val uploadedPhotos = mutableListOf<Pair<String, ByteArray?>>()
+        val photosApi = object : PhotosApi {
+            override fun readPhoto(url: String): ByteArray = uploadedPhotos.last().second!!
+            override fun writePhoto(resource: String, bytes: ByteArray?): Person {
+                uploadedPhotos.add(resource to bytes)
+                val updated = JSONObject(api.remote.getValue(resource).json.toString())
+                if (bytes != null) {
+                    val rev = ContactPhotos.hash(bytes)
+                    updated.put("photos", JSONArray().put(JSONObject()
+                        .put("url", "fsa2-photo:17:$rev")
+                        .put("metadata", JSONObject().put("source", JSONObject().put("type", "CONTACT")))))
+                } else updated.remove("photos")
+                return Person.parse(updated).also { api.remote[resource] = it }
+            }
+        }
+        val photoReport = PhotosSync(api, photosApi, store) { prefs.mode }.sync()
+        assertEquals(1, photoReport.uploaded)
+        assertEquals(0, photoReport.conflicts + photoReport.uncertain + photoReport.skipped)
+        assertEquals(1, uploadedPhotos.size)
+        assertEquals(remote.resource, uploadedPhotos.single().first)
+        assertArrayEquals(photoBytes, uploadedPhotos.single().second)
+        assertFalse(store.contacts().single().dirty)
+
+        // A different copied photo when keeper already has a photo is still held for review, never overwritten.
+        val conflicting = nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+            put(ContactsContract.CommonDataKinds.Photo.PHOTO, byteArrayOf(99, 98, 97))
+        })
+        assertEquals(1, sync().unverifiedImports)
+        assertEquals(listOf(keeper, conflicting), provider.rawIds)
+        assertNull(raw(conflicting, RawContacts.SYNC4))
+
+        // Remove the conflicting row, then delete keeper's photo locally and sync the deletion to Google.
+        // Repeating the original copied import must not resurrect a photo the owner deleted.
+        provider.delete(RawContacts.CONTENT_URI.buildUpon().appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true").build(),
+            "_id=?", arrayOf(conflicting.toString()))
+        provider.delete(Data.CONTENT_URI, "${Data.RAW_CONTACT_ID}=? AND ${Data.MIMETYPE}=?",
+            arrayOf(keeper.toString(), ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE))
+        assertEquals(1, PhotosSync(api, photosApi, store) { prefs.mode }.sync().uploaded)
+        assertFalse(store.contacts().single().hasPhoto)
+
+        nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+            put(ContactsContract.CommonDataKinds.Photo.PHOTO, photoBytes)
+        })
+        assertEquals(0, sync().unverifiedImports)
+        assertEquals(listOf(keeper), provider.rawIds)
+        assertFalse(store.contacts().single().hasPhoto)
+    }
+
+    @Test fun collapseImportDoesNotCopyPhotoInDownloadOnlyModeOrOverDeletedRemotePhoto() {
+        fixture(SyncMode.DOWNLOAD) {
+            val remote = person(); api.remote[remote.resource] = remote
+            sync()
+            val keeper = store.contacts().single().id
+            val copied = nativeImported(null, ContentValues().apply {
+                put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+                put(ContactsContract.CommonDataKinds.Photo.PHOTO, byteArrayOf(1, 2, 3))
+            })
+            assertEquals(1, sync().unverifiedImports)
+            assertEquals(listOf(keeper, copied), provider.rawIds)
+            assertFalse(store.contacts().single().hasPhoto)
+        }
+        fixture(SyncMode.TWO_WAY) {
+            val remotePhoto = "fsa2-photo:17:${ContactPhotos.hash(byteArrayOf(7, 7, 7))}"
+            val remote = person().also {
+                it.json.put("photos", JSONArray().put(JSONObject().put("url", remotePhoto)
+                    .put("metadata", JSONObject().put("source", JSONObject().put("type", "CONTACT")))))
+            }
+            api.remote[remote.resource] = remote
+            sync() // Metadata downloaded (_photoRemote set), photo not yet installed locally.
+            val keeper = store.contacts().single().id
+            assertFalse(store.contacts().single().hasPhoto)
+            val copied = nativeImported(null, ContentValues().apply {
+                put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+                put(ContactsContract.CommonDataKinds.Photo.PHOTO, byteArrayOf(1, 2, 3))
+            })
+            assertEquals(1, sync().unverifiedImports)
+            assertEquals(listOf(keeper, copied), provider.rawIds)
+            assertFalse(store.contacts().single().hasPhoto)
+        }
+    }
+
+    @Test fun providerV2ReviewCacheInvalidatesForPhotoDuplicateRecovery() = fixture {
+        val remote = person(); api.remote[remote.resource] = remote
+        sync()
+        val keeper = store.contacts().single().id
+        val copied = nativeImported(null, ContentValues().apply {
+            put(Data.MIMETYPE, ContactsContract.CommonDataKinds.Photo.CONTENT_ITEM_TYPE)
+            put(ContactsContract.CommonDataKinds.Photo.PHOTO, byteArrayOf(5, 6, 7))
+        })
+        // Simulate an already-cached positive check from provider-v2 (as on phones upgraded after import_review).
+        val v2Key = "${account.type}:${account.name}:importChecks:provider-v2:${PrivatePeopleApi.OWNER}"
+        RuntimeEnvironment.getApplication().getSharedPreferences("contacts-sync", 0).edit()
+            .putString(v2Key, JSONObject().put(copied.toString(), raw(copied, RawContacts.VERSION)!!.toLong()).toString()).commit()
+        store.checkpoint("old-cursor")
+        api.listTokens.clear()
+
+        val report = sync()
+        assertEquals(0, report.unverifiedImports)
+        assertEquals(listOf<String?>(null), api.listTokens)
+        assertEquals(listOf(keeper), provider.rawIds)
+        assertTrue(store.contacts().single().hasPhoto)
     }
 }

@@ -285,7 +285,10 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
         val signature = importSignature(candidate)
         val signatures = importSignatures(json)
         val sameFields = importFields(candidate.fields) in setOf(importFields(keeper.fields), importFields(keeper.baseline))
-        if (signature !in signatures && (!sameFields || candidate.hasPhoto && signature.split(':')[1] != importSignature(keeper).split(':')[1])) return false
+        val copyPhoto = signature !in signatures && sameFields && candidate.hasPhoto && !keeper.hasPhoto &&
+            prefs.mode == SyncMode.TWO_WAY && photoBaseline(json)?.remote == null &&
+            (json.isNull("_photoRemote") || json.optString("_photoRemote").isEmpty())
+        if (signature !in signatures && (!sameFields || candidate.hasPhoto && !copyPhoto && signature.split(':')[1] != importSignature(keeper).split(':')[1])) return false
         val operations = arrayListOf(assertImport(candidate), assertVersion(keeper))
         if (signature in signatures) {
             // The entire import (including photo, favorite and memberships) was
@@ -296,6 +299,10 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
             return true
         }
         if (keeper.pending != null) return false
+        val photo = if (copyPhoto) {
+            val bytes = photoBytes(PhotoContact(candidate, photoToken(candidate.id), null, null)) ?: throw UnreadableContact()
+            if (bytes.size > 256 * 1024) PhotoEncoding.providerBytes(bytes) else bytes
+        } else null
         // Memberships identify labels, not people. Retain any new imported label
         // when removing a repeated copy of the same complete contact data.
         fun groupIds(id: Long) = provider.query(Data.CONTENT_URI, arrayOf(GroupMembership.GROUP_ROW_ID),
@@ -306,11 +313,17 @@ class AndroidContactStore(private val provider: ContentProviderClient, private v
         val newStarred = starred(candidate.id) && !starred(keeper.id)
         for (id in groups) operations.add(ContentProviderOperation.newInsert(syncUri(Data.CONTENT_URI))
             .withValue(Data.RAW_CONTACT_ID, keeper.id).withValue(Data.MIMETYPE, GroupMembership.CONTENT_ITEM_TYPE).withValue(GroupMembership.GROUP_ROW_ID, id).build())
+        if (photo != null) {
+            operations.add(ContentProviderOperation.newDelete(syncUri(Data.CONTENT_URI))
+                .withSelection("${Data.RAW_CONTACT_ID}=? AND ${Data.MIMETYPE}=?", arrayOf(keeper.id.toString(), Photo.CONTENT_ITEM_TYPE)).build())
+            operations.add(ContentProviderOperation.newInsert(syncUri(Data.CONTENT_URI))
+                .withValue(Data.RAW_CONTACT_ID, keeper.id).withValue(Data.MIMETYPE, Photo.CONTENT_ITEM_TYPE).withValue(Photo.PHOTO, photo).build())
+        }
         json.put("_imports", org.json.JSONArray((signatures + signature).toList()))
         val values = ContentValues().apply {
             put(RawContacts.SYNC2, json.toString())
             if (newStarred) put(RawContacts.STARRED, 1)
-            if (groups.isNotEmpty() || newStarred) put(RawContacts.DIRTY, 1)
+            if (groups.isNotEmpty() || newStarred || photo != null) put(RawContacts.DIRTY, 1)
         }
         operations.add(ContentProviderOperation.newUpdate(syncUri(RawContacts.CONTENT_URI)).withSelection(rawScope(keeper.id), args).withValues(values).withExpectedCount(1).build())
         operations.add(ContentProviderOperation.newDelete(syncUri(RawContacts.CONTENT_URI)).withSelection(rawScope(candidate.id), args).withExpectedCount(1).build())

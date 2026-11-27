@@ -65,8 +65,9 @@ object ContactFieldMapper {
             mapOf("home" to Im.TYPE_HOME, "work" to Im.TYPE_WORK, "other" to Im.TYPE_OTHER)),
         Spec("userDefined", USER_DEFINED_MIME, mapOf("key" to Data.DATA1, "value" to Data.DATA2)),
         Spec("urls", Website.CONTENT_ITEM_TYPE, mapOf("value" to Website.URL), Website.TYPE, Website.LABEL,
-            mapOf("home" to Website.TYPE_HOME, "work" to Website.TYPE_WORK, "blog" to Website.TYPE_BLOG,
-                "profile" to Website.TYPE_PROFILE, "other" to Website.TYPE_OTHER))
+            mapOf("homePage" to Website.TYPE_HOMEPAGE, "blog" to Website.TYPE_BLOG,
+                "profile" to Website.TYPE_PROFILE, "home" to Website.TYPE_HOME,
+                "work" to Website.TYPE_WORK, "ftp" to Website.TYPE_FTP, "other" to Website.TYPE_OTHER))
     )
     val managedMimes = specs.map { it.mime }.toSet() + Event.CONTENT_ITEM_TYPE
     private val primaryFields = setOf("phoneNumbers", "emailAddresses", "addresses", "organizations", "nicknames", "urls")
@@ -79,6 +80,7 @@ object ContactFieldMapper {
     /** Import ownership/deletion requires every populated native value to survive projection. */
     fun losslessImport(row: ContentValues, normalize: (String?, ContentValues) -> ContentValues? = { _, _ -> null }): Boolean {
         val mime = row.getAsString(Data.MIMETYPE)
+        val spec = specs.firstOrNull { it.mime == mime }
         val reconstructed = when (mime) {
             Photo.CONTENT_ITEM_TYPE -> ContentValues().apply {
                 put(Photo.PHOTO, row.getAsByteArray(Photo.PHOTO)); put(Data.IS_PRIMARY, 1)
@@ -99,7 +101,7 @@ object ContactFieldMapper {
                 rows(Person("", json)).singleOrNull() ?: return false
             }
             else -> {
-                val spec = specs.firstOrNull { it.mime == mime } ?: return false
+                if (spec == null) return false
                 fromJson(spec, toJson(spec, row))
             }
         }
@@ -119,6 +121,17 @@ object ContactFieldMapper {
                 value == null || value == "" || value is ByteArray && value.isEmpty() -> true
                 // Switch writes undefined name styles (0); unset flags also carry no preference.
                 column in defaults && row.getAsString(column) == "0" -> true
+                // Google FSA2 never reads IS_SUPER_PRIMARY, and ignores IS_PRIMARY on StructuredName/Note
+                // (Switch sets both on StructuredName from iOS ABPerson.IsPreferredName).
+                column == Data.IS_SUPER_PRIMARY -> true
+                column == Data.IS_PRIMARY && (mime == StructuredName.CONTENT_ITEM_TYPE || mime == Note.CONTENT_ITEM_TYPE) -> true
+                // TYPE_CUSTOM (0) with no custom label carries no type information; Switch writes Organization.TYPE=0
+                // with null LABEL for iOS company fields, and Google FSA2 treats untyped 0 with empty label as unspecified/other.
+                spec != null && spec.typeColumn != null && spec.labelColumn != null && column == spec.typeColumn &&
+                    row.getAsString(column) == "0" && row.getAsString(spec.labelColumn).isNullOrEmpty() &&
+                    projected.getAsString(column) == spec.types["other"]?.toString() -> true
+                mime == Event.CONTENT_ITEM_TYPE && column == Event.TYPE && row.getAsString(column) == "0" &&
+                    row.getAsString(Event.LABEL).isNullOrEmpty() && projected.getAsString(column) == Event.TYPE_OTHER.toString() -> true
                 // Permit only an exactly redundant normalized phone number, not guessed country/format equivalence.
                 mime == Phone.CONTENT_ITEM_TYPE && column == Phone.NORMALIZED_NUMBER && value is String && value == row.getAsString(Phone.NUMBER) -> true
                 value is ByteArray -> (projected.get(column) as? ByteArray)?.contentEquals(value) == true
