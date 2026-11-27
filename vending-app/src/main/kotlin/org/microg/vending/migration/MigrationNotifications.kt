@@ -64,8 +64,15 @@ internal object MigrationNotifications {
         if (!summary.getBoolean("complete")) return
         val prefs = context.getSharedPreferences("migration-notifications", Context.MODE_PRIVATE)
         if (prefs.getBoolean(sessionId, false)) return
-        val manager = availableManager(context) ?: return
         val results = summary.getParcelableArray("cyclon_app_results")?.map { it as Bundle }.orEmpty()
+        if (cancelledWithNothingSelected(summary, results)) {
+            // CYC-3430: a transfer cancelled before any app was chosen (Setup's copy skipped, Transfer Phone backed out
+            // of) has nothing to review. Drop any open selection prompt and keep the receipt so no pass posts one later.
+            clearSelectionOpen(context, sessionId)
+            check(prefs.edit().putBoolean(sessionId, true).putBoolean("$sessionId:review_active", false).commit())
+            return
+        }
+        val manager = availableManager(context) ?: return
         val installed = results.count { it.getBoolean("installed") }
         val text = if (installed == results.size) "$installed apps installed" else "$installed of ${results.size} apps installed. Review the remaining apps."
         val notification = Notification.Builder(context, CHANNEL)
@@ -85,6 +92,13 @@ internal object MigrationNotifications {
             // Keep the receipt unset so a later observation can notify after permission is granted.
         }
     }
+
+    /**
+     * Results hold one row per app in the session's stored selection (`$id:packages`), whatever its install state, plus
+     * catalog exclusions marked `excluded`. Only exclusions means no app was ever chosen for install.
+     */
+    private fun cancelledWithNothingSelected(summary: Bundle, results: List<Bundle>) =
+        summary.getString("transfer_outcome") == "cancelled" && results.all { it.getBoolean("excluded") }
 
     private fun availableManager(context: Context): NotificationManager? {
         val manager = context.getSystemService(NotificationManager::class.java)
