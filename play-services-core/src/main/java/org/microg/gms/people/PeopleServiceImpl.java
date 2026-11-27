@@ -69,6 +69,7 @@ public class PeopleServiceImpl extends IPeopleService.Stub {
     @Override
     public void loadOwners(final IPeopleCallbacks callbacks, boolean var2, boolean var3, final String accountName, String var5, int sortOrder) {
         Log.d(TAG, "loadOwners: " + var2 + ", " + var3 + ", " + accountName + ", " + var5 + ", " + sortOrder);
+        // Cyclon: keep the READ_CONTACTS fallback rather than upstream 0eea8f690's OWNER-only gate so contacts-capable apps and Android Switch are not blocked; Cyclon's device account stays hidden below.
         if (context.checkCallingPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) {
             PackageUtils.assertGooglePackagePermission(context, GooglePackagePermission.OWNER);
         }

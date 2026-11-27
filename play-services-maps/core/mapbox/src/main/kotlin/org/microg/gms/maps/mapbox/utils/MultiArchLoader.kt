@@ -83,6 +83,9 @@ class MultiArchLoader(private val mapContext: Context, private val appContext: C
             if (target.length() != size || attempt == 2) {
                 if (!extract(apkFile, path, size, crc, target)) continue
             }
+            // Android 17 (SDK 37+) rejects dynamically loading writable native libraries (#3883).
+            // Ensure copies extracted by earlier builds are read-only too.
+            target.setReadOnly()
             if (tryLoad(target)) return true
         }
         return false
@@ -120,6 +123,8 @@ class MultiArchLoader(private val mapContext: Context, private val appContext: C
                 Log.w(TAG, "Extracted $path has $length bytes, CRC ${java.lang.Long.toHexString(written.value)}; expected $size, ${java.lang.Long.toHexString(crc)}")
                 return false
             }
+            // Make read-only before rename so the target appears already read-only (Android 17 / SDK 37+).
+            temp.setReadOnly()
             // rename() replaces atomically: a process loading the target sees either the old or the new complete file.
             if (!temp.renameTo(target)) {
                 Log.w(TAG, "Can't move $temp to $target")

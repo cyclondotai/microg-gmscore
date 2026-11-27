@@ -62,6 +62,10 @@ public class AskPermissionActivity extends AccountAuthenticatorActivity {
     private AuthManager authManager;
     private IntentData data;
 
+    public static boolean isFromAccountManager(Intent intent) {
+        return intent != null && intent.getBooleanExtra(EXTRA_FROM_ACCOUNT_MANAGER, false);
+    }
+
     private static class IntentData {
         private String accountName;
         private String accountType;
@@ -87,7 +91,7 @@ public class AskPermissionActivity extends AccountAuthenticatorActivity {
                 service = intent.getStringExtra(KEY_AUTHTOKEN);
                 callerUid = intent.getIntExtra(KEY_CALLER_UID, 0);
                 callerPid = intent.getIntExtra(KEY_CALLER_PID, 0);
-                fromAccountManager = intent.hasExtra(EXTRA_FROM_ACCOUNT_MANAGER);
+                fromAccountManager = isFromAccountManager(intent);
                 if (intent.hasExtra(EXTRA_CONSENT_DATA)) {
                     try {
                         consentData = ConsentData.ADAPTER.decode(intent.getByteArrayExtra(EXTRA_CONSENT_DATA));
