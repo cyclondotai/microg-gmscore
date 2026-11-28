@@ -16,6 +16,7 @@ import org.microg.gms.common.GmsService
 import org.microg.gms.fido.core.ui.ACTION_FIDO_AUTHENTICATE
 import org.microg.gms.fido.core.ui.AuthenticatorActivity.Companion.KEY_CALLER
 import org.microg.gms.fido.core.ui.AuthenticatorActivity.Companion.KEY_CREDENTIAL_ID
+import org.microg.gms.fido.core.ui.AuthenticatorActivity.Companion.KEY_HYBRID_ONLY
 import org.microg.gms.fido.core.ui.AuthenticatorActivity.Companion.KEY_OPTIONS
 import org.microg.gms.fido.core.ui.AuthenticatorActivity.Companion.KEY_SERVICE
 import org.microg.gms.fido.core.ui.AuthenticatorActivity.Companion.KEY_SOURCE
@@ -27,6 +28,7 @@ fun Context.buildFidoAuthenticateIntent(
     callingPackage: String?,
     type: String,
     credentialIdString: String? = null,
+    hybridOnly: Boolean = false,
 ): Intent = Intent(ACTION_FIDO_AUTHENTICATE).apply {
     `package` = packageName
     putExtra(KEY_SERVICE, GmsService.FIDO2_API.SERVICE_ID)
@@ -35,6 +37,7 @@ fun Context.buildFidoAuthenticateIntent(
     putExtra(KEY_OPTIONS, optionsBytes)
     callingPackage?.let { putExtra(KEY_CALLER, it) }
     credentialIdString?.let { putExtra(KEY_CREDENTIAL_ID, it) }
+    if (hybridOnly) putExtra(KEY_HYBRID_ONLY, true)
 }
 
 fun Context.buildAssistedSignInIntent(

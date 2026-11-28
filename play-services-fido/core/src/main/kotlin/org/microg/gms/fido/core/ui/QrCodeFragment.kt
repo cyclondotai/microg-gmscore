@@ -28,6 +28,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.databinding.DataBindingUtil
 import androidx.fragment.app.Fragment
+import kotlinx.coroutines.Job
 import org.microg.gms.fido.core.R
 import org.microg.gms.fido.core.RequestOptionsType
 import org.microg.gms.fido.core.databinding.FidoQrCodeFragmentBinding
@@ -49,10 +50,27 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
     companion object {
         private const val TAG = "QrCodeFragment"
         private const val REQUEST_BLUETOOTH_PERMISSIONS = 1001
+        private const val STATE_AWAITING_SETTINGS_RETURN = "awaitingSettingsReturn"
+        private const val STATE_PERMISSION_REQUEST_IN_FLIGHT = "permissionRequestInFlight"
     }
 
     private lateinit var binding: FidoQrCodeFragmentBinding
     private lateinit var activityHost: AuthenticatorActivity
+    private var transportJob: Job? = null
+    private var awaitingSettingsReturn = false
+    private var permissionRequestInFlight = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        awaitingSettingsReturn = savedInstanceState?.getBoolean(STATE_AWAITING_SETTINGS_RETURN, false) == true
+        permissionRequestInFlight = savedInstanceState?.getBoolean(STATE_PERMISSION_REQUEST_IN_FLIGHT, false) == true
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_AWAITING_SETTINGS_RETURN, awaitingSettingsReturn)
+        outState.putBoolean(STATE_PERMISSION_REQUEST_IN_FLIGHT, permissionRequestInFlight)
+    }
 
     override fun onCreateView(
         inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?
@@ -75,9 +93,35 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
 
         setupBodyText()
 
-        if (requestBluetoothPermissions()) {
-            activityHost.startTransportHandling(Transport.HYBRID)
+        if (!awaitingSettingsReturn && !permissionRequestInFlight && requestBluetoothPermissions()) {
+            ensureTransportStarted()
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (awaitingSettingsReturn) {
+            awaitingSettingsReturn = false
+            if (missingBluetoothPermissions().isEmpty()) {
+                ensureTransportStarted()
+            } else {
+                Toast.makeText(
+                    requireContext(), getString(R.string.fido_ble_permission_blocked_toast), Toast.LENGTH_SHORT
+                ).show()
+                activityHost.finish()
+            }
+        }
+    }
+
+    override fun onDestroyView() {
+        transportJob?.cancel()
+        transportJob = null
+        super.onDestroyView()
+    }
+
+    private fun ensureTransportStarted() {
+        if (!isAdded || transportJob?.isActive == true) return
+        transportJob = activityHost.startTransportHandling(Transport.HYBRID)
     }
 
     private fun setupBodyText() {
@@ -117,6 +161,36 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
         }
     }
 
+    private fun missingBluetoothPermissions(): List<String> {
+        val ctx = context ?: return emptyList()
+        val requiredPermissions = mutableListOf<String>()
+        if (SDK_INT >= 31) {
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_ADVERTISE) != PackageManager.PERMISSION_GRANTED) {
+                requiredPermissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            }
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                requiredPermissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                requiredPermissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                requiredPermissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH) != PackageManager.PERMISSION_GRANTED) {
+                requiredPermissions.add(Manifest.permission.BLUETOOTH)
+            }
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.BLUETOOTH_ADMIN) != PackageManager.PERMISSION_GRANTED) {
+                requiredPermissions.add(Manifest.permission.BLUETOOTH_ADMIN)
+            }
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                requiredPermissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+            }
+        }
+        return requiredPermissions
+    }
+
     private fun requestBluetoothPermissions(): Boolean {
         val act = activity ?: run {
             Log.w(TAG, "Activity is null, cannot request permissions")
@@ -127,56 +201,16 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
             return false
         }
 
-        val requiredPermissions = mutableListOf<String>()
-        if (SDK_INT >= 31) {
-            if (ContextCompat.checkSelfPermission(
-                    requireContext(), Manifest.permission.BLUETOOTH_ADVERTISE
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                requiredPermissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            }
-            if (ContextCompat.checkSelfPermission(
-                    requireContext(), Manifest.permission.BLUETOOTH_CONNECT
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                requiredPermissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-            }
-            if (ContextCompat.checkSelfPermission(
-                    requireContext(), Manifest.permission.BLUETOOTH_SCAN
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                requiredPermissions.add(Manifest.permission.BLUETOOTH_SCAN)
-            }
-            if (ContextCompat.checkSelfPermission(
-                    requireContext(), Manifest.permission.ACCESS_FINE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                requiredPermissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
-        } else {
-            if (ContextCompat.checkSelfPermission(requireContext(), Manifest.permission.BLUETOOTH) != PackageManager.PERMISSION_GRANTED) {
-                requiredPermissions.add(Manifest.permission.BLUETOOTH)
-            }
-            if (ContextCompat.checkSelfPermission(
-                    requireContext(), Manifest.permission.BLUETOOTH_ADMIN
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                requiredPermissions.add(Manifest.permission.BLUETOOTH_ADMIN)
-            }
-            if (ContextCompat.checkSelfPermission(
-                    requireContext(), Manifest.permission.ACCESS_FINE_LOCATION
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                requiredPermissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
-            }
-        }
+        val requiredPermissions = missingBluetoothPermissions()
 
         return if (requiredPermissions.isNotEmpty()) {
             try {
+                permissionRequestInFlight = true
                 requestPermissions(
                     requiredPermissions.toTypedArray(), REQUEST_BLUETOOTH_PERMISSIONS
                 )
             } catch (_: Exception) {
+                permissionRequestInFlight = false
                 Log.e(TAG, "requestPermissions failed in Fragment")
                 false
             }
@@ -192,11 +226,10 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         when (requestCode) {
             REQUEST_BLUETOOTH_PERMISSIONS -> {
-                val allGranted = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
+                permissionRequestInFlight = false
+                val allGranted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
                 if (allGranted) {
-                    if (isAdded) {
-                        activityHost.startTransportHandling(Transport.HYBRID)
-                    }
+                    ensureTransportStarted()
                 } else {
                     val deniedPermissions = permissions.filterIndexed { index, _ ->
                         grantResults.getOrNull(index) != PackageManager.PERMISSION_GRANTED
@@ -217,6 +250,7 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
                         Toast.makeText(
                             requireContext(), getString(R.string.fido_ble_permission_rationale), Toast.LENGTH_SHORT
                         ).show()
+                        activityHost.finish()
                     }
                 }
             }
@@ -229,14 +263,16 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
                 try {
                     val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
                         data = Uri.fromParts("package", requireContext().packageName, null)
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
                     }
+                    awaitingSettingsReturn = true
                     startActivity(intent)
                 } catch (e: Exception) {
+                    awaitingSettingsReturn = false
                     Log.e(TAG, "Failed to open app settings", e)
                     Toast.makeText(
                         requireContext(), getString(R.string.fido_ble_open_settings_failed), Toast.LENGTH_LONG
                     ).show()
+                    activityHost.finish()
                 }
             }.setNegativeButton(getString(R.string.fido_pin_cancel)) { dialog, _ ->
                 dialog.dismiss()
@@ -244,6 +280,7 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
                     Toast.makeText(
                         requireContext(), getString(R.string.fido_ble_permission_blocked_toast), Toast.LENGTH_SHORT
                     ).show()
+                    activityHost.finish()
                 }
             }.setCancelable(false).show()
     }

@@ -51,6 +51,27 @@ import org.microg.gms.utils.toBase64
 const val TAG = "FidoUi"
 const val ACTION_FIDO_AUTHENTICATE = "org.microg.gms.fido.AUTHENTICATE"
 
+/**
+ * How a request may start. Android's "another device" entry (microG's RemoteService) asks for
+ * [AuthenticatorActivity.KEY_HYBRID_ONLY]: such a request never offers the account passkey or starts instant screen
+ * lock, and offers only the cross-device QR flow.
+ */
+internal class RequestRoute(val hybridOnly: Boolean) {
+    val offersAccountPasskeys: Boolean
+        get() = !hybridOnly
+    val allowsInstantTransport: Boolean
+        get() = !hybridOnly
+
+    fun offeredTransports(supported: Set<Transport>): Set<Transport> =
+        if (hybridOnly) supported.intersect(setOf(HYBRID)) else supported
+
+    fun startDestination(requiresPrivilege: Boolean, hybridDestination: Int, fallback: () -> Int?): Int? = when {
+        requiresPrivilege -> null
+        hybridOnly -> hybridDestination
+        else -> fallback()
+    }
+}
+
 class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
     val options: RequestOptions?
         get() = when (intent.getStringExtra(KEY_SOURCE) to intent.getStringExtra(KEY_TYPE)) {
@@ -70,6 +91,8 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
         }
     val source: String?
         get() = intent.getStringExtra(KEY_SOURCE)
+    private val route: RequestRoute
+        get() = RequestRoute(intent.getBooleanExtra(KEY_HYBRID_ONLY, false))
 
     enum class AllowedInstantLevel {
         NONE, PRESELECT, INSTANT
@@ -91,6 +114,8 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
     lateinit var callerPackage: String
     lateinit var callerSignature: String
     private lateinit var navHostFragment: NavHostFragment
+    private var navGraphAttached = false
+    private var navStartDestination: Int = 0
     private var preselectedCredentialId: String? = null
     private var preselectedTransport: Transport? = null
     private var accountChoiceOffered = false
@@ -138,8 +163,21 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
             val requiresPrivilege =
                 source == SOURCE_BROWSER && !database.isPrivileged(callerPackage, callerSignature)
 
+            navGraphAttached = savedInstanceState?.getBoolean(STATE_NAV_GRAPH_ATTACHED, false) == true
+            val restoredNavHost = if (savedInstanceState != null && navGraphAttached) {
+                supportFragmentManager.findFragmentById(R.id.fragment_container) as? NavHostFragment
+            } else {
+                null
+            }
+            accountChoiceOffered = savedInstanceState?.getBoolean(STATE_ACCOUNT_CHOICE_OFFERED, false) == true
+            accountRequestPending = savedInstanceState?.getBoolean(STATE_ACCOUNT_REQUEST_PENDING, false) == true
+            navStartDestination = savedInstanceState?.getInt(STATE_NAV_START_DESTINATION, 0) ?: 0
+            if (restoredNavHost != null) {
+                navHostFragment = restoredNavHost
+            }
+
             // Check if we can directly open screen lock handling
-            if (allowInstant == AllowedInstantLevel.INSTANT && !requiresPrivilege) {
+            if (restoredNavHost == null && !accountRequestPending && allowInstant == AllowedInstantLevel.INSTANT && !requiresPrivilege && route.allowsInstantTransport) {
                 val instantTransport = transportHandlers.firstOrNull {
                     it.isSupported && it.shouldBeUsedInstantly(options, preselectedCredentialId)
                 }
@@ -153,8 +191,23 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
             setTheme(androidx.appcompat.R.style.Theme_AppCompat_DayNight_NoActionBar)
             setContentView(R.layout.fido_authenticator_activity)
 
-            lifecycleScope.launchWhenCreated {
-                handleRequest(options, allowInstant)
+            if (restoredNavHost != null) {
+                makeOpaque()
+                runCatching { setAuthenticatorUiBackgroundOpaque() }
+                if (runCatching { restoredNavHost.navController.graph }.isFailure) {
+                    val navGraph = restoredNavHost.navController.navInflater.inflate(R.navigation.nav_fido_authenticator)
+                    if (navStartDestination != 0) {
+                        navGraph.setStartDestination(navStartDestination)
+                    }
+                    restoredNavHost.navController.setGraph(navGraph, null)
+                }
+            } else if (accountRequestPending) {
+                makeOpaque()
+                runCatching { setAuthenticatorUiBackgroundOpaque() }
+            } else {
+                lifecycleScope.launchWhenCreated {
+                    handleRequest(options, allowInstant)
+                }
             }
         } catch (e: RequestHandlingException) {
             finishWithError(e.errorCode, e.message ?: e.errorCode.name)
@@ -180,13 +233,21 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
 
             Log.d(TAG, "FIDO caller validated")
 
+            val route = route
+            val offeredTransports = route.offeredTransports(transportHandlers.filter { it.isSupported }.map { it.transport }.toSet())
+            if (route.hybridOnly && offeredTransports.isEmpty()) {
+                finishWithError(NOT_SUPPORTED_ERR, "Cross-device passkeys are not supported on this device"); return
+            }
+
             // The account backend independently verifies the browser's release signer and exact origin.
             // Its owner confirmation does not create a local remembered-browser fido.db record.
-            if (!accountChoiceOffered && backend != null &&
+            if (route.offersAccountPasskeys && !accountChoiceOffered && backend != null &&
                 backend.available(this, options, callerPackage, source.orEmpty())) {
-                accountChoiceOffered = true
                 makeOpaque()
-                if (chooseAccountPasskey()) {
+                val useAccountPasskey = chooseAccountPasskey()
+                    ?: run { finishWithError(NOT_ALLOWED_ERR, "Passkey request cancelled"); return }
+                accountChoiceOffered = true
+                if (useAccountPasskey) {
                     accountRequestPending = true
                     startActivityForResult(backend.request(this, options, callerPackage, source.orEmpty()), REQUEST_ACCOUNT_PASSKEY)
                     return
@@ -202,7 +263,7 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
             val noLocalUserForSignInstantBlock = options.type == RequestOptionsType.SIGN && database.getKnownRegistrationInfo(options.rpId).isEmpty()
 
             // Check if we can directly open screen lock handling
-            if (!requiresPrivilege && allowInstantLevel == AllowedInstantLevel.INSTANT && !noLocalUserForSignInstantBlock) {
+            if (route.allowsInstantTransport && !requiresPrivilege && allowInstantLevel == AllowedInstantLevel.INSTANT && !noLocalUserForSignInstantBlock) {
                 val instantTransport = transportHandlers.firstOrNull {
                     it.isSupported && it.shouldBeUsedInstantly(options, preselectedCredentialId)
                 }
@@ -220,66 +281,69 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
                 this.isFirst = true
                 this.privilegedCallerName = callerName.takeIf { options is BrowserRequestOptions }
                 this.requiresPrivilege = requiresPrivilege
-                this.supportedTransports = transportHandlers.filter { it.isSupported }.map { it.transport }.toSet()
+                this.supportedTransports = offeredTransports
                 // To sign-in with screen-lock, there must be a local user.
                 if (options.type == RequestOptionsType.SIGN && noLocalUserForSignInstantBlock) {
                     this.implementedTransports = this.implementedTransports.filter { it != SCREEN_LOCK }.toSet()
                 }
             }.arguments
-            val next = if (requiresPrivilege) {
-                null
-            } else if (allowInstantLevel == AllowedInstantLevel.NONE) {
-                R.id.transportSelectionFragment
-            } else {
-                val knownRegistrationTransports = mutableSetOf<Transport>()
-                val allowedTransports = mutableSetOf<Transport>()
-                if (options.type == RequestOptionsType.SIGN) {
-                    if (preselectedCredentialId != null) {
-                        val knownTransport = database.getKnownRegistrationTransport(options.rpId, preselectedCredentialId!!)
-                        if (knownTransport != null && knownTransport in IMPLEMENTED_TRANSPORTS)
-                            knownRegistrationTransports.add(knownTransport)
-                    }
-                    for (descriptor in options.signOptions.allowList.orEmpty()) {
-                        val knownTransport = database.getKnownRegistrationTransport(options.rpId, descriptor.id.toBase64(Base64.URL_SAFE, Base64.NO_WRAP, Base64.NO_PADDING))
-                        if (knownTransport != null && knownTransport in IMPLEMENTED_TRANSPORTS)
-                            knownRegistrationTransports.add(knownTransport)
-                        if (descriptor.transports.isNullOrEmpty()) {
-                            allowedTransports.addAll(IMPLEMENTED_TRANSPORTS)
-                        } else {
-                            for (transport in descriptor.transports.orEmpty()) {
-                                val allowedTransport = when (transport) {
-                                    com.google.android.gms.fido.common.Transport.BLUETOOTH_CLASSIC -> BLUETOOTH
-                                    com.google.android.gms.fido.common.Transport.BLUETOOTH_LOW_ENERGY -> BLUETOOTH
-                                    com.google.android.gms.fido.common.Transport.NFC -> NFC
-                                    com.google.android.gms.fido.common.Transport.USB -> USB
-                                    com.google.android.gms.fido.common.Transport.INTERNAL -> SCREEN_LOCK
-                                    com.google.android.gms.fido.common.Transport.HYBRID -> HYBRID
-                                    else -> null
+            // A browser that still needs privilege starts on the welcome screen; with a single offered transport,
+            // its button then opens that transport (the QR screen for a hybrid-only request).
+            val next = route.startDestination(requiresPrivilege, R.id.hybridFragment) {
+                if (allowInstantLevel == AllowedInstantLevel.NONE) {
+                    R.id.transportSelectionFragment
+                } else {
+                    val knownRegistrationTransports = mutableSetOf<Transport>()
+                    val allowedTransports = mutableSetOf<Transport>()
+                    if (options.type == RequestOptionsType.SIGN) {
+                        if (preselectedCredentialId != null) {
+                            val knownTransport = database.getKnownRegistrationTransport(options.rpId, preselectedCredentialId!!)
+                            if (knownTransport != null && knownTransport in IMPLEMENTED_TRANSPORTS)
+                                knownRegistrationTransports.add(knownTransport)
+                        }
+                        for (descriptor in options.signOptions.allowList.orEmpty()) {
+                            val knownTransport = database.getKnownRegistrationTransport(options.rpId, descriptor.id.toBase64(Base64.URL_SAFE, Base64.NO_WRAP, Base64.NO_PADDING))
+                            if (knownTransport != null && knownTransport in IMPLEMENTED_TRANSPORTS)
+                                knownRegistrationTransports.add(knownTransport)
+                            if (descriptor.transports.isNullOrEmpty()) {
+                                allowedTransports.addAll(IMPLEMENTED_TRANSPORTS)
+                            } else {
+                                for (transport in descriptor.transports.orEmpty()) {
+                                    val allowedTransport = when (transport) {
+                                        com.google.android.gms.fido.common.Transport.BLUETOOTH_CLASSIC -> BLUETOOTH
+                                        com.google.android.gms.fido.common.Transport.BLUETOOTH_LOW_ENERGY -> BLUETOOTH
+                                        com.google.android.gms.fido.common.Transport.NFC -> NFC
+                                        com.google.android.gms.fido.common.Transport.USB -> USB
+                                        com.google.android.gms.fido.common.Transport.INTERNAL -> SCREEN_LOCK
+                                        com.google.android.gms.fido.common.Transport.HYBRID -> HYBRID
+                                        else -> null
+                                    }
+                                    if (allowedTransport != null && allowedTransport in IMPLEMENTED_TRANSPORTS)
+                                        allowedTransports.add(allowedTransport)
                                 }
-                                if (allowedTransport != null && allowedTransport in IMPLEMENTED_TRANSPORTS)
-                                    allowedTransports.add(allowedTransport)
                             }
                         }
                     }
-                }
-                // We do not control if preselectedTransport is in allowedTransports, or if
-                // allowedTransports is empty, as allowedTransports is a *hint*.
-                // This is particularly useful if the application sends a credential with
-                // transport=internal, but we login with another device (via hybrid connection)
-                val preselectedTransport = preselectedTransport
-                    ?: knownRegistrationTransports.singleOrNull() ?: allowedTransports.singleOrNull()
-                if (database.wasUsed()) {
-                    when (preselectedTransport) {
-                        USB -> R.id.usbFragment
-                        NFC -> R.id.nfcFragment
-                        HYBRID -> R.id.hybridFragment
-                        SCREEN_LOCK -> R.id.signInSelectionFragment
-                        else -> R.id.transportSelectionFragment
+                    // We do not control if preselectedTransport is in allowedTransports, or if
+                    // allowedTransports is empty, as allowedTransports is a *hint*.
+                    // This is particularly useful if the application sends a credential with
+                    // transport=internal, but we login with another device (via hybrid connection)
+                    val preselectedTransport = preselectedTransport
+                        ?: knownRegistrationTransports.singleOrNull() ?: allowedTransports.singleOrNull()
+                    if (database.wasUsed()) {
+                        when (preselectedTransport) {
+                            USB -> R.id.usbFragment
+                            NFC -> R.id.nfcFragment
+                            HYBRID -> R.id.hybridFragment
+                            SCREEN_LOCK -> R.id.signInSelectionFragment
+                            else -> R.id.transportSelectionFragment
+                        }
+                    } else {
+                        null
                     }
-                } else {
-                    null
                 }
             }
+            navStartDestination = next ?: 0
             navHostFragment = NavHostFragment()
             supportFragmentManager.commit {
                 replace(R.id.fragment_container, navHostFragment)
@@ -290,8 +354,11 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
                     }
                     Log.d(TAG, "FIDO transport selection ready")
                     navHostFragment.navController.setGraph(navGraph, arguments)
+                    navGraphAttached = true
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: RequestHandlingException) {
             finishWithError(e.errorCode, e.message ?: e.errorCode.name)
         } catch (e: Exception) {
@@ -367,11 +434,11 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
         finish()
     }
 
-    private suspend fun chooseAccountPasskey(): Boolean = suspendCancellableCoroutine { continuation ->
+    private suspend fun chooseAccountPasskey(): Boolean? = suspendCancellableCoroutine { continuation ->
         val dialog = AlertDialog.Builder(this).setTitle(R.string.fido_account_passkey_title)
             .setPositiveButton(R.string.fido_account_passkey_use) { _, _ -> if (continuation.isActive) continuation.resume(true) }
             .setNegativeButton(R.string.fido_account_passkey_other) { _, _ -> if (continuation.isActive) continuation.resume(false) }
-            .setOnCancelListener { if (continuation.isActive) continuation.cancel() }.create()
+            .setOnCancelListener { if (continuation.isActive) continuation.resume(null) }.create()
         continuation.invokeOnCancellation { dialog.dismiss() }
         dialog.show()
     }
@@ -494,8 +561,20 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
         return super.onSupportNavigateUp()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_ACCOUNT_CHOICE_OFFERED, accountChoiceOffered)
+        outState.putBoolean(STATE_ACCOUNT_REQUEST_PENDING, accountRequestPending)
+        outState.putBoolean(STATE_NAV_GRAPH_ATTACHED, navGraphAttached)
+        outState.putInt(STATE_NAV_START_DESTINATION, navStartDestination)
+    }
+
     companion object {
         private const val REQUEST_ACCOUNT_PASSKEY = 6801
+        private const val STATE_ACCOUNT_CHOICE_OFFERED = "accountChoiceOffered"
+        private const val STATE_ACCOUNT_REQUEST_PENDING = "accountRequestPending"
+        private const val STATE_NAV_GRAPH_ATTACHED = "navGraphAttached"
+        private const val STATE_NAV_START_DESTINATION = "navStartDestination"
         const val KEY_SERVICE = "service"
         const val KEY_SOURCE = "source"
         const val KEY_TYPE = "type"
@@ -504,6 +583,8 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
         const val KEY_USER_JSON = "userInfo"
         const val KEY_CREDENTIAL_ID = "credential"
         const val KEY_PRESELECTED_TRANSPORT = "transport"
+        /** Boolean: offer only the cross-device QR flow, as for Android's "another device" entry. */
+        const val KEY_HYBRID_ONLY = "hybridOnly"
         val REQUIRED_EXTRAS = setOf(KEY_SOURCE, KEY_TYPE, KEY_OPTIONS)
 
         const val SOURCE_BROWSER = "browser"

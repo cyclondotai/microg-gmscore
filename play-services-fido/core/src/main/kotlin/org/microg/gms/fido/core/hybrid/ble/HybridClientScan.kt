@@ -85,7 +85,11 @@ class HybridClientScan(
                 val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
                 scanner.startScan(filters, settings, this)
                 Log.d(TAG, "BLE scanning started")
+            } catch (t: RequestHandlingException) {
+                scanStatus.set(false)
+                onScanFailed(t)
             } catch (t: Throwable) {
+                scanStatus.set(false)
                 onScanFailed(RequestHandlingException(ErrorCode.UNKNOWN_ERR, "startScan failed: ${t.message}"))
             }
         }

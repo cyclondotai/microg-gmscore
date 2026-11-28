@@ -6,14 +6,22 @@
 package org.microg.gms.fido.core.hybrid.controller
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.annotation.RequiresPermission
+import androidx.annotation.VisibleForTesting
 import com.google.android.gms.fido.fido2.api.common.ErrorCode
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
 import org.microg.gms.fido.core.RequestHandlingException
 import org.microg.gms.fido.core.hybrid.HandshakePhase
 import org.microg.gms.fido.core.hybrid.ble.HybridClientScan
@@ -35,7 +43,8 @@ private const val TAG = "HybridClientController"
 
 @RequiresApi(Build.VERSION_CODES.LOLLIPOP)
 class HybridClientController(context: Context, val staticKey: Pair<ECPublicKey, ECPrivateKey>) {
-    private val adapter = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+    private val appContext = context.applicationContext
+    private val adapter = (appContext.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
 
     private var ephemeralKeyPair: Pair<ECPublicKey, ECPrivateKey>? = null
     private var noise: NoiseHandshakeState? = null
@@ -172,12 +181,104 @@ class HybridClientController(context: Context, val staticKey: Pair<ECPublicKey, 
         }
     }
 
+    @SuppressLint("MissingPermission")
+    private suspend fun ensureBluetoothReady(): BluetoothAdapter {
+        val btAdapter = adapter
+            ?: throw RequestHandlingException(ErrorCode.NOT_SUPPORTED_ERR, "BluetoothAdapter null")
+        if (!btAdapter.isEnabled) {
+            val turnedOn = awaitBluetoothStateOn(btAdapter)
+            if (!turnedOn) {
+                throw RequestHandlingException(ErrorCode.NOT_SUPPORTED_ERR, "Bluetooth is off")
+            }
+        }
+        // bluetoothLeScanner can become non-null a moment after STATE_ON is broadcast.
+        val deadlineMs = System.currentTimeMillis() + SCANNER_READY_TIMEOUT_MS
+        while (btAdapter.bluetoothLeScanner == null && System.currentTimeMillis() < deadlineMs) {
+            delay(50)
+        }
+        if (btAdapter.bluetoothLeScanner == null) {
+            throw RequestHandlingException(ErrorCode.NOT_SUPPORTED_ERR, "BluetoothLeScanner null")
+        }
+        return btAdapter
+    }
+
+    @VisibleForTesting
+    @SuppressLint("MissingPermission")
+    @Suppress("DEPRECATION")
+    suspend fun awaitBluetoothStateOn(
+        btAdapter: BluetoothAdapter,
+        enableAdapter: () -> Boolean = { btAdapter.enable() },
+    ): Boolean {
+        return withTimeoutOrNull(BLUETOOTH_ENABLE_TIMEOUT_MS) {
+            suspendCancellableCoroutine { cont ->
+                var sawTurningOn = btAdapter.state == BluetoothAdapter.STATE_TURNING_ON
+                val receiver = object : BroadcastReceiver() {
+                    override fun onReceive(ctx: Context?, intent: Intent?) {
+                        if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+                        val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                        val previousState = intent.getIntExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, BluetoothAdapter.ERROR)
+                        when (state) {
+                            BluetoothAdapter.STATE_ON -> {
+                                runCatching { appContext.unregisterReceiver(this) }
+                                if (cont.isActive) cont.resumeWith(Result.success(true))
+                            }
+                            BluetoothAdapter.STATE_TURNING_ON -> {
+                                sawTurningOn = true
+                            }
+                            BluetoothAdapter.STATE_OFF -> {
+                                // Only abort when an enable attempt itself fell back to OFF. When the adapter was
+                                // turning off as enable() was queued, Android broadcasts an intermediate STATE_OFF
+                                // (previousState == STATE_TURNING_OFF) before transitioning to STATE_TURNING_ON -> STATE_ON.
+                                if (previousState == BluetoothAdapter.STATE_TURNING_ON ||
+                                    (sawTurningOn && previousState != BluetoothAdapter.STATE_TURNING_OFF)
+                                ) {
+                                    runCatching { appContext.unregisterReceiver(this) }
+                                    if (cont.isActive) cont.resumeWith(Result.success(false))
+                                }
+                            }
+                        }
+                    }
+                }
+                val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+                if (Build.VERSION.SDK_INT >= 33) {
+                    appContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+                } else {
+                    appContext.registerReceiver(receiver, filter)
+                }
+                cont.invokeOnCancellation { runCatching { appContext.unregisterReceiver(receiver) } }
+
+                if (btAdapter.isEnabled || btAdapter.state == BluetoothAdapter.STATE_ON) {
+                    runCatching { appContext.unregisterReceiver(receiver) }
+                    if (cont.isActive) cont.resumeWith(Result.success(true))
+                    return@suspendCancellableCoroutine
+                }
+                val state = btAdapter.state
+                if (state == BluetoothAdapter.STATE_TURNING_ON) {
+                    sawTurningOn = true
+                    return@suspendCancellableCoroutine
+                }
+                if (!enableAdapter()) {
+                    runCatching { appContext.unregisterReceiver(receiver) }
+                    if (cont.isActive) cont.resumeWith(Result.success(btAdapter.isEnabled))
+                }
+            }
+        } == true
+    }
+
     @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
-    suspend fun startBluetoothScan(seed: ByteArray) = suspendCancellableCoroutine { cont ->
-        scan = HybridClientScan(adapter, seed, onScanSuccess = { eid ->
-            cont.tryResumeData(eid)
-        }, onScanFailed = { cont.tryResumeWithError(it) })
-        scan!!.startScanning()
-        cont.invokeOnCancellation { runCatching { scan?.stopScanning() } }
+    suspend fun startBluetoothScan(seed: ByteArray): ByteArray {
+        val readyAdapter = ensureBluetoothReady()
+        return suspendCancellableCoroutine { cont ->
+            scan = HybridClientScan(readyAdapter, seed, onScanSuccess = { eid ->
+                cont.tryResumeData(eid)
+            }, onScanFailed = { cont.tryResumeWithError(it) })
+            scan!!.startScanning()
+            cont.invokeOnCancellation { runCatching { scan?.stopScanning() } }
+        }
+    }
+
+    companion object {
+        private const val BLUETOOTH_ENABLE_TIMEOUT_MS = 5_000L
+        private const val SCANNER_READY_TIMEOUT_MS = 1_500L
     }
 }
