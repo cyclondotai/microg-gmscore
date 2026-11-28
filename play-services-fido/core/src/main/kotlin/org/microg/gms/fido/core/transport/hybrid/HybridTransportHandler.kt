@@ -16,9 +16,12 @@ import androidx.core.content.getSystemService
 import androidx.core.os.bundleOf
 import com.google.android.gms.fido.fido2.api.common.AuthenticatorAssertionResponse
 import com.google.android.gms.fido.fido2.api.common.AuthenticatorAttestationResponse
+import com.google.android.gms.fido.fido2.api.common.AuthenticatorSelectionCriteria
 import com.google.android.gms.fido.fido2.api.common.RequestOptions
+import com.google.android.gms.fido.fido2.api.common.ResidentKeyRequirement
 import com.google.android.gms.fido.fido2.api.common.UserVerificationRequirement
 import com.upokecenter.cbor.CBORObject
+import java.security.SecureRandom
 import org.microg.gms.fido.core.RequestOptionsType
 import org.microg.gms.fido.core.getClientDataAndHash
 import org.microg.gms.fido.core.hybrid.controller.HybridClientController
@@ -49,22 +52,23 @@ class HybridTransportHandler(private val context: Context, callback: TransportHa
         options: RequestOptions, callerPackage: String, pinRequested: Boolean, pin: String?, credentialIdString: String?
     ): AuthenticatorResponseWithUser<*> {
         val staticKey = generateEcKeyPair()
+        val qrSecret = newQrSecret()
         val hybridClientController = HybridClientController(context, staticKey)
         try {
             callback?.onStatusChanged(
                 Transport.HYBRID, "QR_CODE_READY",
-                bundleOf("qrCodeBitmap" to QrCodeData.generateQrCode(staticKey.first, options.challenge))
+                bundleOf("qrCodeBitmap" to QrCodeData.generateQrCode(staticKey.first, qrSecret))
             )
-            val eid = hybridClientController.startBluetoothScan(options.challenge)
+            val eid = hybridClientController.startBluetoothScan(qrSecret)
             callback?.onStatusChanged(Transport.HYBRID, "CONNECTING", null)
 
             val (clientData, clientDataHash) = getClientDataAndHash(context, options, callerPackage)
-            val tunnelResp = hybridClientController.startClientTunnel(eid, options.challenge) {
+            val tunnelResp = hybridClientController.startClientTunnel(eid, qrSecret) {
                 Log.d(TAG, "start: options: $options")
                 val request = when (options.type) {
                     RequestOptionsType.REGISTER -> {
                         val reqOptions = options.registerOptions.authenticatorSelection?.let {
-                            val rk = (it.requireResidentKey == true || it.residentKeyRequirement?.toString() == UserVerificationRequirement.REQUIRED.name)
+                            val rk = requiresResidentKey(it)
                             val uv = (it.requireUserVerification == UserVerificationRequirement.REQUIRED)
                             AuthenticatorMakeCredentialRequest.Companion.Options(residentKey = rk, userVerification = uv)
                         }
@@ -138,5 +142,18 @@ class HybridTransportHandler(private val context: Context, callback: TransportHa
                 )
             }
         }
+    }
+
+    companion object {
+        private const val TAG = "HybridTransportHandler"
+        internal const val QR_SECRET_BYTES = 16
+
+        /** Fresh 16-byte caBLE v2 QR secret per session (Chromium rejects non-16-byte secrets). */
+        internal fun newQrSecret(random: SecureRandom = SecureRandom()): ByteArray =
+            ByteArray(QR_SECRET_BYTES).also { random.nextBytes(it) }
+
+        internal fun requiresResidentKey(selection: AuthenticatorSelectionCriteria): Boolean =
+            selection.requireResidentKey == true ||
+                selection.residentKeyRequirement == ResidentKeyRequirement.RESIDENT_KEY_REQUIRED
     }
 }

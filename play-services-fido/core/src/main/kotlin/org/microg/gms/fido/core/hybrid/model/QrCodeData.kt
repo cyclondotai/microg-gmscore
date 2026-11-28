@@ -76,7 +76,10 @@ data class QrCodeData(
             }
         }
 
-        private fun buildQrCborPayload(staticPublicKey: ECPublicKey, randomSeed16: ByteArray): String {
+        internal fun buildQrCborPayload(staticPublicKey: ECPublicKey, randomSeed16: ByteArray): String {
+            require(randomSeed16.isEmpty() || randomSeed16.size == 16) {
+                "caBLE v2 QR secret must be 16 bytes, got ${randomSeed16.size}"
+            }
             val cbor = CBORObject.NewOrderedMap().apply {
                 compressECPublicKey(staticPublicKey).let {
                     this[0] = CBORObject.FromObject(it)
