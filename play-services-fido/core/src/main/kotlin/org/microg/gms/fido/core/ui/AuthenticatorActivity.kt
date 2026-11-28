@@ -51,6 +51,21 @@ import org.microg.gms.utils.toBase64
 const val TAG = "FidoUi"
 const val ACTION_FIDO_AUTHENTICATE = "org.microg.gms.fido.AUTHENTICATE"
 
+/**
+ * How a request may start. Android's "another device" entry (microG's RemoteService) asks for
+ * [AuthenticatorActivity.KEY_HYBRID_ONLY]: such a request never offers the account passkey or starts instant screen
+ * lock, and offers only the cross-device QR flow.
+ */
+internal class RequestRoute(val hybridOnly: Boolean) {
+    val offersAccountPasskeys: Boolean
+        get() = !hybridOnly
+    val allowsInstantTransport: Boolean
+        get() = !hybridOnly
+
+    fun offeredTransports(supported: Set<Transport>): Set<Transport> =
+        if (hybridOnly) supported.intersect(setOf(HYBRID)) else supported
+}
+
 class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
     val options: RequestOptions?
         get() = when (intent.getStringExtra(KEY_SOURCE) to intent.getStringExtra(KEY_TYPE)) {
@@ -70,6 +85,8 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
         }
     val source: String?
         get() = intent.getStringExtra(KEY_SOURCE)
+    private val route: RequestRoute
+        get() = RequestRoute(intent.getBooleanExtra(KEY_HYBRID_ONLY, false))
 
     enum class AllowedInstantLevel {
         NONE, PRESELECT, INSTANT
@@ -139,7 +156,7 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
                 source == SOURCE_BROWSER && !database.isPrivileged(callerPackage, callerSignature)
 
             // Check if we can directly open screen lock handling
-            if (allowInstant == AllowedInstantLevel.INSTANT && !requiresPrivilege) {
+            if (allowInstant == AllowedInstantLevel.INSTANT && !requiresPrivilege && route.allowsInstantTransport) {
                 val instantTransport = transportHandlers.firstOrNull {
                     it.isSupported && it.shouldBeUsedInstantly(options, preselectedCredentialId)
                 }
@@ -180,9 +197,15 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
 
             Log.d(TAG, "FIDO caller validated")
 
+            val route = route
+            val offeredTransports = route.offeredTransports(transportHandlers.filter { it.isSupported }.map { it.transport }.toSet())
+            if (route.hybridOnly && offeredTransports.isEmpty()) {
+                finishWithError(NOT_SUPPORTED_ERR, "Cross-device passkeys are not supported on this device"); return
+            }
+
             // The account backend independently verifies the browser's release signer and exact origin.
             // Its owner confirmation does not create a local remembered-browser fido.db record.
-            if (!accountChoiceOffered && backend != null &&
+            if (route.offersAccountPasskeys && !accountChoiceOffered && backend != null &&
                 backend.available(this, options, callerPackage, source.orEmpty())) {
                 accountChoiceOffered = true
                 makeOpaque()
@@ -202,7 +225,7 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
             val noLocalUserForSignInstantBlock = options.type == RequestOptionsType.SIGN && database.getKnownRegistrationInfo(options.rpId).isEmpty()
 
             // Check if we can directly open screen lock handling
-            if (!requiresPrivilege && allowInstantLevel == AllowedInstantLevel.INSTANT && !noLocalUserForSignInstantBlock) {
+            if (route.allowsInstantTransport && !requiresPrivilege && allowInstantLevel == AllowedInstantLevel.INSTANT && !noLocalUserForSignInstantBlock) {
                 val instantTransport = transportHandlers.firstOrNull {
                     it.isSupported && it.shouldBeUsedInstantly(options, preselectedCredentialId)
                 }
@@ -220,14 +243,18 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
                 this.isFirst = true
                 this.privilegedCallerName = callerName.takeIf { options is BrowserRequestOptions }
                 this.requiresPrivilege = requiresPrivilege
-                this.supportedTransports = transportHandlers.filter { it.isSupported }.map { it.transport }.toSet()
+                this.supportedTransports = offeredTransports
                 // To sign-in with screen-lock, there must be a local user.
                 if (options.type == RequestOptionsType.SIGN && noLocalUserForSignInstantBlock) {
                     this.implementedTransports = this.implementedTransports.filter { it != SCREEN_LOCK }.toSet()
                 }
             }.arguments
+            // A browser that still needs privilege starts on the welcome screen; with a single offered transport,
+            // its button then opens that transport (the QR screen for a hybrid-only request).
             val next = if (requiresPrivilege) {
                 null
+            } else if (route.hybridOnly) {
+                R.id.hybridFragment
             } else if (allowInstantLevel == AllowedInstantLevel.NONE) {
                 R.id.transportSelectionFragment
             } else {
@@ -504,6 +531,8 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
         const val KEY_USER_JSON = "userInfo"
         const val KEY_CREDENTIAL_ID = "credential"
         const val KEY_PRESELECTED_TRANSPORT = "transport"
+        /** Boolean: offer only the cross-device QR flow, as for Android's "another device" entry. */
+        const val KEY_HYBRID_ONLY = "hybridOnly"
         val REQUIRED_EXTRAS = setOf(KEY_SOURCE, KEY_TYPE, KEY_OPTIONS)
 
         const val SOURCE_BROWSER = "browser"

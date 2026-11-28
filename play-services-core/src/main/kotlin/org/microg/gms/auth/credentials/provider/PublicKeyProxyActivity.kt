@@ -22,6 +22,8 @@ import androidx.credentials.CreatePublicKeyCredentialRequest
 import androidx.credentials.CreatePublicKeyCredentialResponse
 import androidx.credentials.GetCredentialResponse
 import androidx.credentials.GetPublicKeyCredentialOption
+import androidx.credentials.exceptions.CreateCredentialCancellationException
+import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.provider.ProviderCreateCredentialRequest
 import androidx.credentials.provider.ProviderGetCredentialRequest
 import com.google.android.gms.fido.Fido.FIDO2_KEY_CREDENTIAL_EXTRA
@@ -53,9 +55,17 @@ class PublicKeyProxyActivity : CredentialProviderActivity() {
         super.onCreate(savedInstanceState)
     }
 
+    /** Android's "another device" entry from [RemoteService]: only the cross-device QR flow, never a local passkey. */
+    private val isRemoteEntry: Boolean
+        get() = intent.action == RemoteService.ACTION_REMOTE_ENTRY
+
     override fun onProviderGetCredentialRequest(request: ProviderGetCredentialRequest) {
-        if (SyncedPasskeyProvider.get(this, request)) return
-        val option = request.credentialOptions.firstOrNull() as? GetPublicKeyCredentialOption ?: throw IllegalArgumentException()
+        val remote = isRemoteEntry
+        if (!remote && SyncedPasskeyProvider.get(this, request)) return
+        // Android gives the hybrid service's remote entry every option the caller asked for, in the caller's order,
+        // so a password option can come before the passkey option.
+        val option = request.credentialOptions.filterIsInstance<GetPublicKeyCredentialOption>().firstOrNull()
+            ?: throw IllegalArgumentException("No passkey option in request")
 
         val isBrowserRequest = request.callingAppInfo.origin.isHttpsUrl()
 
@@ -63,7 +73,7 @@ class PublicKeyProxyActivity : CredentialProviderActivity() {
         val credentialIdString = intent.getStringExtra(KEY_CREDENTIAL_ID)
 
         val (optionsBytes, source) = buildRequestOptions(options, isBrowserRequest, request.callingAppInfo.origin, option.clientDataHash)
-        val fidoIntent = buildFidoAuthenticateIntent(source, optionsBytes, request.callingAppInfo.packageName, TYPE_SIGN, credentialIdString)
+        val fidoIntent = buildFidoAuthenticateIntent(source, optionsBytes, request.callingAppInfo.packageName, TYPE_SIGN, credentialIdString, hybridOnly = remote)
         startActivityForResult(fidoIntent, REQUEST_CODE_FIDO)
     }
 
@@ -77,7 +87,8 @@ class PublicKeyProxyActivity : CredentialProviderActivity() {
     }
 
     override fun onProviderCreateCredentialRequest(request: ProviderCreateCredentialRequest) {
-        if (SyncedPasskeyProvider.create(this, request)) return
+        val remote = isRemoteEntry
+        if (!remote && SyncedPasskeyProvider.create(this, request)) return
         val callingPackage = request.callingAppInfo.packageName
         val origin = request.callingAppInfo.origin
         val isBrowserRequest = origin.isHttpsUrl()
@@ -89,7 +100,7 @@ class PublicKeyProxyActivity : CredentialProviderActivity() {
 
 
         val (optionsBytes, source) = buildCreationOptions(options, isBrowserRequest, origin, publicKeyRequest.clientDataHash)
-        val fidoIntent = buildFidoAuthenticateIntent(source, optionsBytes, callingPackage, TYPE_REGISTER)
+        val fidoIntent = buildFidoAuthenticateIntent(source, optionsBytes, callingPackage, TYPE_REGISTER, hybridOnly = remote)
 
         startActivityForResult(fidoIntent, REQUEST_CODE_FIDO)
         Log.d(TAG, "Launched FIDO authenticator by PasskeyCreate")
@@ -113,6 +124,11 @@ class PublicKeyProxyActivity : CredentialProviderActivity() {
         if (requestCode == REQUEST_CODE_PASSKEY_OWNER) { passkeyOwner?.complete(resultCode == RESULT_OK); return }
 
         if (requestCode != REQUEST_CODE_FIDO) return
+        if (resultCode == RESULT_CANCELED) {
+            // Back or Cancel in the authenticator (such as on the QR screen): the caller gets a cancellation, not an error.
+            Log.w(TAG, "FIDO activity canceled")
+            return finishWithException("Sign in canceled", { CreateCredentialCancellationException(it) }, { GetCredentialCancellationException(it) })
+        }
         if (resultCode != RESULT_OK || data == null) {
             Log.w(TAG, "FIDO activity canceled or failed")
             return finishWithException("Sign in canceled")

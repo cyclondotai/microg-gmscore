@@ -64,7 +64,7 @@ open class RemoteService : CredentialProviderService() {
             // TODO: Don't offer when allowedCredentials set and all of them local
 
             val responseBuilder = BeginGetCredentialResponse.Builder()
-            val pendingIntent = createPendingIntent()
+            val pendingIntent = createPendingIntent(REQUEST_CODE_GET)
 
             responseBuilder.setRemoteEntry(RemoteEntry(pendingIntent))
 
@@ -95,7 +95,7 @@ open class RemoteService : CredentialProviderService() {
             }
 
             val responseBuilder = BeginCreateCredentialResponse.Builder()
-            val pendingIntent = createPendingIntent()
+            val pendingIntent = createPendingIntent(REQUEST_CODE_CREATE)
 
             responseBuilder.setRemoteEntry(RemoteEntry(pendingIntent))
 
@@ -116,16 +116,22 @@ open class RemoteService : CredentialProviderService() {
         callback.onResult(null)
     }
 
-    private fun createPendingIntent(): PendingIntent {
+    // The action marks the entry as Android's "another device" choice, so PublicKeyProxyActivity goes straight to
+    // the cross-device QR flow. It also keeps these PendingIntents apart from PasswordAndPasskeyService's.
+    private fun createPendingIntent(requestCode: Int): PendingIntent {
         return PendingIntent.getActivity(
             this,
-            TAG.hashCode(),
-            Intent(this, PublicKeyProxyActivity::class.java),
+            requestCode,
+            Intent(ACTION_REMOTE_ENTRY).setClass(this, PublicKeyProxyActivity::class.java),
             PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
     }
 
     companion object {
+        const val ACTION_REMOTE_ENTRY = "org.microg.gms.auth.credentials.provider.REMOTE_ENTRY"
+        private const val REQUEST_CODE_GET = 1
+        private const val REQUEST_CODE_CREATE = 2
+
         fun hasPermissionForRemoteEntry(context: Context): Boolean {
             return context.checkSelfPermission("android.permission.PROVIDE_DEFAULT_ENABLED_CREDENTIAL_SERVICE") == PackageManager.PERMISSION_GRANTED
         }
