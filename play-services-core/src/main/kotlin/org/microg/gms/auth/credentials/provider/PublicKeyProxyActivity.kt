@@ -49,11 +49,22 @@ fun String?.isHttpsUrl(): Boolean = this?.startsWith("https://") == true
 class PublicKeyProxyActivity : CredentialProviderActivity() {
     private var passkeyRecovery: CompletableDeferred<Boolean>? = null
     private var passkeyOwner: CompletableDeferred<Boolean>? = null
+    private var fidoRequestPending = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         window.decorView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS
+        fidoRequestPending = savedInstanceState?.getBoolean(STATE_FIDO_REQUEST_PENDING, false) == true
         super.onCreate(savedInstanceState)
     }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_FIDO_REQUEST_PENDING, fidoRequestPending)
+    }
+
+    override fun shouldDispatchOnRecreate(savedInstanceState: Bundle): Boolean =
+        !savedInstanceState.getBoolean(STATE_FIDO_REQUEST_PENDING, false)
 
     /** Android's "another device" entry from [RemoteService]: only the cross-device QR flow, never a local passkey. */
     private val isRemoteEntry: Boolean
@@ -74,6 +85,7 @@ class PublicKeyProxyActivity : CredentialProviderActivity() {
 
         val (optionsBytes, source) = buildRequestOptions(options, isBrowserRequest, request.callingAppInfo.origin, option.clientDataHash)
         val fidoIntent = buildFidoAuthenticateIntent(source, optionsBytes, request.callingAppInfo.packageName, TYPE_SIGN, credentialIdString, hybridOnly = remote)
+        fidoRequestPending = true
         startActivityForResult(fidoIntent, REQUEST_CODE_FIDO)
     }
 
@@ -101,7 +113,7 @@ class PublicKeyProxyActivity : CredentialProviderActivity() {
 
         val (optionsBytes, source) = buildCreationOptions(options, isBrowserRequest, origin, publicKeyRequest.clientDataHash)
         val fidoIntent = buildFidoAuthenticateIntent(source, optionsBytes, callingPackage, TYPE_REGISTER, hybridOnly = remote)
-
+        fidoRequestPending = true
         startActivityForResult(fidoIntent, REQUEST_CODE_FIDO)
         Log.d(TAG, "Launched FIDO authenticator by PasskeyCreate")
     }
@@ -124,6 +136,7 @@ class PublicKeyProxyActivity : CredentialProviderActivity() {
         if (requestCode == REQUEST_CODE_PASSKEY_OWNER) { passkeyOwner?.complete(resultCode == RESULT_OK); return }
 
         if (requestCode != REQUEST_CODE_FIDO) return
+        fidoRequestPending = false
         if (resultCode == RESULT_CANCELED) {
             // Back or Cancel in the authenticator (such as on the QR screen): the caller gets a cancellation, not an error.
             Log.w(TAG, "FIDO activity canceled")
@@ -209,5 +222,6 @@ class PublicKeyProxyActivity : CredentialProviderActivity() {
     companion object {
         private const val REQUEST_CODE_PASSKEY_RECOVERY = 1002
         private const val REQUEST_CODE_PASSKEY_OWNER = 1003
+        private const val STATE_FIDO_REQUEST_PENDING = "fidoRequestPending"
     }
 }

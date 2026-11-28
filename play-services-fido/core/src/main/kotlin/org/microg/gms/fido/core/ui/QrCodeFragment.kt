@@ -50,12 +50,23 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
     companion object {
         private const val TAG = "QrCodeFragment"
         private const val REQUEST_BLUETOOTH_PERMISSIONS = 1001
+        private const val STATE_AWAITING_SETTINGS_RETURN = "awaitingSettingsReturn"
     }
 
     private lateinit var binding: FidoQrCodeFragmentBinding
     private lateinit var activityHost: AuthenticatorActivity
     private var transportJob: Job? = null
     private var awaitingSettingsReturn = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        awaitingSettingsReturn = savedInstanceState?.getBoolean(STATE_AWAITING_SETTINGS_RETURN, false) == true
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_AWAITING_SETTINGS_RETURN, awaitingSettingsReturn)
+    }
 
     override fun onCreateView(
         inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?
@@ -78,7 +89,7 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
 
         setupBodyText()
 
-        if (requestBluetoothPermissions()) {
+        if (!awaitingSettingsReturn && requestBluetoothPermissions()) {
             ensureTransportStarted()
         }
     }

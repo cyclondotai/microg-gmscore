@@ -16,6 +16,9 @@ class RequestRouteTest {
         assertEquals(setOf(Transport.HYBRID), route.offeredTransports(everyTransport))
         // Without Bluetooth nothing is offered, and the activity reports the request as not supported.
         assertEquals(emptySet<Transport>(), route.offeredTransports(everyTransport - Transport.HYBRID))
+        assertEquals(42, route.startDestination(requiresPrivilege = false, hybridDestination = 42) { 99 })
+        // Browsers still needing approval land on Welcome (null) first.
+        assertNull(route.startDestination(requiresPrivilege = true, hybridDestination = 42) { 99 })
     }
 
     @Test fun otherRequestsKeepAccountPasskeysInstantScreenLockAndEverySupportedTransport() {
@@ -25,5 +28,7 @@ class RequestRouteTest {
         assertEquals(everyTransport, route.offeredTransports(everyTransport))
         val noBluetooth = everyTransport - Transport.HYBRID - Transport.BLUETOOTH
         assertEquals(noBluetooth, route.offeredTransports(noBluetooth))
+        assertEquals(99, route.startDestination(requiresPrivilege = false, hybridDestination = 42) { 99 })
+        assertNull(route.startDestination(requiresPrivilege = true, hybridDestination = 42) { 99 })
     }
 }

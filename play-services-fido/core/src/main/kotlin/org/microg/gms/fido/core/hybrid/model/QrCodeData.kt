@@ -121,11 +121,19 @@ data class QrCodeData(
             return sb.toString()
         }
 
+        private fun toUnsignedFixed32(value: BigInteger): ByteArray {
+            val raw = value.toByteArray()
+            val out = ByteArray(32)
+            val srcStart = maxOf(0, raw.size - 32)
+            val copyLen = minOf(raw.size, 32)
+            System.arraycopy(raw, srcStart, out, 32 - copyLen, copyLen)
+            return out
+        }
+
         private fun compressECPublicKey(pub: ECPublicKey): ByteArray {
             val p = pub.w
-            val x = p.affineX.toByteArray().takeLast(32).toByteArray()
-            val y = p.affineY.toByteArray().takeLast(32).toByteArray()
-            val prefix = if ((y.last().toInt() and 1) == 0) 0x02 else 0x03
+            val x = toUnsignedFixed32(p.affineX)
+            val prefix = if (p.affineY.testBit(0)) 0x03 else 0x02
             return byteArrayOf(prefix.toByte()) + x
         }
 

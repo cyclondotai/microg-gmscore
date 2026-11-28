@@ -4,6 +4,8 @@ package org.microg.gms.auth.credentials.provider
 
 import android.app.Activity
 import android.app.PendingIntent
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.SigningInfo
@@ -11,6 +13,7 @@ import android.credentials.CredentialOption as FrameworkCredentialOption
 import android.net.Uri
 import android.os.Bundle
 import android.os.CancellationSignal
+import android.os.Looper
 import android.os.OutcomeReceiver
 import android.service.credentials.CallingAppInfo as FrameworkCallingAppInfo
 import android.service.credentials.CreateCredentialRequest as FrameworkCreateCredentialRequest
@@ -29,11 +32,28 @@ import androidx.credentials.provider.BeginGetCredentialResponse
 import androidx.credentials.provider.BeginGetPasswordOption
 import androidx.credentials.provider.BeginGetPublicKeyCredentialOption
 import com.google.android.gms.fido.fido2.api.common.BrowserPublicKeyCredentialRequestOptions
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.yield
+import okhttp3.Protocol
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import okio.ByteString
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.microg.gms.fido.core.hybrid.controller.HybridClientController
+import org.microg.gms.fido.core.hybrid.tunnel.TunnelException
+import org.microg.gms.fido.core.hybrid.tunnel.TunnelWebCallback
+import org.microg.gms.fido.core.hybrid.tunnel.TunnelWebsocket
 import org.microg.gms.fido.core.ui.ACTION_FIDO_AUTHENTICATE
+import java.security.KeyPairGenerator
+import java.security.interfaces.ECPrivateKey
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
 import org.microg.gms.fido.core.ui.AuthenticatorActivity.Companion.KEY_CREDENTIAL_ID
 import org.microg.gms.fido.core.ui.AuthenticatorActivity.Companion.KEY_HYBRID_ONLY
 import org.microg.gms.fido.core.ui.AuthenticatorActivity.Companion.KEY_OPTIONS
@@ -181,5 +201,149 @@ class RemoteEntryRoutingTest {
         val createError = shadowOf(create.get()).resultIntent
             .getSerializableExtra(CredentialProviderService.EXTRA_CREATE_CREDENTIAL_EXCEPTION) as android.credentials.CreateCredentialException
         assertEquals(android.credentials.CreateCredentialException.TYPE_USER_CANCELED, createError.type)
+    }
+
+    @Test fun recreatingProxyWhileAuthenticatorIsRunningDoesNotStartASecondAuthenticator() {
+        val intent = proxyIntent(RemoteService.ACTION_REMOTE_ENTRY)
+            .withGet(GetPasswordOption(), GetPublicKeyCredentialOption(getJson))
+        val first = Robolectric.buildActivity(PublicKeyProxyActivity::class.java, intent).create()
+        val fidoIntent = requireNotNull(first.startedFidoIntent())
+        val savedState = Bundle()
+        first.saveInstanceState(savedState)
+        first.destroy()
+
+        val recreated = Robolectric.buildActivity(PublicKeyProxyActivity::class.java, intent).create(savedState)
+        assertNull(recreated.startedFidoIntent())
+        assertTrue(recreated.get().isGetRequest)
+        assertFalse(recreated.get().isFinishing)
+
+        // Delivering the original authenticator result to the recreated proxy still finishes cleanly.
+        val method = Activity::class.java.getDeclaredMethod("onActivityResult", Int::class.javaPrimitiveType, Int::class.javaPrimitiveType, Intent::class.java)
+        method.isAccessible = true
+        method.invoke(recreated.get(), 1001, Activity.RESULT_CANCELED, null)
+        assertTrue(recreated.get().isFinishing)
+        val getError = shadowOf(recreated.get()).resultIntent
+            .getSerializableExtra(CredentialProviderService.EXTRA_GET_CREDENTIAL_EXCEPTION) as android.credentials.GetCredentialException
+        assertEquals(android.credentials.GetCredentialException.TYPE_USER_CANCELED, getError.type)
+        assertNotNull(fidoIntent)
+    }
+
+    @Test fun tunnelWebsocketClosedBeforeWorkerRunsNeverOpensSocket() {
+        var factoryCalls = 0
+        var connectedCalls = 0
+        var disconnectedCalls = 0
+        var pendingTask: Runnable? = null
+        val ws = TunnelWebsocket(
+            url = "wss://cable.ua5v.com/cable/connect/00",
+            callback = object : TunnelWebCallback {
+                override fun disconnected() { disconnectedCalls++ }
+                override fun error(error: TunnelException) = fail("unexpected error: $error")
+                override fun connected(response: Response) { connectedCalls++ }
+                override fun message(data: ByteArray) = fail("unexpected message")
+            },
+            webSocketFactory = { _, _ ->
+                factoryCalls++
+                error("should not open socket after close")
+            },
+            workerExecutor = { pendingTask = it },
+        )
+        ws.connect()
+        ws.close()
+        requireNotNull(pendingTask).run()
+
+        assertEquals(0, factoryCalls)
+        assertEquals(0, connectedCalls)
+        assertEquals(1, disconnectedCalls)
+    }
+
+    @Test fun tunnelWebsocketLateOnOpenAfterCloseClosesSocketWithoutNotifyingConnected() {
+        var connectedCalls = 0
+        var disconnectedCalls = 0
+        var canceledCalls = 0
+        var closedCalls = 0
+        var capturedListener: WebSocketListener? = null
+        lateinit var fakeSocket: WebSocket
+        fakeSocket = object : WebSocket {
+            override fun request(): Request = Request.Builder().url("https://cable.ua5v.com/").build()
+            override fun queueSize(): Long = 0
+            override fun send(text: String): Boolean = false
+            override fun send(bytes: ByteString): Boolean = false
+            override fun close(code: Int, reason: String?): Boolean { closedCalls++; return true }
+            override fun cancel() { canceledCalls++ }
+        }
+        val ws = TunnelWebsocket(
+            url = "wss://cable.ua5v.com/cable/connect/00",
+            callback = object : TunnelWebCallback {
+                override fun disconnected() { disconnectedCalls++ }
+                override fun error(error: TunnelException) = fail("unexpected error: $error")
+                override fun connected(response: Response) { connectedCalls++ }
+                override fun message(data: ByteArray) = fail("unexpected message")
+            },
+            webSocketFactory = { _, listener -> capturedListener = listener; fakeSocket },
+            workerExecutor = { it.run() },
+        )
+        ws.connect()
+        ws.close()
+        val response = Response.Builder()
+            .request(fakeSocket.request())
+            .protocol(Protocol.HTTP_1_1)
+            .code(101)
+            .message("Switching Protocols")
+            .build()
+        requireNotNull(capturedListener).onOpen(fakeSocket, response)
+
+        assertEquals(1, canceledCalls)
+        assertEquals(1, closedCalls)
+        assertEquals(0, connectedCalls)
+        assertEquals(1, disconnectedCalls)
+    }
+
+    @Test fun awaitBluetoothStateOnIgnoresIntermediateStateOffWhileEnableIsPending() = runBlocking {
+        val kpg = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }
+        val kp = kpg.generateKeyPair()
+        val controller = HybridClientController(context, (kp.public as ECPublicKey) to (kp.private as ECPrivateKey))
+        val adapter = requireNotNull(context.getSystemService(BluetoothManager::class.java)?.adapter)
+        shadowOf(adapter).setEnabled(false)
+        shadowOf(adapter).setState(BluetoothAdapter.STATE_TURNING_OFF)
+
+        val deferred = async { controller.awaitBluetoothStateOn(adapter, enableAdapter = { true }) }
+        yield()
+
+        // Adapter finishes turning off before processing the queued enable().
+        context.sendBroadcast(Intent(BluetoothAdapter.ACTION_STATE_CHANGED)
+            .putExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, BluetoothAdapter.STATE_TURNING_OFF)
+            .putExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_OFF))
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse("Intermediate STATE_OFF should not abort pending enable", deferred.isCompleted)
+
+        context.sendBroadcast(Intent(BluetoothAdapter.ACTION_STATE_CHANGED)
+            .putExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, BluetoothAdapter.STATE_OFF)
+            .putExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_TURNING_ON))
+        context.sendBroadcast(Intent(BluetoothAdapter.ACTION_STATE_CHANGED)
+            .putExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, BluetoothAdapter.STATE_TURNING_ON)
+            .putExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_ON))
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue(deferred.await())
+    }
+
+    @Test fun awaitBluetoothStateOnFailsWhenTurningOnFallsBackToOff() = runBlocking {
+        val kpg = KeyPairGenerator.getInstance("EC").apply { initialize(ECGenParameterSpec("secp256r1")) }
+        val kp = kpg.generateKeyPair()
+        val controller = HybridClientController(context, (kp.public as ECPublicKey) to (kp.private as ECPrivateKey))
+        val adapter = requireNotNull(context.getSystemService(BluetoothManager::class.java)?.adapter)
+        shadowOf(adapter).setEnabled(false)
+        shadowOf(adapter).setState(BluetoothAdapter.STATE_OFF)
+
+        val deferred = async { controller.awaitBluetoothStateOn(adapter, enableAdapter = { true }) }
+        yield()
+
+        context.sendBroadcast(Intent(BluetoothAdapter.ACTION_STATE_CHANGED)
+            .putExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, BluetoothAdapter.STATE_OFF)
+            .putExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_TURNING_ON))
+        context.sendBroadcast(Intent(BluetoothAdapter.ACTION_STATE_CHANGED)
+            .putExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, BluetoothAdapter.STATE_TURNING_ON)
+            .putExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.STATE_OFF))
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse(deferred.await())
     }
 }

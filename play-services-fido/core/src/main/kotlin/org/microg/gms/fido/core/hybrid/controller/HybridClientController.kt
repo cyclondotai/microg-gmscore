@@ -17,6 +17,7 @@ import android.os.Build
 import android.util.Log
 import androidx.annotation.RequiresApi
 import androidx.annotation.RequiresPermission
+import androidx.annotation.VisibleForTesting
 import com.google.android.gms.fido.fido2.api.common.ErrorCode
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -201,22 +202,39 @@ class HybridClientController(context: Context, val staticKey: Pair<ECPublicKey, 
         return btAdapter
     }
 
+    @VisibleForTesting
     @SuppressLint("MissingPermission")
     @Suppress("DEPRECATION")
-    private suspend fun awaitBluetoothStateOn(btAdapter: BluetoothAdapter): Boolean {
+    suspend fun awaitBluetoothStateOn(
+        btAdapter: BluetoothAdapter,
+        enableAdapter: () -> Boolean = { btAdapter.enable() },
+    ): Boolean {
         return withTimeoutOrNull(BLUETOOTH_ENABLE_TIMEOUT_MS) {
             suspendCancellableCoroutine { cont ->
+                var sawTurningOn = btAdapter.state == BluetoothAdapter.STATE_TURNING_ON
                 val receiver = object : BroadcastReceiver() {
                     override fun onReceive(ctx: Context?, intent: Intent?) {
                         if (intent?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
-                        when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                        val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
+                        val previousState = intent.getIntExtra(BluetoothAdapter.EXTRA_PREVIOUS_STATE, BluetoothAdapter.ERROR)
+                        when (state) {
                             BluetoothAdapter.STATE_ON -> {
                                 runCatching { appContext.unregisterReceiver(this) }
                                 if (cont.isActive) cont.resumeWith(Result.success(true))
                             }
+                            BluetoothAdapter.STATE_TURNING_ON -> {
+                                sawTurningOn = true
+                            }
                             BluetoothAdapter.STATE_OFF -> {
-                                runCatching { appContext.unregisterReceiver(this) }
-                                if (cont.isActive) cont.resumeWith(Result.success(false))
+                                // Only abort when an enable attempt itself fell back to OFF. When the adapter was
+                                // turning off as enable() was queued, Android broadcasts an intermediate STATE_OFF
+                                // (previousState == STATE_TURNING_OFF) before transitioning to STATE_TURNING_ON -> STATE_ON.
+                                if (previousState == BluetoothAdapter.STATE_TURNING_ON ||
+                                    (sawTurningOn && previousState != BluetoothAdapter.STATE_TURNING_OFF)
+                                ) {
+                                    runCatching { appContext.unregisterReceiver(this) }
+                                    if (cont.isActive) cont.resumeWith(Result.success(false))
+                                }
                             }
                         }
                     }
@@ -229,15 +247,19 @@ class HybridClientController(context: Context, val staticKey: Pair<ECPublicKey, 
                 }
                 cont.invokeOnCancellation { runCatching { appContext.unregisterReceiver(receiver) } }
 
-                if (btAdapter.isEnabled) {
+                if (btAdapter.isEnabled || btAdapter.state == BluetoothAdapter.STATE_ON) {
                     runCatching { appContext.unregisterReceiver(receiver) }
                     if (cont.isActive) cont.resumeWith(Result.success(true))
                     return@suspendCancellableCoroutine
                 }
                 val state = btAdapter.state
-                if (state != BluetoothAdapter.STATE_TURNING_ON && !btAdapter.enable()) {
+                if (state == BluetoothAdapter.STATE_TURNING_ON) {
+                    sawTurningOn = true
+                    return@suspendCancellableCoroutine
+                }
+                if (!enableAdapter()) {
                     runCatching { appContext.unregisterReceiver(receiver) }
-                    if (cont.isActive) cont.resumeWith(Result.success(false))
+                    if (cont.isActive) cont.resumeWith(Result.success(btAdapter.isEnabled))
                 }
             }
         } == true

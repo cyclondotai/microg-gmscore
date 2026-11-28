@@ -32,16 +32,19 @@ abstract class CredentialProviderActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Log.d(TAG, "onCreate: intent: ${intent?.extras?.keySet()}")
+        val dispatch = savedInstanceState == null || shouldDispatchOnRecreate(savedInstanceState)
         runCatching {
             val createRequest = PendingIntentHandler.retrieveProviderCreateCredentialRequest(intent)
             if (createRequest != null) {
                 isCreateRequest = true
-                return onProviderCreateCredentialRequest(createRequest)
+                if (dispatch) return onProviderCreateCredentialRequest(createRequest)
+                return
             }
             val getRequest = PendingIntentHandler.retrieveProviderGetCredentialRequest(intent)
             if (getRequest != null) {
                 isGetRequest = true
-                return onProviderGetCredentialRequest(getRequest)
+                if (dispatch) return onProviderGetCredentialRequest(getRequest)
+                return
             }
             finishWithException("Unknown request")
         }.onFailure { e ->
@@ -49,6 +52,13 @@ abstract class CredentialProviderActivity : AppCompatActivity() {
             finishWithException(e.localizedMessage)
         }
     }
+
+    /**
+     * Subclasses that already launched a child activity via [startActivityForResult] should keep
+     * the default `false` so activity recreation waits for [onActivityResult] instead of launching
+     * a duplicate flow.
+     */
+    protected open fun shouldDispatchOnRecreate(savedInstanceState: Bundle): Boolean = false
 
     // TODO: Turn these into suspendable and make sure that returning the correct result type becomes mandatory
     abstract fun onProviderCreateCredentialRequest(request: ProviderCreateCredentialRequest)

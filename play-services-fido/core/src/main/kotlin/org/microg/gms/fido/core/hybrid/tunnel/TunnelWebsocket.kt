@@ -6,6 +6,7 @@
 package org.microg.gms.fido.core.hybrid.tunnel
 
 import android.util.Log
+import androidx.annotation.VisibleForTesting
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -31,7 +32,14 @@ interface TunnelWebCallback {
 
 data class TunnelException(val msg: String, val th: Throwable? = null) : RuntimeException(msg, th)
 
-class TunnelWebsocket(val url: String, val callback: TunnelWebCallback) {
+class TunnelWebsocket @VisibleForTesting constructor(
+    val url: String,
+    val callback: TunnelWebCallback,
+    private val webSocketFactory: ((Request, WebSocketListener) -> WebSocket)?,
+    private val workerExecutor: ((Runnable) -> Unit)?,
+) {
+    constructor(url: String, callback: TunnelWebCallback) : this(url, callback, null, null)
+
     private val threadPool = Executors.defaultThreadFactory()
     private var submitThread: Thread? = null
 
@@ -62,14 +70,21 @@ class TunnelWebsocket(val url: String, val callback: TunnelWebCallback) {
             return
         }
         Log.d(TAG, "closeWebsocket: ")
-        if (this.socket != null) {
+        val previousStatus = this.socketStatus
+        val activeSocket = this.socket
+        this.socket = null
+        this.socketStatus = SocketStatus.DISCONNECTED
+        if (activeSocket != null) {
             try {
-                this.socket!!.close(1000, "Done")
+                if (previousStatus == SocketStatus.CONNECTED) {
+                    activeSocket.close(1000, "Done")
+                } else {
+                    activeSocket.cancel()
+                }
             } catch (e: IOException) {
                 throw TunnelException("Socket failed to close", e)
             }
         }
-        this.socketStatus = SocketStatus.DISCONNECTED
         this.callback.disconnected()
     }
 
@@ -82,22 +97,21 @@ class TunnelWebsocket(val url: String, val callback: TunnelWebCallback) {
             close()
             return
         }
-        val threadNewThread = threadPool.newThread {
+        val task = Runnable {
             Log.d(TAG, "runReader()")
             try {
                 synchronized(this) {
-                    if (socket != null && socketStatus == SocketStatus.DISCONNECTED) {
-                        try {
-                            Log.d(TAG, "runReader() called when websocket is disconnected")
-                            close()
-                        } catch (e: IOException) {
-                            Log.w(TAG, "connect: Socket failed to close")
+                    if (socketStatus == SocketStatus.DISCONNECTED) {
+                        Log.d(TAG, "runReader() skipped because websocket is disconnected")
+                        val activeSocket = socket
+                        socket = null
+                        if (activeSocket != null) {
+                            runCatching { activeSocket.cancel() }
+                                .onFailure { Log.w(TAG, "connect: Socket failed to close") }
                         }
                     } else {
                         val request = Request.Builder().url(url).header("Sec-WebSocket-Protocol", "fido.cable").build()
-
-
-                        socket = client.newWebSocket(request, object : WebSocketListener() {
+                        val listener = object : WebSocketListener() {
                             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                                 closeWebsocket()
                             }
@@ -108,31 +122,62 @@ class TunnelWebsocket(val url: String, val callback: TunnelWebCallback) {
 
                             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                                 Log.e(TAG, "Tunnel failure")
-                                socketStatus = SocketStatus.DISCONNECTED
-                                callback.error(TunnelException("Websocket failed", t))
+                                val shouldNotify = synchronized(this@TunnelWebsocket) {
+                                    if (socketStatus == SocketStatus.DISCONNECTED) {
+                                        false
+                                    } else {
+                                        socketStatus = SocketStatus.DISCONNECTED
+                                        socket = null
+                                        true
+                                    }
+                                }
+                                if (shouldNotify) {
+                                    callback.error(TunnelException("Websocket failed", t))
+                                }
                             }
 
                             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                                if (socketStatus == SocketStatus.DISCONNECTED) return
                                 Log.d(TAG, "Received ${bytes.size} bytes")
                                 callback.message(bytes.toByteArray())
                             }
 
                             override fun onOpen(webSocket: WebSocket, response: Response) {
-                                socketStatus = SocketStatus.CONNECTED
+                                val opened = synchronized(this@TunnelWebsocket) {
+                                    if (socketStatus == SocketStatus.DISCONNECTED) {
+                                        false
+                                    } else {
+                                        socketStatus = SocketStatus.CONNECTED
+                                        true
+                                    }
+                                }
+                                if (!opened) {
+                                    runCatching { webSocket.close(1000, "Done") }
+                                    return
+                                }
                                 callback.connected(response)
                             }
-                        })
+                        }
+                        socket = webSocketFactory?.invoke(request, listener) ?: client.newWebSocket(request, listener)
                     }
                 }
             } catch (e: Exception) {
                 Log.d(TAG, "connect: ")
-                callback.error(TunnelException("Websocket connect failed", e))
+                if (socketStatus != SocketStatus.DISCONNECTED) {
+                    callback.error(TunnelException("Websocket connect failed", e))
+                }
             }
         }
-        this.submitThread = threadNewThread
-        threadNewThread.setName("TunnelWebSocket")
         this.socketStatus = SocketStatus.CONNECTING
-        this.submitThread?.start()
+        val customExecutor = workerExecutor
+        if (customExecutor != null) {
+            customExecutor(task)
+        } else {
+            val threadNewThread = threadPool.newThread(task)
+            this.submitThread = threadNewThread
+            threadNewThread.setName("TunnelWebSocket")
+            this.submitThread?.start()
+        }
     }
 
     // OkHttp WebSocket.send is thread-safe. Never acquire this object's monitor or call
