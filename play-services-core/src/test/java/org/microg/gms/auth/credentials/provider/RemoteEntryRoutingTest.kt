@@ -291,6 +291,8 @@ class RemoteEntryRoutingTest {
             .message("Switching Protocols")
             .build()
         requireNotNull(capturedListener).onOpen(fakeSocket, response)
+        capturedListener!!.onMessage(fakeSocket, ByteString.of(1, 2, 3))
+        capturedListener!!.onFailure(fakeSocket, RuntimeException("boom"), null)
 
         assertEquals(1, canceledCalls)
         assertEquals(1, closedCalls)

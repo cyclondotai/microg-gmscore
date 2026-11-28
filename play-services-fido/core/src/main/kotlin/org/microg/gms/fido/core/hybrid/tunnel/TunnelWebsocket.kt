@@ -121,41 +121,34 @@ class TunnelWebsocket @VisibleForTesting constructor(
                             }
 
                             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                                Log.e(TAG, "Tunnel failure")
-                                val shouldNotify = synchronized(this@TunnelWebsocket) {
-                                    if (socketStatus == SocketStatus.DISCONNECTED) {
-                                        false
-                                    } else {
-                                        socketStatus = SocketStatus.DISCONNECTED
-                                        socket = null
-                                        true
-                                    }
-                                }
-                                if (shouldNotify) {
+                                synchronized(this@TunnelWebsocket) {
+                                    if (socketStatus == SocketStatus.DISCONNECTED) return
+                                    Log.e(TAG, "Tunnel failure")
+                                    socketStatus = SocketStatus.DISCONNECTED
+                                    socket = null
                                     callback.error(TunnelException("Websocket failed", t))
                                 }
                             }
 
                             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                                if (socketStatus == SocketStatus.DISCONNECTED) return
-                                Log.d(TAG, "Received ${bytes.size} bytes")
-                                callback.message(bytes.toByteArray())
+                                synchronized(this@TunnelWebsocket) {
+                                    if (socketStatus == SocketStatus.DISCONNECTED) return
+                                    Log.d(TAG, "Received ${bytes.size} bytes")
+                                    callback.message(bytes.toByteArray())
+                                }
                             }
 
                             override fun onOpen(webSocket: WebSocket, response: Response) {
-                                val opened = synchronized(this@TunnelWebsocket) {
+                                var lateSocket: WebSocket? = null
+                                synchronized(this@TunnelWebsocket) {
                                     if (socketStatus == SocketStatus.DISCONNECTED) {
-                                        false
+                                        lateSocket = webSocket
                                     } else {
                                         socketStatus = SocketStatus.CONNECTED
-                                        true
+                                        callback.connected(response)
                                     }
                                 }
-                                if (!opened) {
-                                    runCatching { webSocket.close(1000, "Done") }
-                                    return
-                                }
-                                callback.connected(response)
+                                lateSocket?.let { runCatching { it.close(1000, "Done") } }
                             }
                         }
                         socket = webSocketFactory?.invoke(request, listener) ?: client.newWebSocket(request, listener)
@@ -163,8 +156,12 @@ class TunnelWebsocket @VisibleForTesting constructor(
                 }
             } catch (e: Exception) {
                 Log.d(TAG, "connect: ")
-                if (socketStatus != SocketStatus.DISCONNECTED) {
-                    callback.error(TunnelException("Websocket connect failed", e))
+                synchronized(this) {
+                    if (socketStatus != SocketStatus.DISCONNECTED) {
+                        socketStatus = SocketStatus.DISCONNECTED
+                        socket = null
+                        callback.error(TunnelException("Websocket connect failed", e))
+                    }
                 }
             }
         }

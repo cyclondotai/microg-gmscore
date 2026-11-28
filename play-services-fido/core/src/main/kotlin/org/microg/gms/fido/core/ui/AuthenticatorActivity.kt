@@ -243,9 +243,10 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
             // Its owner confirmation does not create a local remembered-browser fido.db record.
             if (route.offersAccountPasskeys && !accountChoiceOffered && backend != null &&
                 backend.available(this, options, callerPackage, source.orEmpty())) {
-                accountChoiceOffered = true
                 makeOpaque()
-                if (chooseAccountPasskey()) {
+                val useAccountPasskey = chooseAccountPasskey()
+                accountChoiceOffered = true
+                if (useAccountPasskey) {
                     accountRequestPending = true
                     startActivityForResult(backend.request(this, options, callerPackage, source.orEmpty()), REQUEST_ACCOUNT_PASSKEY)
                     return

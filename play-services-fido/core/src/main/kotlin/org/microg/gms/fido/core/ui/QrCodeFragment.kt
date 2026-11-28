@@ -51,21 +51,25 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
         private const val TAG = "QrCodeFragment"
         private const val REQUEST_BLUETOOTH_PERMISSIONS = 1001
         private const val STATE_AWAITING_SETTINGS_RETURN = "awaitingSettingsReturn"
+        private const val STATE_PERMISSION_REQUEST_IN_FLIGHT = "permissionRequestInFlight"
     }
 
     private lateinit var binding: FidoQrCodeFragmentBinding
     private lateinit var activityHost: AuthenticatorActivity
     private var transportJob: Job? = null
     private var awaitingSettingsReturn = false
+    private var permissionRequestInFlight = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         awaitingSettingsReturn = savedInstanceState?.getBoolean(STATE_AWAITING_SETTINGS_RETURN, false) == true
+        permissionRequestInFlight = savedInstanceState?.getBoolean(STATE_PERMISSION_REQUEST_IN_FLIGHT, false) == true
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(STATE_AWAITING_SETTINGS_RETURN, awaitingSettingsReturn)
+        outState.putBoolean(STATE_PERMISSION_REQUEST_IN_FLIGHT, permissionRequestInFlight)
     }
 
     override fun onCreateView(
@@ -89,7 +93,7 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
 
         setupBodyText()
 
-        if (!awaitingSettingsReturn && requestBluetoothPermissions()) {
+        if (!awaitingSettingsReturn && !permissionRequestInFlight && requestBluetoothPermissions()) {
             ensureTransportStarted()
         }
     }
@@ -201,10 +205,12 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
 
         return if (requiredPermissions.isNotEmpty()) {
             try {
+                permissionRequestInFlight = true
                 requestPermissions(
                     requiredPermissions.toTypedArray(), REQUEST_BLUETOOTH_PERMISSIONS
                 )
             } catch (_: Exception) {
+                permissionRequestInFlight = false
                 Log.e(TAG, "requestPermissions failed in Fragment")
                 false
             }
@@ -220,6 +226,7 @@ class QrCodeFragment : Fragment(), TransportHandlerCallback {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         when (requestCode) {
             REQUEST_BLUETOOTH_PERMISSIONS -> {
+                permissionRequestInFlight = false
                 val allGranted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
                 if (allGranted) {
                     ensureTransportStarted()
