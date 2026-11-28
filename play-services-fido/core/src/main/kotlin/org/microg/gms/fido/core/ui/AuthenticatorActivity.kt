@@ -245,6 +245,7 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
                 backend.available(this, options, callerPackage, source.orEmpty())) {
                 makeOpaque()
                 val useAccountPasskey = chooseAccountPasskey()
+                    ?: run { finishWithError(NOT_ALLOWED_ERR, "Passkey request cancelled"); return }
                 accountChoiceOffered = true
                 if (useAccountPasskey) {
                     accountRequestPending = true
@@ -356,6 +357,8 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
                     navGraphAttached = true
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: RequestHandlingException) {
             finishWithError(e.errorCode, e.message ?: e.errorCode.name)
         } catch (e: Exception) {
@@ -431,11 +434,11 @@ class AuthenticatorActivity : AppCompatActivity(), TransportHandlerCallback {
         finish()
     }
 
-    private suspend fun chooseAccountPasskey(): Boolean = suspendCancellableCoroutine { continuation ->
+    private suspend fun chooseAccountPasskey(): Boolean? = suspendCancellableCoroutine { continuation ->
         val dialog = AlertDialog.Builder(this).setTitle(R.string.fido_account_passkey_title)
             .setPositiveButton(R.string.fido_account_passkey_use) { _, _ -> if (continuation.isActive) continuation.resume(true) }
             .setNegativeButton(R.string.fido_account_passkey_other) { _, _ -> if (continuation.isActive) continuation.resume(false) }
-            .setOnCancelListener { if (continuation.isActive) continuation.cancel() }.create()
+            .setOnCancelListener { if (continuation.isActive) continuation.resume(null) }.create()
         continuation.invokeOnCancellation { dialog.dismiss() }
         dialog.show()
     }

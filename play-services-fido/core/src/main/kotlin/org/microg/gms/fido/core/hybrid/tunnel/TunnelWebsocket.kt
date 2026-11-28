@@ -187,8 +187,15 @@ class TunnelWebsocket @VisibleForTesting constructor(
 
     fun send(bArr: ByteArray): Boolean {
         val accepted = enqueue(bArr)
-        // The ordinary handshake/client callers retain their failure callback, outside any output guard.
-        if (!accepted) callback.error(TunnelException("Websocket rejected frame"))
+        // The ordinary handshake/client callers retain their failure callback, outside any output guard,
+        // serialized with close() so an error is never delivered after disconnected().
+        if (!accepted) {
+            synchronized(this) {
+                if (socketStatus != SocketStatus.DISCONNECTED) {
+                    callback.error(TunnelException("Websocket rejected frame"))
+                }
+            }
+        }
         return accepted
     }
 }

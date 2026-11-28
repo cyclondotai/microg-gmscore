@@ -293,6 +293,7 @@ class RemoteEntryRoutingTest {
         requireNotNull(capturedListener).onOpen(fakeSocket, response)
         capturedListener!!.onMessage(fakeSocket, ByteString.of(1, 2, 3))
         capturedListener!!.onFailure(fakeSocket, RuntimeException("boom"), null)
+        assertFalse(ws.send(byteArrayOf(1, 2, 3)))
 
         assertEquals(1, canceledCalls)
         assertEquals(1, closedCalls)
